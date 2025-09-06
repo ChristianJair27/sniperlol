@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8"/>
+<title>Riot Debug</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Arial;padding:20px;max-width:900px;margin:auto}
+  input,button{font:inherit;padding:8px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  pre{background:#111;color:#ddd;padding:12px;border-radius:8px;overflow:auto}
+</style>
+
+<h1>Riot Debug</h1>
+<div class="row">
+  <label>Riot ID:
+    <input id="riotId" value="Kister#NGC" size="24"/>
+  </label>
+  <label>Shards a probar:
+    <input id="probe" value="la1,la2,na1,br1,oc1" size="26"/>
+  </label>
+  <button id="run">Probar</button>
+</div>
+
+<pre id="out">Listo para probar…</pre>
+
+<script src="riot-test.js"></script>

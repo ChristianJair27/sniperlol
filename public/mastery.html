@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Champion Mastery (by PUUID)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    input, select, button { padding:8px 10px; font-size:14px; }
+    pre { background:#0b0f14; color:#cde3ff; padding:16px; border-radius:8px; overflow:auto; }
+    table { border-collapse: collapse; width:100%; margin-top:16px; }
+    th, td { border-bottom:1px solid #ddd; padding:8px; text-align:left; }
+    .icon { width:28px; height:28px; border-radius:4px; vertical-align:middle; margin-right:8px; }
+    .muted { color:#666; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h1>Champion Mastery (by PUUID)</h1>
+
+  <div class="row">
+    <label>riotId:
+      <input id="riotId" placeholder="Nombre#Tag" value="Kister#NGC" />
+    </label>
+    <span class="muted">o</span>
+    <label>PUUID:
+      <input id="puuid" size="80" placeholder="encrypted PUUID" />
+    </label>
+  </div>
+
+  <div class="row" style="margin-top:8px">
+    <label>Platform:
+      <select id="platform">
+        <option>la1</option><option>la2</option><option>na1</option><option>br1</option><option>oc1</option>
+        <option>euw1</option><option>eun1</option><option>tr1</option><option>ru</option>
+        <option>jp1</option><option>kr</option>
+      </select>
+    </label>
+    <label>Top:
+      <select id="top">
+        <option>10</option><option selected>20</option><option>30</option><option>50</option>
+      </select>
+    </label>
+    <button id="btn">Consultar</button>
+  </div>
+
+  <div id="out"></div>
+
+  <script src="/mastery.js"></script>
+</body>
+</html>
