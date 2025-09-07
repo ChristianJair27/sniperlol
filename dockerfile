@@ -58,6 +58,8 @@ EXPOSE 4000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -qO- http://127.0.0.1:${PORT}/health || exit 1
 
+
+  
 USER app
 # Asegúrate que tu package.json tenga "start": "node dist/server.js"
 CMD ["npm", "start"]
