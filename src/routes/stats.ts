@@ -10,12 +10,12 @@ import {
   getAccountByPUUID,
   getMatchIdsByPUUID,
   getMatchById,
-  getLiveGame,
 } from "../services/riot.js";
 
 const r = Router();
+const RIOT_KEY = process.env.RIOT_API_KEY;
 
-// Log simple para verificar que el router se alcanza
+// Log para verificar que el router se alcanza
 r.use((req, _res, next) => {
   console.log("[STATS]", req.method, req.path);
   next();
@@ -31,10 +31,14 @@ r.get("/resolve", async (req, res) => {
     if (!region || !gameName || !tagLine) {
       return res.status(400).json({ message: "region, gameName y tagLine son requeridos" });
     }
+    if (!RIOT_KEY) return res.status(500).json({ message: "RIOT_API_KEY missing" });
+
     const regional = platformToRegional(region);
     const { data } = await axios.get(
-      `https://${regional}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`,
-      { headers: { "X-Riot-Token": process.env.RIOT_API_KEY! } }
+      `https://${regional}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(
+        gameName
+      )}/${encodeURIComponent(tagLine)}`,
+      { headers: { "X-Riot-Token": RIOT_KEY } }
     );
     return res.json({
       puuid: data.puuid,
@@ -87,7 +91,7 @@ r.get("/summary/:platform/:puuid", async (req, res) => {
     }
   }
 
-  // B) league-v4 (rank) si tenemos summonerId
+  // B) league-v4 (rank)
   let rank: { queue: string; tier: string; rank: string; lp: number }[] = [];
   if (summoner.id && pfUsed) {
     try {
@@ -142,7 +146,7 @@ r.get("/summary/:platform/:puuid", async (req, res) => {
 
 /**
  * GET /api/stats/recent/:platform/:puuid?count=10&queues=420,440
- * -> { champions: [...] } // agregado por campeón
+ * -> { champions: [...] }
  */
 r.get("/recent/:platform/:puuid", async (req, res) => {
   try {
@@ -150,16 +154,15 @@ r.get("/recent/:platform/:puuid", async (req, res) => {
     const { count = "10", queues } = req.query as { count?: string; queues?: string };
 
     const regional = platformToRegional(platform);
-    const headers = { "X-Riot-Token": process.env.RIOT_API_KEY! };
+    if (!RIOT_KEY) return res.status(500).json({ message: "RIOT_API_KEY missing" });
+    const headers = { "X-Riot-Token": RIOT_KEY };
 
-    // ids de partidas
     const idsRes = await axios.get<string[]>(
       `https://${regional}.api.riotgames.com/lol/match/v5/matches/by-puuid/${puuid}/ids`,
       { headers, params: { start: 0, count: Number(count) } }
     );
     const ids = idsRes.data || [];
 
-    // filtro de colas opcional
     const onlyQueues = queues
       ? new Set(
           String(queues)
@@ -255,7 +258,10 @@ r.get("/matches/:regional/:puuid/ids", async (req, res) => {
   }
 });
 
-// GET /api/stats/matches/:regional/:matchId?puuid=<puuid>
+/**
+ * GET /api/stats/matches/:regional/:matchId?puuid=<puuid>
+ * Devuelve detalle enriquecido (items, trinket, KP, daño, oro, augments, mini-rosters)
+ */
 r.get("/matches/:regional/:matchId", async (req, res) => {
   try {
     const { regional, matchId } = req.params as { regional: string; matchId: string };
@@ -263,30 +269,52 @@ r.get("/matches/:regional/:matchId", async (req, res) => {
 
     const match = await getMatchById(regional, matchId);
     if (!match) return res.status(404).json({ message: "Match not found" });
-    if (!puuid) return res.json(match); // fallback: devuelvo todo
+    if (!puuid) return res.json(match);
 
     const info = match.info;
-    const p = info?.participants?.find((x: any) => x.puuid === puuid);
-    if (!p) return res.status(404).json({ message: "Participant not found" });
+    const me = info?.participants?.find((x: any) => x.puuid === puuid);
+    if (!me) return res.status(404).json({ message: "Participant not found" });
+
+    const teamId = me.teamId;
+    const teamKills = info.participants
+      .filter((p: any) => p.teamId === teamId)
+      .reduce((a: number, p: any) => a + (p.kills || 0), 0);
+
+    const items = [me.item0, me.item1, me.item2, me.item3, me.item4, me.item5].filter((x: any) =>
+      Number.isInteger(x)
+    );
+    const trinket = Number.isInteger(me.item6) ? me.item6 : undefined;
 
     const out = {
       matchId,
-      championId: p.championId,
-      championName: p.championName,
-      win: !!p.win,
-      kills: p.kills,
-      deaths: p.deaths,
-      assists: p.assists,
-      kda: p.deaths === 0 ? p.kills + p.assists : (p.kills + p.assists) / p.deaths,
-      cs: (p.totalMinionsKilled ?? 0) + (p.neutralMinionsKilled ?? 0),
-      gameDuration: (info?.gameDuration ?? 0) * 1000,
-      gameMode: info?.gameMode ?? info?.queueId,
-      gameStartTimestamp: info?.gameStartTimestamp,
-      items: [p.item0, p.item1, p.item2, p.item3, p.item4, p.item5, p.item6].filter((x: any) => typeof x === "number"),
-      summonerSpells: [p.summoner1Id, p.summoner2Id],
-      perks: p.perks,
-      role: p.role,
-      lane: p.lane,
+      championId: me.championId,
+      championName: me.championName,
+      win: Boolean(me.win),
+      kills: me.kills,
+      deaths: me.deaths,
+      assists: me.assists,
+      kda: (me.kills + me.assists) / Math.max(me.deaths, 1),
+      cs: (me.totalMinionsKilled ?? 0) + (me.neutralMinionsKilled ?? 0),
+      gameDuration: info.gameDuration, // secs
+      gameMode: info.gameMode ?? info.queueId,
+      gameStartTimestamp: info.gameStartTimestamp,
+      queueId: info.queueId,
+      championLevel: me.champLevel,
+      gold: me.goldEarned,
+      totalDamageDealtToChampions: me.totalDamageDealtToChampions,
+
+      items,
+      trinket,
+      summonerSpells: [me.summoner1Id, me.summoner2Id],
+      perks: me.perks,
+      role: me.role,
+      lane: me.lane,
+
+      killParticipation: teamKills ? (me.kills + me.assists) / teamKills : undefined,
+      playerAugments: [me.playerAugment1, me.playerAugment2, me.playerAugment3, me.playerAugment4].filter(
+        (x: any) => Number.isInteger(x)
+      ),
+      teamParticipants: info.participants.map((p: any) => ({ teamId: p.teamId, championId: p.championId })),
     };
 
     return res.json(out);
@@ -295,84 +323,70 @@ r.get("/matches/:regional/:matchId", async (req, res) => {
   }
 });
 
-// GET /api/stats/spectator/:platform/:puuid  (con fallback de plataforma)
+/**
+ * GET /api/stats/spectator/:platform/:puuid
+ */
 r.get("/spectator/:platform/:puuid", async (req, res) => {
   try {
-    const { platform, puuid } = req.params as { platform: string; puuid: string };
-    const tryPlatforms = [platform, ...PROBE_AMERICAS.filter(p => p !== platform)];
+    const platform = String(req.params.platform).toLowerCase();
+    const puuid = String(req.params.puuid);
 
-    let sum: any = null;
-    let pfUsed: string | null = null;
-
-    for (const pf of tryPlatforms) {
-      try {
-        sum = await getSummonerByPUUID(pf, puuid);
-        if (sum?.id) { pfUsed = pf; break; }
-      } catch (e: any) {
-        if (e?.response?.status !== 404) throw e; // 404 => probar otra plataforma
-      }
+    const ALLOWED = new Set([
+      "la1",
+      "la2",
+      "na1",
+      "br1",
+      "oc1",
+      "euw1",
+      "eun1",
+      "tr1",
+      "ru",
+      "jp1",
+      "kr",
+    ]);
+    if (!ALLOWED.has(platform)) {
+      return res.status(400).json({ error: "invalid platform", platform });
     }
-    if (!sum?.id) return res.status(404).json({ message: "Summoner not found in probed platforms" });
+    if (!RIOT_KEY) {
+      return res.status(500).json({ error: "RIOT_API_KEY missing" });
+    }
+    const base = (pf: string) => `https://${pf}.api.riotgames.com`;
 
-    const live = await getLiveGame(pfUsed!, sum.id).catch((e: any) => {
-      if (e?.response?.status === 404) return null; // NO está en partida
-      throw e;
-    });
+    // 1) PUUID -> summonerId
+    const sumR = await fetch(
+      `${base(platform)}/lol/summoner/v4/summoners/by-puuid/${encodeURIComponent(puuid)}`,
+      { headers: { "X-Riot-Token": RIOT_KEY } }
+    );
+    if (sumR.status === 404) return res.sendStatus(404);
+    if (!sumR.ok) {
+      const body = await sumR.text().catch(() => "");
+      return res.status(sumR.status).json({ error: "summoner lookup failed", status: sumR.status, body });
+    }
+    const summ = await sumR.json();
 
-    if (!live) return res.status(204).send();
+    // 2) Spectator
+    const specR = await fetch(
+      `${base(platform)}/lol/spectator/v4/active-games/by-summoner/${summ.id}`,
+      { headers: { "X-Riot-Token": RIOT_KEY } }
+    );
+    if (specR.status === 404) return res.sendStatus(204); // no está en partida
+    if (!specR.ok) {
+      const body = await specR.text().catch(() => "");
+      return res.status(specR.status).json({ error: "spectator failed", status: specR.status, body });
+    }
 
-    const out = {
-      gameMode: live.gameMode,
-      gameStartTime: live.gameStartTime,
-      participants: (live.participants || []).map((p: any) => ({
+    const g = await specR.json();
+    return res.json({
+      gameMode: g.gameMode,
+      gameStartTime: g.gameStartTime,
+      participants: g.participants?.map((p: any) => ({
         summonerName: p.summonerName,
         championId: p.championId,
         teamId: p.teamId,
       })),
-    };
-    return res.json(out);
+    });
   } catch (e: any) {
-    return res.status(e?.response?.status || 500).json({ message: e?.message || "spectator failed" });
-  }
-});
-
-// GET /api/stats/champion-stats/:platform/:puuid?count=20
-r.get("/champion-stats/:platform/:puuid", async (req, res) => {
-  try {
-    const { platform, puuid } = req.params as { platform: string; puuid: string };
-    const { count = "20" } = req.query as any;
-
-    const ids = await getMatchIdsByPUUID(platform, puuid, Number(count), 0);
-    const agg = new Map<number, { games: number; wins: number; k: number; d: number; a: number }>();
-
-    for (const id of ids) {
-      const m = await getMatchById(platform, id);
-      const p = m?.info?.participants?.find((x: any) => x.puuid === puuid);
-      if (!p) continue;
-
-      const row = agg.get(p.championId) ?? { games: 0, wins: 0, k: 0, d: 0, a: 0 };
-      row.games++;
-      if (p.win) row.wins++;
-      row.k += p.kills;
-      row.d += p.deaths || 0;
-      row.a += p.assists;
-      agg.set(p.championId, row);
-    }
-
-    const out: Record<string, any> = {};
-    for (const [champId, r] of agg.entries()) {
-      const kda = r.d === 0 ? (r.k + r.a).toFixed(2) : ((r.k + r.a) / r.d).toFixed(2);
-      out[String(champId)] = {
-        games: r.games,
-        wins: r.wins,
-        losses: r.games - r.wins,
-        winRate: Math.round((r.wins / r.games) * 100),
-        kda,
-      };
-    }
-    return res.json(out);
-  } catch (e: any) {
-    return res.status(e?.response?.status || 500).json({ message: e?.message || "champion-stats failed" });
+    return res.status(500).json({ error: e?.message || "server error" });
   }
 });
 
