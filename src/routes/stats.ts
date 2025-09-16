@@ -323,12 +323,17 @@ r.get("/matches/:regional/:matchId", async (req, res) => {
       playerAugments: [me.playerAugment1, me.playerAugment2, me.playerAugment3, me.playerAugment4].filter((x: any) =>
         Number.isInteger(x)
       ),
-      teamParticipants: info.participants.map((p: any) => ({
-        teamId: p.teamId,
-        championId: p.championId,
-        summonerName: p.riotIdGameName || p.summonerName || "Invocador",
-        puuid: p.puuid,
-      })),
+      teamParticipants: info.participants.map((p:any) => ({
+  teamId: p.teamId,
+  championId: p.championId,
+  summonerName: p.riotIdGameName || p.summonerName || "Invocador",
+  puuid: p.puuid,
+  kills: p.kills,
+  deaths: p.deaths,
+  assists: p.assists,
+  items: [p.item0,p.item1,p.item2,p.item3,p.item4,p.item5].filter(Number.isInteger),
+  trinket: Number.isInteger(p.item6) ? p.item6 : undefined,
+})),
     };
 
     return res.json(out);
@@ -340,54 +345,151 @@ r.get("/matches/:regional/:matchId", async (req, res) => {
 /**
  * GET /api/stats/spectator/:platform/:puuid
  */
+
 r.get("/spectator/:platform/:puuid", async (req, res) => {
   try {
     const platform = String(req.params.platform).toLowerCase();
     const puuid = String(req.params.puuid);
+    const wantRank = String(req.query.rank || "0") === "1";
 
     const ALLOWED = new Set(["la1","la2","na1","br1","oc1","euw1","eun1","tr1","ru","jp1","kr"]);
-    if (!ALLOWED.has(platform)) return res.status(400).json({ error: "invalid platform", platform });
+    if (!ALLOWED.has(platform)) {
+      return res.status(400).json({ error: "invalid platform", platform });
+    }
     if (!RIOT_KEY) return res.status(500).json({ error: "RIOT_API_KEY missing" });
 
-    const base = (pf: string) => `https://${pf}.api.riotgames.com`;
+    const headers = { "X-Riot-Token": RIOT_KEY };
+    const url = `https://${platform}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
 
-    // 1) PUUID -> summonerId
-    const sumR = await fetch(
-      `${base(platform)}/lol/summoner/v4/summoners/by-puuid/${encodeURIComponent(puuid)}`,
-      { headers: { "X-Riot-Token": RIOT_KEY } }
-    );
-    if (sumR.status === 404) return res.sendStatus(204);
-    if (!sumR.ok) return res.sendStatus(204); // nunca pasamos HTML
+    let g: any;
+    try {
+      const r0 = await riotGet(url, { headers });
+      g = r0.data;
+    } catch (e: any) {
+      const st = e?.response?.status;
+      if (st === 404 || st === 403) return res.sendStatus(204); // sin partida
+      return res.status(st || 500).json(e?.response?.data || { error: "spectator failed" });
+    }
 
-    const summ = await sumR.json();
+    // Participantes con campos útiles de v5
+    // éxito
+const participants = (g.participants || []).map((p: any) => {
+  // spectator-v5 trae spell1Id, spell2Id y perks con perkIds, perkStyle, perkSubStyle
+  const perkIds: number[] = p?.perks?.perkIds || [];
+  // keystone suele venir como el primer perk de la rama primaria
+  const keystone = perkIds[0];
 
-    // 2) Spectator
-    const specR = await fetch(
-      `${base(platform)}/lol/spectator/v4/active-games/by-summoner/${summ.id}`,
-      { headers: { "X-Riot-Token": RIOT_KEY } }
-    );
+  return {
+    summonerName: p.riotIdGameName || p.summonerName || "Invocador",
+    championId: p.championId,
+    teamId: p.teamId,
+    puuid: p.puuid,
 
-    // Mapeamos TODO lo que no sea 200 a 204
-    if (specR.status === 404 || specR.status === 403 || specR.status === 429) return res.sendStatus(204);
-    if (!specR.ok) return res.sendStatus(204);
+    // 👇 nuevo
+    spell1Id: p.spell1Id,
+    spell2Id: p.spell2Id,
+    perks: {
+      keystone,
+      primaryStyle: p?.perks?.perkStyle,
+      subStyle: p?.perks?.perkSubStyle,
+    },
 
-    const g = await specR.json();
+    // placeholder rank; lo completamos abajo si ?rank=1
+    rank: null as null | { tier: string; rank: string; lp: number },
+  };
+});
 
-    res.setHeader("Cache-Control", "no-store");
+if (String(req.query.rank) === "1") {
+  // Trae rank para cada summonerId (máximo 10 → OK con rate limits suaves)
+  const axiosOpts = { headers: { "X-Riot-Token": RIOT_KEY } };
+  await Promise.allSettled(
+    participants.map(async (pp: any, i: number) => {
+      try {
+        // necesitamos el summonerId desde puuid
+        const sum = await riotGet<{ id: string }>(
+          `https://${platform}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/${encodeURIComponent(pp.puuid || "")}`,
+          axiosOpts
+        );
+        if (!sum?.data?.id) return;
+
+        const le = await riotGet<any[]>(
+          `https://${platform}.api.riotgames.com/lol/league/v4/entries/by-summoner/${sum.data.id}`,
+          axiosOpts
+        );
+        const best = (le.data || []).find((x: any) => x.queueType === "RANKED_SOLO_5x5") || (le.data || [])[0];
+        if (best) {
+          participants[i].rank = {
+            tier: best.tier,
+            rank: best.rank,
+            lp: best.leaguePoints,
+          };
+        }
+      } catch {}
+    })
+  );
+}
+
+return res.json({
+  gameMode: g.gameMode,
+  gameStartTime: g.gameStartTime,
+  queueId: g.gameQueueConfigId,
+  participants,
+});
+
+
+    // (Opcional) – Rango por jugador (league-v4 requires summonerId)
+    let ranksBySumm: Record<string, { tier: string; rank: string; lp: number } | null> = {};
+    if (wantRank) {
+      // limita concurrencia para evitar 429
+      const queue: (() => Promise<void>)[] = [];
+      for (const p of participants) {
+        if (!p.summonerId) continue;
+        queue.push(async () => {
+          try {
+            const { data: entries } = await riotGet(
+              `https://${platform}.api.riotgames.com/lol/league/v4/entries/by-summoner/${p.summonerId}`,
+              { headers }
+            );
+            const solo = (entries as any[]).find(e => e.queueType === "RANKED_SOLO_5x5");
+            ranksBySumm[p.summonerId] = solo
+              ? { tier: solo.tier, rank: solo.rank, lp: solo.leaguePoints }
+              : null;
+          } catch {
+            ranksBySumm[p.summonerId] = null;
+          }
+        });
+      }
+      // Ejecuta de a 3 en paralelo
+      const runLimited = async (concurrency = 3) => {
+        const running: Promise<void>[] = [];
+        for (const job of queue) {
+          const p = job();
+          running.push(p);
+          if (running.length >= concurrency) await Promise.race(running).catch(() => {});
+          // limpia los resueltos
+          for (let i = running.length - 1; i >= 0; i--) {
+            if ((running[i] as any).settled) running.splice(i, 1);
+          }
+        }
+        await Promise.allSettled(running);
+      };
+      await runLimited(3);
+    }
+
     return res.json({
       gameMode: g.gameMode,
       gameStartTime: g.gameStartTime,
-      participants: (g.participants || []).map((p: any) => ({
-        summonerName: p.summonerName,
-        championId: p.championId,
-        teamId: p.teamId,
+      queueId: g.gameQueueConfigId,
+      participants: participants.map((p: any) => ({
+        ...p,
+        rank: wantRank && p.summonerId ? ranksBySumm[p.summonerId] ?? null : undefined,
       })),
     });
   } catch (e: any) {
-    // Cualquier error interno -> 204 para que el front lo trate como "no está en partida"
-    return res.sendStatus(204);
+    return res.status(500).json({ error: e?.message || "server error" });
   }
 });
+
 
 // Imprime rutas
 setImmediate(() => {
@@ -474,6 +576,71 @@ r.get("/champion-stats/:platform/:puuid", async (req, res) => {
   } catch (e: any) {
     return res.status(e?.response?.status || 500).json({
       message: e?.response?.data?.status?.message || e?.message || "champion-stats failed",
+    });
+  }
+});
+
+
+r.get("/match-timeline/:regional/:matchId", async (req, res) => {
+  try {
+    const { regional, matchId } = req.params as { regional: string; matchId: string };
+    if (!RIOT_KEY) return res.status(500).json({ message: "RIOT_API_KEY missing" });
+
+    const headers = { "X-Riot-Token": RIOT_KEY };
+    const { data: tl } = await riotGet<any>(
+      `https://${regional}.api.riotgames.com/lol/match/v5/matches/${matchId}/timeline`,
+      { headers }
+    );
+
+    // Frames → oro por equipo, cs por equipo, etc.
+    const frames = tl?.info?.frames ?? [];
+    const blueIds = new Set<number>();
+    const redIds  = new Set<number>();
+
+    // Necesitamos team mapping: lo tomamos del match normal (ya lo tienes en /matches/:regional/:matchId)
+    // Si prefieres incluirlo aquí, puedes hacer un GET al match y mapear participantId -> teamId.
+    // Para ahorrar, exponemos totales por "ladoA/ladoB" sin nombres.
+    const teamTotals = frames.map((f: any) => {
+      let blueGold = 0, redGold = 0, blueCS = 0, redCS = 0;
+      for (const [pid, pf] of Object.entries<any>(f.participantFrames || {})) {
+        // sin teamId aquí, pero podemos alternar por convención: ids 1-5 = blue, 6-10 = red (estándar Riot)
+        const idNum = Number(pid);
+        const isBlue = idNum >= 1 && idNum <= 5;
+        const gold = pf.totalGold ?? 0;
+        const cs   = (pf.minionsKilled ?? 0) + (pf.jungleMinionsKilled ?? 0);
+        if (isBlue) { blueGold += gold; blueCS += cs; } else { redGold += gold; redCS += cs; }
+      }
+      return {
+        t: f.timestamp, blueGold, redGold, blueCS, redCS
+      };
+    });
+
+    // Eventos interesantes: subidas de skill, objetivos, compras
+    const skillUps: Array<{ t:number; participantId:number; skillSlot:number; levelUpType:string }> = [];
+    const itemBuys: Array<{ t:number; participantId:number; itemId:number }> = [];
+    const objectives: Array<{ t:number; type:string; teamId?:number }> = [];
+
+    for (const f of frames) {
+      for (const ev of (f.events || [])) {
+        if (ev.type === "SKILL_LEVEL_UP") {
+          skillUps.push({ t: ev.timestamp, participantId: ev.participantId, skillSlot: ev.skillSlot, levelUpType: ev.levelUpType });
+        } else if (ev.type === "ITEM_PURCHASED") {
+          itemBuys.push({ t: ev.timestamp, participantId: ev.participantId, itemId: ev.itemId });
+        } else if (["ELITE_MONSTER_KILL","TURRET_PLATE_DESTROYED","BUILDING_KILL"].includes(ev.type)) {
+          objectives.push({ t: ev.timestamp, type: ev.type, teamId: ev.killerTeamId ?? ev.teamId });
+        }
+      }
+    }
+
+    return res.json({
+      frames: teamTotals,   // {t, blueGold, redGold, blueCS, redCS}
+      skillUps,
+      itemBuys,
+      objectives
+    });
+  } catch (e:any) {
+    return res.status(e?.response?.status || 500).json({
+      message: e?.response?.data?.status?.message || e?.message || "timeline failed",
     });
   }
 });

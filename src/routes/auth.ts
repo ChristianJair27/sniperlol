@@ -148,24 +148,59 @@ function verifyPassword(pw: string, stored: string) {
 
 r.post("/register", async (req, res) => {
   const { email, password, name } = req.body || {};
-  if (!email || !password) return res.status(400).json({ ok: false, msg: "email y password requeridos" });
+  if (!email || !password) {
+    return res.status(400).json({ ok: false, msg: "email y password requeridos" });
+  }
 
   const norm = String(email).toLowerCase();
   const conn = await pool.getConnection();
   try {
-    const [exists] = await conn.query<any[]>("SELECT id FROM users WHERE email=? LIMIT 1", [norm]);
-    if (exists.length) return res.status(409).json({ ok: false, msg: "email ya registrado" });
+    // 1) Mira si ya existe y con qué proveedor
+    const [rows] = await conn.query<any[]>(
+      "SELECT id, provider FROM users WHERE email=? LIMIT 1",
+      [norm]
+    );
 
+    if (rows.length) {
+      const prov = rows[0]?.provider;
+      if (prov === "google") {
+        return res
+          .status(409)
+          .json({ ok: false, code: "PROVIDER_GOOGLE", msg: "Ese correo ya está vinculado a Google. Inicia sesión con Google." });
+      }
+      return res
+        .status(409)
+        .json({ ok: false, code: "EMAIL_TAKEN", msg: "El correo ya está registrado." });
+    }
+
+    // 2) Crear usuario local
     const [ins]: any = await conn.query(
       `INSERT INTO users (email, name, password_hash, role, provider)
        VALUES (?, ?, ?, 'user', 'local')`,
       [norm, name || null, hashPassword(password)]
     );
 
-    const [rows] = await conn.query<any[]>("SELECT * FROM users WHERE id=?", [ins.insertId]);
-    const u = rows[0] as DbUser;
+    const [rows2] = await conn.query<any[]>("SELECT * FROM users WHERE id=?", [ins.insertId]);
+    const u = rows2[0] as DbUser;
+
     const token = signToken({ id: u.id, email: u.email, role: u.role });
-    res.json({ ok: true, token, user: { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url, role: u.role } });
+    return res
+      .status(201)
+      .json({
+        ok: true,
+        token,
+        user: { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url, role: u.role }
+      });
+
+  } catch (e: any) {
+    // 3) Si hay índice único y se produce carrera: ER_DUP_ENTRY
+    if (e?.code === "ER_DUP_ENTRY") {
+      return res
+        .status(409)
+        .json({ ok: false, code: "EMAIL_TAKEN", msg: "El correo ya está registrado." });
+    }
+    console.error("[AUTH] register error:", e);
+    return res.status(500).json({ ok: false, msg: "Error registrando usuario" });
   } finally {
     conn.release();
   }
