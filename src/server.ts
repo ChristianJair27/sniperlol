@@ -16,6 +16,10 @@ import cookieParser from "cookie-parser";
 import playersLink from "./routes/players.link.js";
 import staticRoutes from './routes/static.js';
 
+import aiRoutes from './routes/ai.routes.js';
+
+import tournamentsRouter from './routes/tournaments.routes.js';
+
 const app = express();
 app.use(express.json());
 
@@ -67,6 +71,19 @@ app.use(cookieParser());
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.use("/api/players", players);
 app.use("/api/live", live);
+
+
+
+
+
+
+app.use('/api', aiRoutes);
+
+
+app.use('/api', tournamentsRouter);
+app.use('/api/tournaments', tournamentsRouter);
+
+
 
 // Manejo de errores tipado
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {

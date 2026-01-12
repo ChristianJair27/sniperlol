@@ -67,7 +67,7 @@ const RIOT_KEY = (process.env.RIOT_API_KEY || "").trim();
 if (!RIOT_KEY) throw new Error("RIOT_API_KEY vacío. Define tu key en .env");
 
 // --- Axios con header X-Riot-Token siempre presente ---
-const riot = axios.create({ timeout: 10000 });
+export const riot = axios.create({ timeout: 10000 });
 riot.interceptors.request.use((cfg) => {
   cfg.headers = cfg.headers ?? {};
   (cfg.headers as any)["X-Riot-Token"] = RIOT_KEY;
