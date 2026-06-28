@@ -157,6 +157,17 @@ if (solo && (solo.tier || solo.rank)) {
       recent = [];
     }
 
+    const riotIdStr = `${game_name}#${tag_line}`;
+    const [[{ tournamentsJoined }]] = await pool.query<any[]>(
+      `SELECT COUNT(DISTINCT tournament_id) AS tournamentsJoined
+       FROM tournament_registrations
+       WHERE captain_user_id = ?
+          OR registered_by = ?
+          OR JSON_SEARCH(players, 'one', ?, NULL, '$[*].riotId') IS NOT NULL
+          OR JSON_SEARCH(players, 'one', CAST(? AS CHAR), NULL, '$[*].userId') IS NOT NULL`,
+      [userId, userId, riotIdStr, userId]
+    );
+
     return res.json({
       ok: true,
       linked: true,
@@ -167,7 +178,7 @@ if (solo && (solo.tier || solo.rank)) {
         currentRank,
         lp,
         favoriteChampion,
-        tournamentsJoined: 0,
+        tournamentsJoined: Number(tournamentsJoined) || 0,
         socialPosts: 0,
       },
       recent,

@@ -1,5 +1,6 @@
 // src/server.ts
-import "dotenv/config";
+import "./loadEnv.js";
+
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -19,9 +20,9 @@ import staticRoutes from './routes/static.js';
 import aiRoutes from './routes/ai.routes.js';
 
 import tournamentsRouter from './routes/tournaments.routes.js';
-
-const app = express();
-app.use(express.json());
+import socialRouter from './routes/social.routes.js';
+import champSelectRouter from './routes/champ-select.routes.js';
+import lcuProxyRouter from './routes/lcu-proxy.routes.js';
 
 // ===== CORS =====
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
@@ -34,14 +35,25 @@ const corsOptions: cors.CorsOptions = {
     // Permite herramientas sin Origin (curl/Postman) y same-origin
     if (!origin) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS: origin no permitido: ${origin}`));
+    // Allow all localhost for development (companion on 5174, web on 8080, etc.)
+    if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      return cb(null, true);
+    }
+    // Permite Electron o webview protocols
+    if (origin.startsWith("app://") || origin.startsWith("file://") || origin.startsWith("vscode-webview://") || origin.startsWith("overwolf-extension://") || origin.startsWith("https://www.overwolf.com/")) {
+      return cb(null, true);
+    }
+    console.warn(`[CORS Blocked] Origin: ${origin}`);
+    return cb(null, false);
   },
   credentials: true, // <- necesario si el front manda cookies/credenciales
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
 };
 
+const app = express();
 app.use(cors(corsOptions));
+app.use(express.json());
 // Responder preflight explícitamente (algunos proxies lo requieren)
 
 // =================
@@ -79,9 +91,10 @@ app.use("/api/live", live);
 
 app.use('/api', aiRoutes);
 
-
-app.use('/api', tournamentsRouter);
 app.use('/api/tournaments', tournamentsRouter);
+app.use('/api/social', socialRouter);
+app.use('/api/champ-select', champSelectRouter);
+app.use('/api/lcu-proxy', lcuProxyRouter);
 
 
 

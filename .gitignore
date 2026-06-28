@@ -21,5 +21,8 @@ build/
 .env.local
 .env.*.local
 
+# Dev/E2E scripts (may contain test credentials — keep local, never push)
+scripts/dev/
+
 # Misc
 .DS_Store

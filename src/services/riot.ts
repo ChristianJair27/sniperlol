@@ -214,6 +214,23 @@ export async function getLiveGame(platform: Platform | string, summonerId: strin
   }
 }
 
+export async function getLiveGameByPuuid(platform: Platform | string, puuid: string) {
+  const key = normalizePlatform(platform as string);
+  const base = PLATFORM_HOST[key];
+  if (!base) return null;
+
+  const url = `${base}/lol/spectator/v5/active-games/by-puuid/${encodeURIComponent(puuid)}`;
+  try {
+    const { data } = await riot.get(url);
+    return data as any;
+  } catch (e: any) {
+    const st = e?.response?.status;
+    // 404 = not in game, 403/401 = key lacks permission → return null so caller can try by-summoner
+    if (st === 404 || st === 403 || st === 401) return null;
+    rethrowNice(e, `${key} spectator-v5 active-games by-puuid`);
+  }
+}
+
 
 // --- AL FINAL DE src/services/riot.ts ---
 
@@ -279,5 +296,35 @@ export async function getLeagueEntriesBySummonerId(platform: Platform | string, 
   } catch (e: any) {
     if (e?.response?.status === 404) return [];
     rethrowNice(e, `${key} league-v4 entries by-summoner`);
+  }
+}
+
+export type LeagueEntry = {
+  queueType: string;     // "RANKED_SOLO_5x5" | "RANKED_FLEX_SR"
+  tier: string;
+  rank: string;
+  leaguePoints: number;
+  wins: number;
+  losses: number;
+  summonerId?: string;
+  puuid?: string;
+  hotStreak?: boolean;
+  veteran?: boolean;
+  freshBlood?: boolean;
+  inactive?: boolean;
+};
+
+// ===== League-V4 (PLATFORM): entries by PUUID (current, reliable path) =====
+export async function getLeagueEntriesByPuuid(platform: Platform | string, puuid: string): Promise<LeagueEntry[]> {
+  const key = normalizePlatform(platform as string);
+  const base = PLATFORM_HOST[key];
+  if (!base) return [];
+  const url = `${base}/lol/league/v4/entries/by-puuid/${encodeURIComponent(puuid)}`;
+  try {
+    const { data } = await riot.get(url);
+    return (data || []) as LeagueEntry[];
+  } catch (e: any) {
+    if (e?.response?.status === 404) return [];
+    rethrowNice(e, `${key} league-v4 entries by-puuid`);
   }
 }

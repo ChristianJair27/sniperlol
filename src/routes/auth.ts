@@ -13,7 +13,7 @@ type DbUser = {
   name: string | null;
   avatar_url: string | null;
   role: 'user' | 'admin';
-  provider: 'local' | 'google';
+  provider: 'local' | 'google' | 'riot';
   provider_id: string | null;
   password_hash: string | null;
 };
@@ -130,6 +130,150 @@ r.get("/google/callback", async (req, res) => {
   } catch (e) {
     console.error("[AUTH] google callback error", e);
     res.redirect(`${WEB_ORIGIN}/login?error=google`);
+  }
+});
+
+// ===== RIOT SIGN-ON (RSO) =====
+// OAuth2 Authorization Code flow against Riot's auth server.
+// Requires RSO_CLIENT_ID, RSO_CLIENT_SECRET and RSO_REDIRECT_URI in .env, where
+// RSO_REDIRECT_URI must EXACTLY match the URI registered with your RSO product.
+const RSO_AUTH_BASE = process.env.RSO_AUTH_BASE || "https://auth.riotgames.com";
+const RSO_ACCOUNT_BASE = `https://${process.env.RSO_ACCOUNT_REGION || "americas"}.api.riotgames.com`;
+
+function rsoConfigured() {
+  return !!(process.env.RSO_CLIENT_ID && process.env.RSO_CLIENT_SECRET && process.env.RSO_REDIRECT_URI);
+}
+
+// Step 1 — send the user to Riot to authorize
+r.get("/riot", (_req, res) => {
+  if (!rsoConfigured()) {
+    return res.status(503).send("RSO no configurado: falta RSO_CLIENT_ID / RSO_CLIENT_SECRET / RSO_REDIRECT_URI en .env");
+  }
+  const state = crypto.randomBytes(16).toString("hex");
+  res.cookie("rso_state", state, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 10 * 60 * 1000,
+  });
+  const params = new URLSearchParams({
+    redirect_uri: process.env.RSO_REDIRECT_URI!,
+    client_id: process.env.RSO_CLIENT_ID!,
+    response_type: "code",
+    scope: "openid",
+    state,
+  });
+  res.redirect(`${RSO_AUTH_BASE}/authorize?${params.toString()}`);
+});
+
+// Step 2 — Riot redirects back with ?code; exchange it for tokens, resolve the
+// player's PUUID + Riot ID, upsert the user, then hand a JWT to the frontend.
+r.get("/riot/callback", async (req, res) => {
+  try {
+    if (!rsoConfigured()) return res.status(503).send("RSO no configurado");
+
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+    const cookieState = (req as any).cookies?.rso_state;
+    if (!code) return res.redirect(`${WEB_ORIGIN}/login?error=rso`);
+    if (!state || !cookieState || state !== cookieState) {
+      return res.redirect(`${WEB_ORIGIN}/login?error=rso_state`);
+    }
+    res.clearCookie("rso_state");
+
+    // Exchange authorization code for tokens (confidential client → Basic auth)
+    const basic = Buffer.from(`${process.env.RSO_CLIENT_ID}:${process.env.RSO_CLIENT_SECRET}`).toString("base64");
+    const tokenRes = await fetch(`${RSO_AUTH_BASE}/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${basic}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: process.env.RSO_REDIRECT_URI!,
+      }).toString(),
+    });
+    if (!tokenRes.ok) {
+      console.error("[RSO] token exchange failed:", tokenRes.status, await tokenRes.text().catch(() => ""));
+      return res.redirect(`${WEB_ORIGIN}/login?error=rso_token`);
+    }
+    const tokenJson: any = await tokenRes.json();
+    const accessToken: string = tokenJson.access_token;
+    const idToken: string | undefined = tokenJson.id_token;
+
+    // PUUID from the id_token's `sub` claim (token came directly from Riot over TLS)
+    let puuid = "";
+    if (idToken) {
+      try {
+        const part = idToken.split(".")[1];
+        const payload = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+        puuid = payload.sub || "";
+      } catch { /* ignore */ }
+    }
+
+    // Riot ID (gameName#tagLine) via Account-V1 /me using the RSO access token
+    let gameName = "", tagLine = "";
+    try {
+      const meRes = await fetch(`${RSO_ACCOUNT_BASE}/riot/account/v1/accounts/me`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (meRes.ok) {
+        const me: any = await meRes.json();
+        puuid = me.puuid || puuid;
+        gameName = me.gameName || "";
+        tagLine = me.tagLine || "";
+      }
+    } catch { /* fall back to id_token puuid */ }
+
+    if (!puuid) return res.redirect(`${WEB_ORIGIN}/login?error=rso_nopuuid`);
+
+    const riotId = gameName && tagLine ? `${gameName}#${tagLine}` : "";
+    const displayName = riotId || `Riot ${puuid.slice(0, 6)}`;
+    // RSO doesn't provide an email — synthesize a stable placeholder for the NOT NULL/UNIQUE column.
+    const placeholderEmail = `riot_${puuid.slice(0, 24).toLowerCase()}@rso.atak.gg`;
+
+    const conn = await pool.getConnection();
+    let user: DbUser | undefined;
+    try {
+      await conn.beginTransaction();
+      const [rows] = await conn.query<any[]>(
+        "SELECT * FROM users WHERE provider='riot' AND provider_id=? LIMIT 1",
+        [puuid]
+      );
+      if (rows.length === 0) {
+        const [result]: any = await conn.query(
+          `INSERT INTO users (email, name, avatar_url, role, provider, provider_id, password_hash)
+           VALUES (?, ?, NULL, 'user', 'riot', ?, NULL)`,
+          [placeholderEmail, displayName, puuid]
+        );
+        const [rows2] = await conn.query<any[]>("SELECT * FROM users WHERE id = ? LIMIT 1", [result.insertId]);
+        user = rows2[0] as DbUser;
+      } else {
+        const u = rows[0] as DbUser;
+        await conn.query(`UPDATE users SET name = COALESCE(?, name) WHERE id = ?`, [displayName, u.id]);
+        const [rows2] = await conn.query<any[]>("SELECT * FROM users WHERE id = ? LIMIT 1", [u.id]);
+        user = rows2[0] as DbUser;
+      }
+      await conn.commit();
+    } catch (e) {
+      await conn.rollback();
+      throw e;
+    } finally {
+      conn.release();
+    }
+
+    const token = signToken({ id: user!.id, email: user!.email, role: user!.role });
+    const safeUser = {
+      id: user!.id, email: user!.email, name: user!.name,
+      avatar_url: user!.avatar_url, role: user!.role,
+      riotId, puuid,
+    };
+    res.redirect(`${WEB_ORIGIN}/dashboard?payload=${b64urlEncode({ token, user: safeUser })}`);
+  } catch (e) {
+    console.error("[AUTH] rso callback error", e);
+    res.redirect(`${WEB_ORIGIN}/login?error=rso`);
   }
 });
 
