@@ -1290,6 +1290,111 @@ router.get('/:id/bracket', optionalAuth, async (req: any, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Tournament dashboard — one aggregated payload for the detail view ─────────
+let _ddV = { v: '14.24.1', at: 0 };
+async function ddVersion(): Promise<string> {
+  if (Date.now() - _ddV.at < 6 * 3600_000) return _ddV.v;
+  try {
+    const r = await fetch('https://ddragon.leagueoflegends.com/api/versions.json');
+    const j: any = await r.json();
+    if (Array.isArray(j) && j[0]) _ddV = { v: j[0], at: Date.now() };
+  } catch { /* keep last */ }
+  return _ddV.v;
+}
+const TD_PALETTE = ['#e8323c', '#e5e7eb', '#4ade80', '#3b82f6', '#a78bfa', '#22d3ee'];
+function tdMono(n?: string | null): string {
+  if (!n) return '?';
+  const p = n.trim().split(/\s+/);
+  return (p.length > 1 ? p[0][0] + p[1][0] : n.slice(0, 2)).toUpperCase();
+}
+
+router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    const access = await getViewerAccess(t, req.auth);
+    const regs = await getRegs(t.id);
+    const version = await ddVersion();
+
+    const names = regs.map(r => r.teamName);
+    const colorOf = (name?: string | null) => TD_PALETTE[(name ? Math.max(0, names.indexOf(name)) : 0) % TD_PALETTE.length];
+    const teamMeta = (name?: string | null) => (name && name !== 'BYE')
+      ? { id: name, name, mono: tdMono(name), color: colorOf(name) } : null;
+
+    const bracketArr: BracketMatch[] = t.bracket || [];
+    const maxRound = bracketArr.length ? Math.max(...bracketArr.map(m => m.round)) : 0;
+    const rlabel = (r: number) => {
+      const d = maxRound - r;
+      return d === 0 ? 'Final' : d === 1 ? 'Semifinales' : d === 2 ? 'Cuartos' : `Ronda ${r}`;
+    };
+    const rounds = [];
+    for (let r = 1; r <= maxRound; r++) {
+      const matches = bracketArr.filter(m => m.round === r)
+        .sort((a, b) => a.matchNumber - b.matchNumber)
+        .map(m => ({
+          id: m.id, round: m.round, matchStatus: m.matchStatus,
+          teamA: m.team1 ? { ...teamMeta(m.team1), score: m.score1 ?? null } : null,
+          teamB: m.team2 ? { ...teamMeta(m.team2), score: m.score2 ?? null } : null,
+          winnerId: m.winner || null, scheduledAt: null,
+        }));
+      rounds.push({ round: r, label: rlabel(r), matches });
+    }
+
+    const standings = (t.standings || []).map(s => {
+      const games = (s.wins || 0) + (s.losses || 0);
+      return {
+        teamId: s.team, name: s.team, mono: tdMono(s.team), color: colorOf(s.team),
+        wins: s.wins || 0, losses: s.losses || 0,
+        winratePct: games ? Math.round((s.wins / games) * 100) : 0,
+        streak: null, points: s.points || 0, position: s.position,
+      };
+    });
+
+    const activeM = bracketArr.find(m => m.matchStatus === 'active');
+    const liveMatch = activeM ? {
+      matchId: activeM.id, game: 1, timer: null, code: (access === 'owner' || access === 'participant') ? activeM.code : null,
+      teamA: { ...teamMeta(activeM.team1), score: activeM.score1 ?? 0, picks: [] },
+      teamB: { ...teamMeta(activeM.team2), score: activeM.score2 ?? 0, picks: [] },
+      goldDiffSeries: [],
+    } : null;
+
+    const schedule = bracketArr
+      .filter(m => m.matchStatus !== 'complete' && m.team1 && m.team2 && m.team1 !== 'BYE' && m.team2 !== 'BYE')
+      .slice(0, 6)
+      .map(m => ({ matchId: m.id, scheduledAt: null, teamA: teamMeta(m.team1), teamB: teamMeta(m.team2), roundLabel: rlabel(m.round), reminded: false }));
+
+    let myTeam: any = null;
+    if (req.auth?.userId) {
+      const reg = regs.find(r => (r as any).registeredBy === req.auth.userId);
+      if (reg) myTeam = {
+        tag: reg.teamName, checkinDeadline: t.checkinDeadline ?? null, checkedIn: !!reg.checkedIn,
+        roster: (reg.players || []).slice(0, 5).map((p: any) => ({ playerName: p.name || p.riotId, role: null, mainChampionId: null, rank: null })),
+      };
+    }
+
+    let activityByDay: Array<{ day: string; games: number }> = [];
+    try {
+      const [rows] = await pool.query<any[]>('SELECT game_end_ts FROM tournament_match_stats WHERE tournament_id = ? AND game_end_ts IS NOT NULL', [t.id]);
+      const byDay: Record<string, number> = {};
+      for (const row of rows) { const d = new Date(Number(row.game_end_ts)).toISOString().slice(0, 10); byDay[d] = (byDay[d] || 0) + 1; }
+      activityByDay = Object.entries(byDay).map(([day, games]) => ({ day, games }));
+    } catch { /* optional */ }
+
+    const status = t.phase === 'active' ? 'live' : t.phase === 'complete' ? 'finished'
+      : t.phase === 'registration' ? 'registration' : 'checkin';
+
+    res.json({
+      tournament: {
+        id: t.id, name: t.name, season: null, startDate: t.startDate, endDate: null,
+        format: t.format, patch: version, region: t.region, phase: t.phase, status,
+        prizePool: t.prize, prizeFinal: null, teamsRegistered: regs.length, teamsMax: t.maxParticipants,
+        checkinDeadline: t.checkinDeadline ?? null, logoUrl: t.logoUrl, bannerUrl: t.bannerUrl,
+      },
+      bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 // Activate match
 router.post('/:id/matches/:matchId/activate', requireAuth, async (req: any, res) => {
   const { id, matchId } = req.params;
