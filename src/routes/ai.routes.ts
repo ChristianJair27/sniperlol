@@ -16,70 +16,75 @@ const MODEL = process.env.OLLAMA_MODEL || 'llama3.1:8b';
 const getCacheKey = (type: string, data: any) => `${type}:${JSON.stringify(data)}`;
 
 // Ruta: etiquetas globales del jugador
+// ── Shared tag helpers (structured, scannable, data-grounded) ─────────────────
+type AiTag = { label: string; kind: 'pos' | 'warn' | 'gold' | 'dim' };
+const TAG_KINDS = ['pos', 'warn', 'gold', 'dim'];
+const num = (v: any) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+
+// Parse Ollama's JSON output (format:json) into validated AiTags, tolerating a few shapes.
+function parseAiTags(raw: string): AiTag[] {
+  try {
+    const parsed = JSON.parse(raw);
+    const arr = Array.isArray(parsed) ? parsed : (parsed.tags || parsed.labels || []);
+    return arr
+      .map((t: any) => (typeof t === 'string' ? { label: t, kind: 'dim' } : { label: t?.label, kind: t?.kind }))
+      .filter((t: AiTag) => t.label)
+      .map((t: AiTag) => ({ label: String(t.label).slice(0, 22), kind: TAG_KINDS.includes(t.kind) ? t.kind : 'dim' }));
+  } catch { return []; }
+}
+// Merge fact tags (reliable, from data) + AI flavor tags, dedupe by label, cap.
+function mergeTags(facts: AiTag[], flavor: AiTag[], max = 5): AiTag[] {
+  const out: AiTag[] = []; const seen = new Set<string>();
+  for (const t of [...facts, ...flavor]) {
+    const k = t.label.toLowerCase();
+    if (seen.has(k)) continue; seen.add(k); out.push(t);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
 router.post('/ai-insights', async (req, res) => {
-  console.log('Solicitud IA global recibida:', req.body);
-
   const { riotId, region, stats } = req.body;
+  if (!stats || !riotId) return res.status(400).json({ error: 'Faltan datos requeridos' });
 
-  if (!stats || !riotId) {
-    return res.status(400).json({ error: 'Faltan datos requeridos' });
-  }
+  const cacheKey = getCacheKey('insights2', { riotId, stats });
+  const cached = cache.get<AiTag[]>(cacheKey);
+  if (cached) return res.json({ tags: cached, insights: JSON.stringify(cached.map(t => t.label)) });
 
-  const cacheKey = getCacheKey('insights', { riotId, stats });
-  const cached = cache.get<string>(cacheKey);
-  if (cached) {
-    console.log('Respuesta desde cache');
-    return res.json({ insights: cached });
-  }
+  const wr = num(stats.winRate), kda = num(stats.kda), games = num(stats.totalGames);
+  // Deterministic base tags — always correct, computed straight from the numbers.
+  const facts: AiTag[] = [];
+  if (wr >= 60) facts.push({ label: 'En racha', kind: 'pos' });
+  else if (wr > 0 && wr < 45) facts.push({ label: 'Mala racha', kind: 'warn' });
+  if (kda >= 4) facts.push({ label: 'KDA alto', kind: 'pos' });
+  else if (kda > 0 && kda < 1.8) facts.push({ label: 'Muere seguido', kind: 'warn' });
+  if (wr >= 60 && games > 0 && games < 40) facts.push({ label: 'Posible smurf', kind: 'gold' });
+  if (stats.rank && /challenger|grandmaster|master|diamond|diamante/i.test(stats.rank)) facts.push({ label: 'Elo alto', kind: 'gold' });
+  if (games >= 200) facts.push({ label: 'Veterano', kind: 'dim' });
+  else if (games > 0 && games < 30) facts.push({ label: 'Cuenta nueva', kind: 'dim' });
 
-  const topChamps = stats.mostPlayed || 'No disponible';
-
-  const prompt = `Eres ATAK Coach, analista LoL directo y con humor negro. Genera EXCLUSIVAMENTE un array JSON de 5 strings (etiquetas clave). Usa jerga LoL (inting, feeding, smurf, etc.). Ejemplo exacto:
-
-["Int Master", "CS Bot", "Ward Hater", "All-in Addict", "Smurf Fail"]
-
-Perfil:
-- Riot ID: ${riotId}
-- Región: ${region}
-- Rank: ${stats.rank || 'Sin clasificar'}
-- Winrate: ${stats.winRate || 'N/A'}%
-- KDA: ${stats.kda || 'N/A'}
-- Campeones: ${topChamps}
-- Partidas: ${stats.totalGames || 'N/A'}
-
-Responde SOLO con el array JSON de strings. NO uses objetos, NO añadas texto extra, NO uses markdown.`;
+  const prompt = `Perfil de LoL (usa SOLO estos datos, no inventes):
+Rank ${stats.rank || 'Sin clasificar'} · Winrate ${wr}% · KDA ${kda} · Mains: ${stats.mostPlayed || 'N/A'} · ${games} partidas.
+Devuelve JSON {"tags":[...]}: 2 o 3 etiquetas MUY cortas (1-3 palabras, español, jerga LoL) que describan a este jugador según esos números. Cada tag {"label":"...","kind":"pos|warn|gold|dim"} (pos=bueno, warn=malo, gold=destaca, dim=neutro). Solo JSON.`;
 
   try {
     const response = await axios.post(OLLAMA_URL, {
       model: MODEL,
-      messages: [{ role: 'user', content: prompt }],
-      stream: false,
-    }, {
-      timeout: 300000,
-    });
+      messages: [
+        { role: 'system', content: 'Respondes SIEMPRE con JSON {"tags":[{"label","kind"}]}. Etiquetas brevísimas basadas en los datos dados. Nunca párrafos.' },
+        { role: 'user', content: prompt },
+      ],
+      stream: false, format: 'json', options: { temperature: 0.5 },
+    }, { timeout: 60000 });
 
-    let aiText = '["Análisis no disponible"]';
-    try {
-      const rawContent = response.data.message?.content?.trim() || '';
-      const parsed = JSON.parse(rawContent);
-
-      if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string')) {
-        aiText = JSON.stringify(parsed);
-      } else {
-        console.warn('IA devolvió formato inválido:', parsed);
-        aiText = '["Formato inesperado de IA"]';
-      }
-    } catch (parseError) {
-      console.error('Error parseando respuesta IA:', parseError);
-      aiText = '["Error en análisis IA"]';
-    }
-
-    cache.set(cacheKey, aiText);
-    console.log('IA global cacheada');
-    res.json({ insights: aiText });
+    const flavor = parseAiTags(response.data.message?.content?.trim() || '');
+    const tags = mergeTags(facts, flavor, 5);
+    cache.set(cacheKey, tags, 600);
+    res.json({ tags, insights: JSON.stringify(tags.map(t => t.label)) });
   } catch (error: any) {
-    console.error('Error Ollama global:', error.message);
-    res.status(500).json({ error: 'Error conectando con IA' });
+    console.error('Error Ollama insights:', error.code ?? error.message);
+    // Graceful: return the data-driven tags even if the AI is down.
+    res.json({ tags: facts, insights: JSON.stringify(facts.map(t => t.label)), unavailable: true });
   }
 });
 
@@ -91,50 +96,43 @@ router.post('/ai-match-tags', async (req, res) => {
     return res.status(400).json({ error: 'Faltan datos de partida' });
   }
 
-  const cacheKey = getCacheKey('match', matchData.matchId);
-  const cached = cache.get<string>(cacheKey);
-  if (cached) {
-    return res.json({ tags: cached });
-  }
+  const cacheKey = getCacheKey('match2', matchData.matchId);
+  const cached = cache.get<AiTag[]>(cacheKey);
+  if (cached) return res.json({ tags: cached });
 
-  const prompt = `Eres ATAK Coach, directo con humor negro. Genera EXCLUSIVAMENTE un array JSON de 3 strings (etiquetas clave para esta partida). Ejemplo exacto:
+  const kda = num(matchData.kda), cs = num(matchData.cs);
+  const k = num(matchData.kills), d = num(matchData.deaths), a = num(matchData.assists);
+  // Deterministic base tags from the match numbers.
+  const facts: AiTag[] = [];
+  facts.push(matchData.win ? { label: 'Victoria', kind: 'pos' } : { label: 'Derrota', kind: 'warn' });
+  if (kda >= 5 || (d === 0 && (k + a) >= 5)) facts.push({ label: 'Dominó', kind: 'pos' });
+  else if (kda >= 3) facts.push({ label: 'Buen KDA', kind: 'pos' });
+  else if (kda > 0 && kda < 1) facts.push({ label: 'Partida difícil', kind: 'warn' });
+  if (d >= 8) facts.push({ label: 'Murió mucho', kind: 'warn' });
+  if (cs >= 8.5) facts.push({ label: 'Farmeó bien', kind: 'gold' });
+  else if (cs > 0 && cs < 4.5) facts.push({ label: 'Poco CS', kind: 'dim' });
+  if (k >= 10) facts.push({ label: 'Carreó', kind: 'gold' });
 
-["Feeding Early", "Carry Late", "Ward God"]
-
-Partida: Win: ${matchData.win ? 'Sí' : 'No'}, KDA: ${matchData.kda}, CS/min: ${matchData.cs || 'N/A'}, Role: ${matchData.role || 'N/A'}.
-
-Responde SOLO con el array JSON de strings. NO uses objetos, NO añadas texto extra, NO uses markdown.`;
+  const prompt = `Partida de LoL (usa SOLO estos datos): ${matchData.win ? 'Victoria' : 'Derrota'}, ${matchData.championName || matchData.role || ''} KDA ${matchData.kills ?? '?'}/${matchData.deaths ?? '?'}/${matchData.assists ?? '?'} (${kda}), ${cs} CS/min.
+Devuelve JSON {"tags":[...]}: 2 etiquetas MUY cortas (1-3 palabras, español) sobre el desempeño en ESTA partida. Cada {"label":"...","kind":"pos|warn|gold|dim"}. Solo JSON.`;
 
   try {
     const response = await axios.post(OLLAMA_URL, {
       model: MODEL,
-      messages: [{ role: 'user', content: prompt }],
-      stream: false,
-    }, {
-      timeout: 180000,
-    });
+      messages: [
+        { role: 'system', content: 'Respondes SIEMPRE con JSON {"tags":[{"label","kind"}]}. Etiquetas brevísimas de la partida. Nunca párrafos.' },
+        { role: 'user', content: prompt },
+      ],
+      stream: false, format: 'json', options: { temperature: 0.5 },
+    }, { timeout: 60000 });
 
-    let tags = '["Análisis no disponible"]';
-    try {
-      const rawContent = response.data.message?.content?.trim() || '';
-      const parsed = JSON.parse(rawContent);
-
-      if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string')) {
-        tags = JSON.stringify(parsed);
-      } else {
-        console.warn('IA partida devolvió formato inválido:', parsed);
-        tags = '["Formato inesperado"]';
-      }
-    } catch (parseError) {
-      console.error('Error parseando respuesta IA partida:', parseError);
-      tags = '["Error en análisis"]';
-    }
-
-    cache.set(cacheKey, tags);
+    const flavor = parseAiTags(response.data.message?.content?.trim() || '');
+    const tags = mergeTags(facts, flavor, 4);
+    cache.set(cacheKey, tags, 3600);
     res.json({ tags });
   } catch (error: any) {
-    console.error('Error IA partida:', error.message);
-    res.status(500).json({ error: 'Error en análisis de partida' });
+    console.error('Error IA partida:', error.code ?? error.message);
+    res.json({ tags: facts, unavailable: true });
   }
 });
 
