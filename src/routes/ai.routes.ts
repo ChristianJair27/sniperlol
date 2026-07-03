@@ -195,47 +195,60 @@ router.post('/ai-live-coach', async (req, res) => {
     length: liveGame.gameLength,
     player: playerRiotId 
   });
-  const cached = cache.get<string>(cacheKey);
+  const cached = cache.get<{ tags: any[]; advice: string }>(cacheKey);
   if (cached) {
-    return res.json({ advice: cached });
+    return res.json(cached);
   }
 
   const fmtPlayer = (p: any) => `${p.championName || p.summonerName}(${p.kills}/${p.deaths}/${p.assists} ${p.cs}cs)`
   const blue = liveGame.participants.filter((p: any) => p.teamId === 100).map(fmtPlayer).join(', ');
   const red  = liveGame.participants.filter((p: any) => p.teamId === 200).map(fmtPlayer).join(', ');
 
-  const prompt = `Eres ATAK AI Coach, un analista de LoL extremadamente directo, con humor negro y conocimiento profundo. 
-Estás viendo una partida en vivo (minuto ${Math.floor((liveGame.gameLength || 0) / 60)}).
+  const prompt = `Eres ATAK AI Coach de LoL, viendo una partida en vivo (minuto ${Math.floor((liveGame.gameLength || 0) / 60)}).
+Composición — Azul: ${blue}. Rojo: ${red}.
+Jugador objetivo (${playerRiotId || 'desconocido'}): ${playerRecentStats ? JSON.stringify(playerRecentStats).slice(0, 400) : 'sin datos'}.
 
-Composición:
-Azul: ${blue}
-Rojo: ${red}
-
-Datos del jugador objetivo (${playerRiotId || 'desconocido'}): 
-${playerRecentStats ? JSON.stringify(playerRecentStats).slice(0, 600) : 'Sin datos recientes disponibles.'}
-
-Genera un consejo accionable y breve (máx 3-4 oraciones) como si estuvieras hablando por voz en un overlay. 
-Incluye:
-- Una observación sobre la composición o matchup actual
-- Una recomendación concreta (objetivo, rotación, build, etc.)
-- Un toque de humor negro si cabe.
-
-Responde SOLO con el texto del consejo. Nada de JSON, nada de explicaciones extra.`;
+Devuelve SOLO un JSON: {"tags":[ ... ]} con 3 o 4 consejos MUY cortos (2 a 4 palabras cada uno, en español), accionables para un overlay que se lee de un vistazo. Cada tag = {"label":"texto corto","kind":"pos|gold|warn|dim"}:
+- "warn": amenaza/peligro (ej. "Foco a Renekton", "Cuidado gank top")
+- "gold": objetivo/build (ej. "Roba dragón", "Compra Zhonya")
+- "pos": oportunidad/bueno (ej. "Empuja mid", "Toma iniciativa")
+- "dim": info neutra (ej. "Nashor a las 20:00")
+Nada de frases largas. Solo el JSON.`;
 
   try {
     const response = await axios.post(OLLAMA_URL, {
       model: MODEL,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [
+        { role: 'system', content: 'Respondes SIEMPRE con JSON válido {"tags":[{"label","kind"}]}. Consejos brevísimos, nunca párrafos.' },
+        { role: 'user', content: prompt },
+      ],
       stream: false,
+      format: 'json',
+      options: { temperature: 0.5 },
     }, { timeout: 120000 });
 
-    const advice = response.data.message?.content?.trim() || 'No pude generar consejo en este momento.';
-    cache.set(cacheKey, advice, 60);
-    res.json({ advice });
+    const raw = response.data.message?.content?.trim() || '{}';
+    const KINDS = ['pos', 'gold', 'warn', 'dim'];
+    let tags: Array<{ label: string; kind: string }> = [];
+    try {
+      const parsed = JSON.parse(raw);
+      const arr = Array.isArray(parsed) ? parsed : (parsed.tags || []);
+      tags = arr
+        .filter((t: any) => t && (t.label || typeof t === 'string'))
+        .slice(0, 4)
+        .map((t: any) => ({
+          label: String(t.label ?? t).slice(0, 32),
+          kind: KINDS.includes(t.kind) ? t.kind : 'gold',
+        }));
+    } catch { /* fall through to empty */ }
+
+    const advice = tags.map((t) => t.label).join(' · ');  // fullText fallback/tooltip
+    const payload = { tags, advice };
+    cache.set(cacheKey, payload, 60);
+    res.json(payload);
   } catch (error: any) {
     console.error('Error IA live coach:', error.code ?? error.message);
-    // Return graceful fallback so the overlay doesn't lose state over a transient AI error
-    res.json({ advice: null, unavailable: true });
+    res.json({ tags: [], advice: null, unavailable: true });
   }
 });
 
