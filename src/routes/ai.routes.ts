@@ -248,14 +248,18 @@ router.post('/ai-augment-tip', async (req, res) => {
     ? currentAugments.join(', ')
     : 'none yet';
 
-  const prompt = `You are a concise LoL Arena coach. Champion: ${champion}. Current augments: ${haveList}.
-Give ONE sentence (max 120 chars) advising what augment type to prioritize next pick. Be direct, specific, no filler. Only the tip text.`;
+  const prompt = `Campeón: ${champion}. Augments ya tomados: ${haveList}.
+Recomienda QUÉ TIPO/categoría de augment priorizar en el siguiente pick para este campeón (ej: "AP + Penetración mágica", "Velocidad de ataque on-hit", "Letalidad", "Vida/Tanque", "Haste + escudos"). UNA sola frase corta (máx 110 caracteres), directa y específica. Solo el texto del consejo, sin preámbulo.`;
 
   try {
     const response = await axios.post(OLLAMA_URL, {
       model: MODEL,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [
+        { role: 'system', content: 'Eres ATAK, coach experto de LoL Arena. SIEMPRE das una recomendación concreta y breve en español. Nunca te niegas ni pides más contexto.' },
+        { role: 'user', content: prompt },
+      ],
       stream: false,
+      options: { temperature: 0.4 },
     }, { timeout: 60000 });
 
     const tip = (response.data.message?.content?.trim() || '').slice(0, 160);
