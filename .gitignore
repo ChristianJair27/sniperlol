@@ -26,3 +26,8 @@ scripts/dev/
 
 # Misc
 .DS_Store
+
+# Tooling dirs that don't belong in the backend deploy repo
+mcps/
+agent-tools/
+terminals/

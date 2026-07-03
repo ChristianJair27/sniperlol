@@ -338,7 +338,7 @@ r.get("/matches/:regional/:matchId", async (req, res) => {
 
       killParticipation: teamKills ? (me.kills + me.assists) / teamKills : undefined,
       playerAugments: [me.playerAugment1, me.playerAugment2, me.playerAugment3, me.playerAugment4].filter((x: any) =>
-        Number.isInteger(x)
+        Number.isInteger(x) && x > 0
       ),
       teamParticipants: info.participants.map((p:any) => ({
   teamId: p.teamId,

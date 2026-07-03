@@ -22,6 +22,24 @@ router.options('/', (req, res) => {
   res.sendStatus(204);
 });
 
+// GET /api/lcu-proxy/game-data
+// Proxies LoL Live Client Data API (port 2999) for Overwolf windows.
+// Regular fetch() to localhost:4000 works from any Overwolf window;
+// direct access to port 2999 requires the "Web" permission (background-only).
+router.get('/game-data', async (req, res) => {
+  setCors(req, res);
+  try {
+    const { data } = await axios.get(
+      'https://127.0.0.1:2999/liveclientdata/allgamedata',
+      { timeout: 5000, httpsAgent: insecureAgent }
+    );
+    res.json(data);
+  } catch (err: any) {
+    const status = err?.code === 'ECONNREFUSED' || err?.code === 'ECONNRESET' ? 404 : 502;
+    res.status(status).json({ ok: false, msg: 'Not in game' });
+  }
+});
+
 // GET ?port=PORT&password=PASS&path=/lol-gameflow/...
 router.get('/', async (req, res) => {
   setCors(req, res);

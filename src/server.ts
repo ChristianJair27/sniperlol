@@ -23,6 +23,7 @@ import tournamentsRouter from './routes/tournaments.routes.js';
 import socialRouter from './routes/social.routes.js';
 import champSelectRouter from './routes/champ-select.routes.js';
 import lcuProxyRouter from './routes/lcu-proxy.routes.js';
+import opggRouter from './routes/opgg.routes.js';
 
 // ===== CORS =====
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
@@ -95,6 +96,7 @@ app.use('/api/tournaments', tournamentsRouter);
 app.use('/api/social', socialRouter);
 app.use('/api/champ-select', champSelectRouter);
 app.use('/api/lcu-proxy', lcuProxyRouter);
+app.use('/api/opgg', opggRouter);
 
 
 

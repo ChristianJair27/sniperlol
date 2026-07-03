@@ -1,18 +1,17 @@
 // src/routes/champ-select.routes.ts
-// GET /api/champ-select?champion=Jinx[&puuid=...&region=la1]
-// Returns rune/item/tip recommendations using Data Dragon (auto-updates each patch).
-// Champions WITHOUT a curated build get a real, champion-specific, AI-generated build
-// (Ollama llama3.1:8b) whose rune/item NAMES are resolved to Data Dragon IDs, cached
-// per champion+patch so the result is stable and deterministic (never random).
+// GET /api/champ-select?champion=Jinx[&position=BOTTOM&puuid=...&region=la1]
+// Build priority: OP.GG real meta data → curated static → AI (Ollama) → DDragon fallback
 import { Router } from 'express';
 import axios from 'axios';
 import { getMatchIdsByPUUID, getMatchById } from '../services/riot.js';
+import { getChampionBuild } from '../services/opgg.js';
 
 const router = Router();
 
 // ─── Ollama config (same pattern as ai.routes.ts) ────────────────────────────
-const OLLAMA_URL = 'http://localhost:11434/api/chat';
-const MODEL = 'llama3.1:8b';
+// Configurable via env so prod points at a hosted LLM; local Ollama in dev.
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/chat';
+const MODEL = process.env.OLLAMA_MODEL || 'llama3.1:8b';
 
 // ─── Patch-aware DDragon cache (1 hour) ──────────────────────────────────────
 let patchCache: { version: string; exp: number } | null = null;
@@ -403,8 +402,9 @@ Da UN consejo personalizado y accionable (máx 140 caracteres, en español) basa
 router.get('/', async (req, res) => {
   const rawName = (req.query.champion as string ?? '').trim();
   if (!rawName) return res.status(400).json({ ok: false, msg: 'champion param required' });
-  const puuid = (req.query.puuid as string ?? '').trim();
-  const region = (req.query.region as string ?? '').trim();
+  const puuid    = (req.query.puuid    as string ?? '').trim();
+  const region   = (req.query.region   as string ?? '').trim();
+  const position = (req.query.position as string ?? '').trim(); // LCDA: TOP/JUNGLE/MIDDLE/BOTTOM/UTILITY
 
   try {
     const patch = await getLatestPatch();
@@ -463,43 +463,59 @@ router.get('/', async (req, res) => {
     const role = champData?.tags?.[0] ?? 'Fighter';
     const displayName = champData?.name ?? rawName;
 
-    // ── Decide build source: curated > AI > DDragon recommended/default ──────────
+    // ── Decide build source: OP.GG live data > curated > AI > DDragon fallback ──
     const override = CHAMPION_BUILDS[buildKey];
     let runeIds: number[];
     let itemIds: number[];
     let bootsId: number;
     let starterIds: number[];
     let tips: string[];
-    let source: 'curated' | 'ai' | 'fallback';
+    let source: 'opgg' | 'curated' | 'ai' | 'fallback';
+    let winRateResult: number | null = null;
+    let pickRate: number | null = null;
+    let skillOrder: string[] = [];
 
-    if (override) {
-      runeIds = override.runes;
-      itemIds = override.items;
-      bootsId = override.boots;
+    // ── 1. Try OP.GG (live meta build from current patch data) ──────────────────
+    const opgg = await getChampionBuild(displayName, position || role).catch(() => null);
+    if (opgg && opgg.rune_ids[0] && opgg.core_item_ids.length >= 2) {
+      runeIds    = opgg.rune_ids;
+      itemIds    = opgg.core_item_ids.slice(0, 6);
+      bootsId    = opgg.boots_id;
+      starterIds = opgg.starter_ids.length ? opgg.starter_ids : [1055, 2003];
+      tips       = CHAMPION_TIPS[buildKey] ?? CHAMPION_TIPS.default;
+      source     = 'opgg';
+      winRateResult = opgg.win_rate !== null ? Math.round(opgg.win_rate * 100) : null;
+      pickRate   = opgg.pick_rate;
+      skillOrder = opgg.skill_order.slice(0, 15);
+    // ── 2. Curated static builds ──────────────────────────────────────────────────
+    } else if (override) {
+      runeIds    = override.runes;
+      itemIds    = override.items;
+      bootsId    = override.boots;
       starterIds = override.starter;
-      tips = CHAMPION_TIPS[buildKey] ?? CHAMPION_TIPS.default;
-      source = 'curated';
+      tips       = CHAMPION_TIPS[buildKey] ?? CHAMPION_TIPS.default;
+      source     = 'curated';
     } else {
-      // Try AI (cached per champion+patch → deterministic, never random)
+      // ── 3. AI (cached per champion+patch → deterministic, never random) ──────────
       const ai = await getAiBuild(displayName, role, patch, runeDataArr, itemData).catch(() => null);
       if (ai && ai.runes[0]) {
-        runeIds = ai.runes;
-        itemIds = ai.items;
-        bootsId = ai.boots;
+        runeIds    = ai.runes;
+        itemIds    = ai.items;
+        bootsId    = ai.boots;
         starterIds = ai.starter;
-        tips = ai.tips.length ? ai.tips : CHAMPION_TIPS.default;
-        source = 'ai';
+        tips       = ai.tips.length ? ai.tips : CHAMPION_TIPS.default;
+        source     = 'ai';
       } else {
-        // Graceful fallback: DDragon recommended build + sensible default rune page
+        // ── 4. DDragon recommended fallback ────────────────────────────────────────
         const recItems = champData?.recommended?.[0]?.blocks
           ?.flatMap((b: any) => b.items?.map((i: any) => Number(i.id)) ?? [])
           ?.filter((id: number) => itemData.data[String(id)]) ?? [];
-        runeIds = [8005, 9111, 9104, 8014, 8009, 8017, 5005, 5008, 5001];
-        itemIds = recItems.length >= 2 ? recItems.slice(0, 6) : [3078, 3071, 3047, 3053, 3065, 3742];
-        bootsId = 3047;
+        runeIds    = [8005, 9111, 9104, 8014, 8009, 8017, 5005, 5008, 5001];
+        itemIds    = recItems.length >= 2 ? recItems.slice(0, 6) : [3078, 3071, 3047, 3053, 3065, 3742];
+        bootsId    = 3047;
         starterIds = [1055, 2003];
-        tips = CHAMPION_TIPS.default;
-        source = 'fallback';
+        tips       = CHAMPION_TIPS.default;
+        source     = 'fallback';
       }
     }
 
@@ -520,8 +536,10 @@ router.get('/', async (req, res) => {
       champion: displayName,
       patch,
       role,
-      winRate: null, // real winRate not computed here; overlay tolerates null (no fake Math.random)
-      source,        // 'curated' | 'ai' | 'fallback' (diagnostic)
+      winRate: winRateResult,
+      pickRate,
+      skillOrder,
+      source,        // 'opgg' | 'curated' | 'ai' | 'fallback' (diagnostic)
       portrait: champData ? `https://ddragon.leagueoflegends.com/cdn/${patch}/img/champion/${champData.id}.png` : '',
       runes: {
         primaryPath: findRunePath(primaryPathId),

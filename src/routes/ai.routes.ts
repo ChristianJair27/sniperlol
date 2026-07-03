@@ -7,8 +7,10 @@ const router = Router();
 // Cache: 5 minutos TTL
 const cache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 
-const OLLAMA_URL = 'http://localhost:11434/api/chat';
-const MODEL = 'llama3.1:8b';
+// Configurable so prod can point at a hosted LLM (Ollama or any OpenAI-/Ollama-compatible
+// endpoint). Defaults to a local Ollama for dev.
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/chat';
+const MODEL = process.env.OLLAMA_MODEL || 'llama3.1:8b';
 
 // Helper para generar key de cache
 const getCacheKey = (type: string, data: any) => `${type}:${JSON.stringify(data)}`;
