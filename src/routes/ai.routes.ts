@@ -67,25 +67,23 @@ router.post('/ai-insights', async (req, res) => {
 Rank ${stats.rank || 'Sin clasificar'} · Winrate ${wr}% · KDA ${kda} · Mains: ${stats.mostPlayed || 'N/A'} · ${games} partidas.
 Devuelve JSON {"tags":[...]}: 2 o 3 etiquetas MUY cortas (1-3 palabras, español, jerga LoL) que describan a este jugador según esos números. Cada tag {"label":"...","kind":"pos|warn|gold|dim"} (pos=bueno, warn=malo, gold=destaca, dim=neutro). Solo JSON.`;
 
-  try {
-    const response = await axios.post(OLLAMA_URL, {
-      model: MODEL,
-      messages: [
-        { role: 'system', content: 'Respondes SIEMPRE con JSON {"tags":[{"label","kind"}]}. Etiquetas brevísimas basadas en los datos dados. Nunca párrafos.' },
-        { role: 'user', content: prompt },
-      ],
-      stream: false, format: 'json', options: { temperature: 0.5 },
-    }, { timeout: 60000 });
-
-    const flavor = parseAiTags(response.data.message?.content?.trim() || '');
-    const tags = mergeTags(facts, flavor, 5);
-    cache.set(cacheKey, tags, 600);
-    res.json({ tags, insights: JSON.stringify(tags.map(t => t.label)) });
-  } catch (error: any) {
-    console.error('Error Ollama insights:', error.code ?? error.message);
-    // Graceful: return the data-driven tags even if the AI is down.
-    res.json({ tags: facts, insights: JSON.stringify(facts.map(t => t.label)), unavailable: true });
-  }
+  // Respond INSTANTLY with the reliable data-driven tags (never blocks on the LLM,
+  // which can be slow/cold and would time out the client). Enrich with AI flavor in
+  // the background so the NEXT load (served from cache) also shows the LLM tag.
+  res.json({ tags: facts, insights: JSON.stringify(facts.map(t => t.label)) });
+  axios.post(OLLAMA_URL, {
+    model: MODEL,
+    messages: [
+      { role: 'system', content: 'Respondes SIEMPRE con JSON {"tags":[{"label","kind"}]}. Etiquetas brevísimas basadas en los datos dados. Nunca párrafos.' },
+      { role: 'user', content: prompt },
+    ],
+    stream: false, format: 'json', options: { temperature: 0.5 },
+  }, { timeout: 60000 })
+    .then(r => {
+      const flavor = parseAiTags(r.data.message?.content?.trim() || '');
+      cache.set(cacheKey, mergeTags(facts, flavor, 5), 600);
+    })
+    .catch(e => console.error('insights flavor bg:', e.code ?? e.message));
 });
 
 // Ruta: etiquetas por partida
@@ -116,24 +114,21 @@ router.post('/ai-match-tags', async (req, res) => {
   const prompt = `Partida de LoL (usa SOLO estos datos): ${matchData.win ? 'Victoria' : 'Derrota'}, ${matchData.championName || matchData.role || ''} KDA ${matchData.kills ?? '?'}/${matchData.deaths ?? '?'}/${matchData.assists ?? '?'} (${kda}), ${cs} CS/min.
 Devuelve JSON {"tags":[...]}: 2 etiquetas MUY cortas (1-3 palabras, español) sobre el desempeño en ESTA partida. Cada {"label":"...","kind":"pos|warn|gold|dim"}. Solo JSON.`;
 
-  try {
-    const response = await axios.post(OLLAMA_URL, {
-      model: MODEL,
-      messages: [
-        { role: 'system', content: 'Respondes SIEMPRE con JSON {"tags":[{"label","kind"}]}. Etiquetas brevísimas de la partida. Nunca párrafos.' },
-        { role: 'user', content: prompt },
-      ],
-      stream: false, format: 'json', options: { temperature: 0.5 },
-    }, { timeout: 60000 });
-
-    const flavor = parseAiTags(response.data.message?.content?.trim() || '');
-    const tags = mergeTags(facts, flavor, 4);
-    cache.set(cacheKey, tags, 3600);
-    res.json({ tags });
-  } catch (error: any) {
-    console.error('Error IA partida:', error.code ?? error.message);
-    res.json({ tags: facts, unavailable: true });
-  }
+  // Respond instantly with data-driven tags; enrich with AI flavor in the background.
+  res.json({ tags: facts });
+  axios.post(OLLAMA_URL, {
+    model: MODEL,
+    messages: [
+      { role: 'system', content: 'Respondes SIEMPRE con JSON {"tags":[{"label","kind"}]}. Etiquetas brevísimas de la partida. Nunca párrafos.' },
+      { role: 'user', content: prompt },
+    ],
+    stream: false, format: 'json', options: { temperature: 0.5 },
+  }, { timeout: 60000 })
+    .then(r => {
+      const flavor = parseAiTags(r.data.message?.content?.trim() || '');
+      cache.set(cacheKey, mergeTags(facts, flavor, 4), 3600);
+    })
+    .catch(e => console.error('match-tags flavor bg:', e.code ?? e.message));
 });
 
 // BONUS: Ruta build/runas (mantenida con validación extra)
