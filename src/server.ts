@@ -55,6 +55,10 @@ const corsOptions: cors.CorsOptions = {
 const app = express();
 app.use(cors(corsOptions));
 app.use(express.json());
+// cookieParser DEBE ir antes de cualquier router que lea req.cookies (p.ej. el
+// callback RSO valida la cookie `rso_state`). Antes estaba montado tarde (después
+// de /auth), así que el state llegaba vacío y el login de Riot fallaba con rso_state.
+app.use(cookieParser());
 // Responder preflight explícitamente (algunos proxies lo requieren)
 
 // =================
@@ -78,8 +82,6 @@ app.use("/api/players", playersLink);
 app.use('/api/static', staticRoutes);
 
 console.log("CORS_ORIGIN allowlist:", allowedOrigins);
-
-app.use(cookieParser());
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.use("/api/players", players);
