@@ -373,6 +373,86 @@ export async function resolveChampionId(name: string): Promise<number | null> {
   return null;
 }
 
+// ── ARAM augments (real pick-rate + performance per champion) ─────────────────
+export interface AramAugment {
+  id: number;
+  name: string;
+  desc: string;
+  tier: number;         // OP.GG tier (3+ returned; higher = stronger)
+  performance: number;  // ~100 = average; higher is better on this champ
+  pickRate: number;     // 0-1 (share of games this augment is taken on the champ)
+}
+
+export async function getAramAugments(championName: string): Promise<AramAugment[]> {
+  const champId = await resolveChampionId(championName);
+  if (!champId) return [];
+  const cacheKey = `aramaug:${champId}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) return cached.data as AramAugment[];
+  try {
+    const result = await callTool('lol_list_aram_augments', { champion_id: champId });
+    const augs = result?.data?.augments;
+    if (!Array.isArray(augs)) return [];
+    const out: AramAugment[] = augs
+      .map((a: any) => ({
+        id: Number(a.id),
+        name: String(a.name ?? ''),
+        desc: String(a.desc ?? '').replace(/<[^>]+>/g, ''), // strip rich-text tags
+        tier: Number(a.tier) || 0,
+        performance: Number(a.performance) || 0,
+        pickRate: Number(a.popular) || 0,
+      }))
+      .filter((a: AramAugment) => a.id && a.name);
+    out.sort((a, b) => b.pickRate - a.pickRate); // most-picked first
+    cache.set(cacheKey, { data: out, exp: Date.now() + CACHE_TTL });
+    return out;
+  } catch (e: any) {
+    console.error('[opgg] getAramAugments failed:', e?.message);
+    return [];
+  }
+}
+
+// ── Arena augment metadata (CommunityDragon: name/icon/rarity/desc) ────────────
+// OP.GG has no Arena augment stats, but CommunityDragon has the full metadata so
+// we can render the offered/picked Arena augments cleanly (real icons + rarity).
+export interface ArenaAugmentMeta {
+  id: number;
+  name: string;
+  desc: string;
+  rarity: number;   // 0=silver, 1=gold, 2=prismatic (higher can appear for special anvils)
+  icon: string;     // absolute CommunityDragon icon URL
+}
+const CDRAGON_ARENA = 'https://raw.communitydragon.org/latest/cdragon/arena/en_us.json';
+const CDRAGON_GAME  = 'https://raw.communitydragon.org/latest/game/';
+
+export async function getArenaAugmentMeta(): Promise<Record<number, ArenaAugmentMeta>> {
+  const cacheKey = 'arenaAugMeta';
+  const cached = cache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) return cached.data as Record<number, ArenaAugmentMeta>;
+  try {
+    const { data } = await axios.get(CDRAGON_ARENA, { timeout: 15000 });
+    const list: any[] = Array.isArray(data?.augments) ? data.augments : [];
+    const map: Record<number, ArenaAugmentMeta> = {};
+    for (const a of list) {
+      const id = Number(a.id);
+      if (!id) continue;
+      const iconPath = (a.iconLarge || a.iconSmall || '').toLowerCase();
+      map[id] = {
+        id,
+        name: String(a.name ?? ''),
+        desc: String(a.desc ?? '').replace(/<[^>]+>/g, ''),
+        rarity: Number(a.rarity) || 0,
+        icon: iconPath ? CDRAGON_GAME + iconPath : '',
+      };
+    }
+    cache.set(cacheKey, { data: map, exp: Date.now() + 6 * 60 * 60 * 1000 }); // 6h
+    return map;
+  } catch (e: any) {
+    console.error('[opgg] getArenaAugmentMeta failed:', e?.message);
+    return {};
+  }
+}
+
 // ── Summoner full profile ─────────────────────────────────────────────────────
 export interface OPGGChampStat {
   champion_name: string;

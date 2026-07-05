@@ -5,9 +5,34 @@
 // GET /api/opgg/raw?game_name=Faker&tag_line=KR1&region=KR   ← diagnostic: raw MCP text
 import { Router } from 'express';
 import axios from 'axios';
-import { getSummonerRank, getSummonerFullProfile, normaliseRegion, getChampionBuild, getLaneMeta, resolveChampionId } from '../services/opgg.js';
+import { getSummonerRank, getSummonerFullProfile, normaliseRegion, getChampionBuild, getLaneMeta, resolveChampionId, getAramAugments, getArenaAugmentMeta } from '../services/opgg.js';
 
 const router = Router();
+
+// GET /api/opgg/aram-augments?champion=Jinx
+// Real per-champion ARAM augment stats (pick-rate + performance) from OP.GG.
+router.get('/aram-augments', async (req, res) => {
+  const champion = (req.query.champion as string ?? '').trim();
+  if (!champion) return res.status(400).json({ ok: false, msg: 'champion requerido' });
+  try {
+    const augments = await getAramAugments(champion);
+    res.json({ ok: true, champion, augments });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, msg: err?.message });
+  }
+});
+
+// GET /api/opgg/arena-augment-meta
+// Full Arena augment metadata (name/icon/rarity/desc) from CommunityDragon, so the
+// overlay can render the augments the player picks with real icons + rarity.
+router.get('/arena-augment-meta', async (_req, res) => {
+  try {
+    const meta = await getArenaAugmentMeta();
+    res.json({ ok: true, augments: meta });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, msg: err?.message });
+  }
+});
 
 router.get('/summoner', async (req, res) => {
   let gameName = (req.query.game_name as string ?? '').trim();
