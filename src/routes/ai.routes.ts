@@ -55,11 +55,15 @@ router.post('/ai-insights', async (req, res) => {
   // Deterministic base tags — always correct, computed straight from the numbers.
   const facts: AiTag[] = [];
   if (wr >= 60) facts.push({ label: 'En racha', kind: 'pos' });
+  else if (wr >= 52) facts.push({ label: 'Ganando', kind: 'pos' });
   else if (wr > 0 && wr < 45) facts.push({ label: 'Mala racha', kind: 'warn' });
   if (kda >= 4) facts.push({ label: 'KDA alto', kind: 'pos' });
-  else if (kda > 0 && kda < 1.8) facts.push({ label: 'Muere seguido', kind: 'warn' });
-  if (wr >= 60 && games > 0 && games < 40) facts.push({ label: 'Posible smurf', kind: 'gold' });
-  if (stats.rank && /challenger|grandmaster|master|diamond|diamante/i.test(stats.rank)) facts.push({ label: 'Elo alto', kind: 'gold' });
+  else if (kda >= 2.8) facts.push({ label: 'KDA sólido', kind: 'pos' });
+  else if (kda > 0 && kda < 1.5) facts.push({ label: 'Muere seguido', kind: 'warn' });
+  if (wr >= 58 && games > 0 && games < 40) facts.push({ label: 'Posible smurf', kind: 'gold' });
+  if (stats.rank && /challenger|grandmaster|gran maestro/i.test(stats.rank)) facts.push({ label: 'Elo top', kind: 'gold' });
+  else if (stats.rank && /master|maestro|diamond|diamante|emerald|esmeralda/i.test(stats.rank)) facts.push({ label: 'Elo alto', kind: 'gold' });
+  if (stats.mostPlayed) facts.push({ label: `Main ${stats.mostPlayed}`, kind: 'dim' });
   if (games >= 200) facts.push({ label: 'Veterano', kind: 'dim' });
   else if (games > 0 && games < 30) facts.push({ label: 'Cuenta nueva', kind: 'dim' });
 
