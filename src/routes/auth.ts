@@ -150,10 +150,16 @@ r.get("/riot", (_req, res) => {
     return res.status(503).send("RSO no configurado: falta RSO_CLIENT_ID / RSO_CLIENT_SECRET / RSO_REDIRECT_URI en .env");
   }
   const state = crypto.randomBytes(16).toString("hex");
+  // El callback vuelve desde auth.riotgames.com (cross-site) hacia atakback. Con
+  // SameSite=Lax el navegador NO reenvía la cookie en ese redirect cross-site entre
+  // subdominios, así que el `state` llegaba vacío y fallaba siempre (rso_state).
+  // None+Secure la envía en todo contexto (requiere HTTPS, que prod tiene). En local
+  // (http) usamos Lax porque None sin Secure es rechazada por el navegador.
+  const isProd = process.env.NODE_ENV === "production";
   res.cookie("rso_state", state, {
     httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    sameSite: isProd ? "none" : "lax",
+    secure: isProd,
     maxAge: 10 * 60 * 1000,
   });
   const params = new URLSearchParams({
