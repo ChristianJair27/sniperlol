@@ -4,6 +4,7 @@ import { OAuth2Client } from "google-auth-library";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { pool } from "../db.js"; // <-- tu pool MySQL
+import { getSummonerByPUUID, getAccountByPUUID } from "../services/riot.js";
 
 const r = Router();
 
@@ -144,6 +145,26 @@ function rsoConfigured() {
   return !!(process.env.RSO_CLIENT_ID && process.env.RSO_CLIENT_SECRET && process.env.RSO_REDIRECT_URI);
 }
 
+// RSO da puuid/gameName/tagLine pero NO la plataforma (la1, na1, …). La detectamos
+// probando summoner-v4 by-puuid en las plataformas de la región RSO; la primera que
+// devuelve summoner (no-404) es la del jugador. Devolvemos también el profileIcon.
+const REGION_PLATFORMS: Record<string, string[]> = {
+  americas: ["la1", "la2", "na1", "br1", "oc1"],
+  europe:   ["euw1", "eun1", "tr1", "ru"],
+  asia:     ["jp1", "kr", "ph2", "sg2", "th2", "tw2", "vn2"],
+};
+async function detectRiotPlatform(puuid: string): Promise<{ platform: string; profileIconId: number | null }> {
+  const region = (process.env.RSO_ACCOUNT_REGION || "americas").toLowerCase();
+  const platforms = REGION_PLATFORMS[region] || REGION_PLATFORMS.americas;
+  for (const p of platforms) {
+    try {
+      const s: any = await getSummonerByPUUID(p, puuid);
+      if (s) return { platform: p, profileIconId: s.profileIconId ?? null };
+    } catch { /* probar siguiente plataforma */ }
+  }
+  return { platform: platforms[0], profileIconId: null }; // fallback razonable
+}
+
 // Step 1 — send the user to Riot to authorize
 r.get("/riot", (_req, res) => {
   if (!rsoConfigured()) {
@@ -233,6 +254,15 @@ r.get("/riot/callback", async (req, res) => {
       }
     } catch { /* fall back to id_token puuid */ }
 
+    // Si /me no devolvió el Riot ID, resolverlo por puuid con la dev key para no
+    // guardar la cuenta vinculada sin nombre.
+    if (puuid && (!gameName || !tagLine)) {
+      try {
+        const acc: any = await getAccountByPUUID(puuid);
+        if (acc) { gameName = acc.gameName || gameName; tagLine = acc.tagLine || tagLine; }
+      } catch { /* seguimos con lo que haya */ }
+    }
+
     if (!puuid) return res.redirect(`${WEB_ORIGIN}/login?error=rso_nopuuid`);
 
     const riotId = gameName && tagLine ? `${gameName}#${tagLine}` : "";
@@ -268,6 +298,52 @@ r.get("/riot/callback", async (req, res) => {
       throw e;
     } finally {
       conn.release();
+    }
+
+    // ── Auto-vincular la cuenta de LoL ────────────────────────────────────────
+    // El login con Riot YA prueba ownership, así que poblamos user_riot_accounts
+    // sin pedir vinculación manual (antes el dashboard mandaba a "Vincular cuenta").
+    // Si el puuid ya estaba vinculado a OTRO usuario, se lo quitamos: el acceso por
+    // Riot es del dueño real de la cuenta (take-ownership).
+    if (gameName && tagLine) {
+      try {
+        const { platform, profileIconId } = await detectRiotPlatform(puuid);
+        const conn2 = await pool.getConnection();
+        try {
+          await conn2.beginTransaction();
+          // take-ownership: liberar el puuid de cualquier otro usuario
+          await conn2.query(
+            "DELETE FROM user_riot_accounts WHERE puuid = ? AND user_id <> ?",
+            [puuid, user!.id]
+          );
+          const [ex]: any = await conn2.query(
+            "SELECT id FROM user_riot_accounts WHERE user_id = ? LIMIT 1",
+            [user!.id]
+          );
+          if (ex.length) {
+            await conn2.query(
+              `UPDATE user_riot_accounts
+                 SET platform=?, puuid=?, game_name=?, tag_line=?, profile_icon=?, updated_at=NOW()
+               WHERE user_id=?`,
+              [platform, puuid, gameName, tagLine, profileIconId, user!.id]
+            );
+          } else {
+            await conn2.query(
+              `INSERT INTO user_riot_accounts (user_id, platform, puuid, game_name, tag_line, profile_icon)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              [user!.id, platform, puuid, gameName, tagLine, profileIconId]
+            );
+          }
+          await conn2.commit();
+        } catch (e) {
+          await conn2.rollback(); throw e;
+        } finally {
+          conn2.release();
+        }
+      } catch (e) {
+        // No bloqueamos el login si el auto-link falla; el usuario podrá vincular manual.
+        console.error("[RSO] auto-link failed:", (e as any)?.message);
+      }
     }
 
     const token = signToken({ id: user!.id, email: user!.email, role: user!.role });
