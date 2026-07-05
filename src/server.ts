@@ -18,6 +18,7 @@ import playersLink from "./routes/players.link.js";
 import staticRoutes from './routes/static.js';
 
 import aiRoutes from './routes/ai.routes.js';
+import aiPublicRouter from './routes/ai-public.routes.js';
 
 import tournamentsRouter from './routes/tournaments.routes.js';
 import socialRouter from './routes/social.routes.js';
@@ -93,6 +94,8 @@ app.use("/api/live", live);
 
 
 app.use('/api', aiRoutes);
+// API de IA compartible (API-key) para apps de terceros (p.ej. reproductor de música).
+app.use('/api/ai', aiPublicRouter);
 
 app.use('/api/tournaments', tournamentsRouter);
 app.use('/api/social', socialRouter);
