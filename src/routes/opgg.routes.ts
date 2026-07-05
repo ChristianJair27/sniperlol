@@ -5,7 +5,7 @@
 // GET /api/opgg/raw?game_name=Faker&tag_line=KR1&region=KR   ← diagnostic: raw MCP text
 import { Router } from 'express';
 import axios from 'axios';
-import { getSummonerRank, getSummonerFullProfile, normaliseRegion, getChampionBuild } from '../services/opgg.js';
+import { getSummonerRank, getSummonerFullProfile, normaliseRegion, getChampionBuild, getLaneMeta, resolveChampionId } from '../services/opgg.js';
 
 const router = Router();
 
@@ -127,19 +127,44 @@ router.get('/tier-list', async (req, res) => {
   const cached = tierCache.get(cacheKey);
   if (cached && cached.exp > Date.now()) return res.json({ ok: true, picks: cached.data });
 
-  const champs = CURATED[posKey] ?? CURATED.bottom;
   try {
-    const results = await Promise.all(
-      champs.map(async c => {
-        const build = await getChampionBuild(c.name, c.opggPos).catch(() => null);
-        const tier  = build?.tier ?? 5;
-        const rank  = build?.rank ?? 99;
-        const wr    = build?.win_rate != null ? Math.round(build.win_rate * 100) : null;
-        const score = parseFloat(Math.max(0, 10 - tier * 1.8 - rank * 0.01).toFixed(1));
-        return { name: c.name, id: c.id, tier, rank, wr, score };
-      })
-    );
-    const picks = results.sort((a, b) => b.score - a.score);
+    // Primary source: ONE real OP.GG meta call (tiers + win/pick/ban per lane).
+    const meta = await getLaneMeta(rawPos);
+    let picks: any[] = [];
+
+    if (meta.length) {
+      const resolved = await Promise.all(meta.map(async m => {
+        const id = await resolveChampionId(m.name);
+        if (id == null) return null; // skip champs we can't map to a portrait
+        const wr    = Math.round(m.winRate * 100);
+        // Meaningful, higher = better: tier-1 rank-1 ≈ 8.5-10, lower tiers drop off.
+        const score = parseFloat(
+          Math.min(10, Math.max(0, 10 - m.tier * 1.5 - (m.rank - 1) * 0.08)).toFixed(1)
+        );
+        return {
+          name: m.name, id, tier: m.tier, rank: m.rank, wr,
+          win_rate: m.winRate, pick_rate: m.pickRate, ban_rate: m.banRate, score,
+        };
+      }));
+      picks = resolved.filter(Boolean).sort((a: any, b: any) => b.score - a.score);
+    }
+
+    // Fallback: never regress to nothing — use the curated list if meta is empty.
+    if (!picks.length) {
+      const champs = CURATED[posKey] ?? CURATED.bottom;
+      const results = await Promise.all(
+        champs.map(async c => {
+          const build = await getChampionBuild(c.name, c.opggPos).catch(() => null);
+          const tier  = build?.tier ?? 5;
+          const rank  = build?.rank ?? 99;
+          const wr    = build?.win_rate != null ? Math.round(build.win_rate * 100) : null;
+          const score = parseFloat(Math.max(0, 10 - tier * 1.8 - rank * 0.01).toFixed(1));
+          return { name: c.name, id: c.id, tier, rank, wr, score };
+        })
+      );
+      picks = results.sort((a, b) => b.score - a.score);
+    }
+
     tierCache.set(cacheKey, { data: picks, exp: Date.now() + 30 * 60 * 1000 });
     res.json({ ok: true, picks });
   } catch (err: any) {

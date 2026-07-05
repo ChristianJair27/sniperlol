@@ -251,6 +251,128 @@ export async function getChampionBuild(
   }
 }
 
+// ── Lane meta (tier list) ─────────────────────────────────────────────────────
+// Uses ONE call to lol_list_lane_meta_champions which returns real OP.GG tiers +
+// win/pick/ban rates for every position at once.
+export interface LaneMetaChamp {
+  name: string;      // OP.GG champion display name, e.g. "Miss Fortune"
+  winRate: number;   // 0-1 fraction
+  pickRate: number;  // 0-1 fraction
+  banRate: number;   // 0-1 fraction
+  tier: number;      // 1 = best
+  rank: number;      // 1 = best
+  kda: number;
+}
+
+// Incoming position (LCU / role) → positions map key
+const LANE_KEY: Record<string, string> = {
+  MIDDLE: 'mid', MID: 'mid',
+  TOP: 'top',
+  JUNGLE: 'jungle', JG: 'jungle',
+  BOTTOM: 'adc', BOT: 'adc', ADC: 'adc',
+  UTILITY: 'support', SUPPORT: 'support', SUP: 'support',
+};
+// positions key → OP.GG lane argument
+const KEY_LANE: Record<string, string> = {
+  mid: 'MIDDLE', top: 'TOP', jungle: 'JUNGLE', adc: 'BOTTOM', support: 'UTILITY',
+};
+
+export async function getLaneMeta(position: string): Promise<LaneMetaChamp[]> {
+  const key = LANE_KEY[(position ?? '').toUpperCase()] ?? 'mid';
+  const cacheKey = `laneMeta:${key}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) return cached.data as LaneMetaChamp[];
+
+  try {
+    const lane = KEY_LANE[key] ?? 'MIDDLE';
+    // NOTE: the tool returns ALL positions regardless of the lane argument.
+    const parsed = await callTool('lol_list_lane_meta_champions', { lane });
+    const positions = parsed?.data?.positions ?? {};
+
+    let arr: any[] = Array.isArray(positions[key]) ? positions[key] : [];
+    if (!arr.length) {
+      // Fallback: use the first non-empty positions array we can find.
+      for (const k of Object.keys(positions)) {
+        if (Array.isArray(positions[k]) && positions[k].length) { arr = positions[k]; break; }
+      }
+    }
+
+    const meta: LaneMetaChamp[] = arr.slice(0, 15).map((e: any) => ({
+      name: String(e?.champion ?? ''),
+      winRate: typeof e?.win_rate === 'number' ? e.win_rate : 0,
+      pickRate: typeof e?.pick_rate === 'number' ? e.pick_rate : 0,
+      banRate: typeof e?.ban_rate === 'number' ? e.ban_rate : 0,
+      tier: typeof e?.tier === 'number' ? e.tier : 5,
+      rank: typeof e?.rank === 'number' ? e.rank : 99,
+      kda: typeof e?.kda === 'number' ? e.kda : 0,
+    })).filter(m => m.name);
+
+    cache.set(cacheKey, { data: meta, exp: Date.now() + CACHE_TTL });
+    return meta;
+  } catch (err: any) {
+    console.warn('[opgg] lane meta failed:', err?.message);
+    return [];
+  }
+}
+
+// ── DDragon champion name → numeric championId resolver ───────────────────────
+// The overlay's cdPortrait() builds a communitydragon champion-icons URL from the
+// NUMERIC championId (DDragon `.key`, e.g. Miss Fortune = 21), so we resolve to that.
+interface DDragonMaps { byName: Record<string, number>; byKeyId: Record<string, number>; }
+
+function normName(s: string): string { return (s ?? '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+// OP.GG display-name quirks → DDragon key id (`.id`), normalised.
+const OPGG_NAME_ALIAS: Record<string, string> = {
+  wukong: 'monkeyking',
+  nunuwillump: 'nunu',
+  renataglasc: 'renata',
+};
+
+async function getDDragonMaps(): Promise<DDragonMaps | null> {
+  const cacheKey = 'ddragon:champmap';
+  const cached = cache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) return cached.data as DDragonMaps;
+
+  try {
+    const { data: versions } = await axios.get(
+      'https://ddragon.leagueoflegends.com/api/versions.json', { timeout: 15000 });
+    const version = Array.isArray(versions) && versions.length ? versions[0] : '15.1.1';
+    const { data: champJson } = await axios.get(
+      `https://ddragon.leagueoflegends.com/cdn/${version}/data/en_US/champion.json`,
+      { timeout: 15000 });
+
+    const byName: Record<string, number> = {};
+    const byKeyId: Record<string, number> = {};
+    const entries = champJson?.data ?? {};
+    for (const k of Object.keys(entries)) {
+      const c = entries[k];
+      const numId = parseInt(c?.key, 10);
+      if (isNaN(numId)) continue;
+      byName[normName(c?.name)] = numId; // display name, e.g. "Miss Fortune"
+      byKeyId[normName(c?.id)] = numId;   // key string, e.g. "MissFortune"
+    }
+    const maps: DDragonMaps = { byName, byKeyId };
+    cache.set(cacheKey, { data: maps, exp: Date.now() + CACHE_TTL });
+    return maps;
+  } catch (err: any) {
+    console.warn('[opgg] ddragon champion map failed:', err?.message);
+    return null;
+  }
+}
+
+export async function resolveChampionId(name: string): Promise<number | null> {
+  if (!name) return null;
+  const maps = await getDDragonMaps();
+  if (!maps) return null;
+  const n = normName(name);
+  const alias = OPGG_NAME_ALIAS[n];
+  if (alias && maps.byKeyId[alias] != null) return maps.byKeyId[alias];
+  if (maps.byName[n] != null) return maps.byName[n];
+  if (maps.byKeyId[n] != null) return maps.byKeyId[n];
+  return null;
+}
+
 // ── Summoner full profile ─────────────────────────────────────────────────────
 export interface OPGGChampStat {
   champion_name: string;
