@@ -5,9 +5,23 @@
 // GET /api/opgg/raw?game_name=Faker&tag_line=KR1&region=KR   ← diagnostic: raw MCP text
 import { Router } from 'express';
 import axios from 'axios';
-import { getSummonerRank, getSummonerFullProfile, normaliseRegion, getChampionBuild, getLaneMeta, resolveChampionId, getAramAugments, getArenaAugmentMeta } from '../services/opgg.js';
+import { getSummonerRank, getSummonerFullProfile, normaliseRegion, getChampionBuild, getLaneMeta, resolveChampionId, getAramAugments, getArenaAugmentMeta, getCounters } from '../services/opgg.js';
 
 const router = Router();
+
+// GET /api/opgg/counters?champion=Ahri&position=MIDDLE
+// Campeones que más le ganan al campeón dado en su línea (winrate real OP.GG).
+router.get('/counters', async (req, res) => {
+  const champion = (req.query.champion as string ?? '').trim();
+  const position = (req.query.position as string ?? 'MIDDLE').trim();
+  if (!champion) return res.status(400).json({ ok: false, msg: 'champion requerido' });
+  try {
+    const counters = await getCounters(champion, position);
+    res.json({ ok: true, champion, position, counters });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, msg: err?.message });
+  }
+});
 
 // GET /api/opgg/aram-augments?champion=Jinx
 // Real per-champion ARAM augment stats (pick-rate + performance) from OP.GG.

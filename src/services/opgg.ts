@@ -315,6 +315,71 @@ export async function getLaneMeta(position: string): Promise<LaneMetaChamp[]> {
   }
 }
 
+// ── Counter picks: quién gana contra un campeón en su línea ───────────────────
+// Usa lol_get_lane_matchup_guide, que (a diferencia del resto) devuelve JSON
+// crudo en content[0].text. El array summary.positions[].counters trae los
+// campeones que más le ganan a my_champion con play/win reales.
+export interface CounterPick {
+  id: number;       // numeric championId (para retratos)
+  name: string;
+  winRate: number;  // 0-1: winrate del counter CONTRA este campeón
+  games: number;
+}
+
+const POS_TO_OPGG_ENUM: Record<string, string> = {
+  TOP: 'top', JUNGLE: 'jungle', MIDDLE: 'mid', MID: 'mid',
+  BOTTOM: 'adc', ADC: 'adc', UTILITY: 'support', SUPPORT: 'support',
+};
+const OPGG_ENUM_TO_POSNAME: Record<string, string> = {
+  top: 'TOP', jungle: 'JUNGLE', mid: 'MID', adc: 'ADC', support: 'SUPPORT',
+};
+
+export async function getCounters(championName: string, position: string): Promise<CounterPick[]> {
+  const opggChamp = toOPGGChampName(championName);
+  const opggPos = POS_TO_OPGG_ENUM[(position ?? '').toUpperCase()] ?? 'mid';
+  const cacheKey = `counters:${opggChamp}:${opggPos}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) return cached.data as CounterPick[];
+
+  try {
+    // opponent_champion es requerido por el tool pero los counters del summary no
+    // dependen de él — pasamos un dummy distinto al campeón consultado.
+    const dummyOpponent = opggChamp === 'AHRI' ? 'SYLAS' : 'AHRI';
+    const { data: json } = await axios.post(MCP_URL, {
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method: 'tools/call',
+      params: {
+        name: 'lol_get_lane_matchup_guide',
+        arguments: { my_champion: opggChamp, opponent_champion: dummyOpponent, position: opggPos },
+      },
+    }, { timeout: 20000 });
+    if (json.error) throw new Error(String(json.error.message ?? json.error));
+
+    const parsed = JSON.parse(json.result?.content?.[0]?.text ?? '{}');
+    const positions: any[] = parsed?.data?.summary?.positions ?? [];
+    const wantName = OPGG_ENUM_TO_POSNAME[opggPos] ?? 'MID';
+    const entry = positions.find(p => p?.name === wantName) ?? positions[0];
+    const counters: any[] = entry?.counters ?? [];
+
+    const out: CounterPick[] = counters
+      .map(c => ({
+        id: Number(c?.champion_id) || 0,
+        name: String(c?.champion_name ?? ''),
+        winRate: c?.play ? (Number(c.win) || 0) / Number(c.play) : 0,
+        games: Number(c?.play) || 0,
+      }))
+      .filter(c => c.id && c.name)
+      .sort((a, b) => b.winRate - a.winRate);
+
+    cache.set(cacheKey, { data: out, exp: Date.now() + CACHE_TTL });
+    return out;
+  } catch (err: any) {
+    console.warn('[opgg] counters failed:', err?.message);
+    return [];
+  }
+}
+
 // ── DDragon champion name → numeric championId resolver ───────────────────────
 // The overlay's cdPortrait() builds a communitydragon champion-icons URL from the
 // NUMERIC championId (DDragon `.key`, e.g. Miss Fortune = 21), so we resolve to that.
