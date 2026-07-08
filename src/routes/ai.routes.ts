@@ -67,8 +67,8 @@ router.post('/ai-insights', async (req, res) => {
   if (games >= 200) facts.push({ label: 'Veterano', kind: 'dim' });
   else if (games > 0 && games < 30) facts.push({ label: 'Cuenta nueva', kind: 'dim' });
 
-  const prompt = `Perfil de LoL (usa SOLO estos datos, no inventes):
-Rank ${stats.rank || 'Sin clasificar'} · Winrate ${wr}% · KDA ${kda} · Mains: ${stats.mostPlayed || 'N/A'} · ${games} partidas.
+  const prompt = `Perfil de LoL — datos de los últimos 30 días (usa SOLO estos datos, no inventes):
+Rank ${stats.rank || 'Sin clasificar'} · Winrate ${wr}% · KDA ${kda} · Mains: ${stats.mostPlayed || 'N/A'} · ${games} partidas en 30 días.
 Devuelve JSON {"tags":[...]}: 2 o 3 etiquetas MUY cortas (1-3 palabras, español, jerga LoL) que describan a este jugador según esos números. Cada tag {"label":"...","kind":"pos|warn|gold|dim"} (pos=bueno, warn=malo, gold=destaca, dim=neutro). Solo JSON.`;
 
   // Respond INSTANTLY with the reliable data-driven tags (never blocks on the LLM,

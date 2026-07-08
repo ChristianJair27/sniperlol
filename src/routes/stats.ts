@@ -1650,4 +1650,76 @@ r.get("/seasons/:puuid", async (req, res) => {
   }
 });
 
+// ── GET /enemy-avg/:platform/:puuid — elo promedio de los rivales recientes ──
+// Muestra "Promedio enemigos" en el perfil (estilo Porofessor). Toma los últimos
+// N matches (detalles ya cacheados por getMatchById), junta puuids del equipo
+// RIVAL, muestrea hasta 12 y promedia su solo-queue tier/division. Cache 1h.
+const enemyAvgCache = new Map<string, { data: any; exp: number }>();
+const TIER_ORDER = ["IRON","BRONZE","SILVER","GOLD","PLATINUM","EMERALD","DIAMOND","MASTER","GRANDMASTER","CHALLENGER"];
+const DIV_ORDER: Record<string, number> = { IV: 0, III: 1, II: 2, I: 3 };
+
+r.get("/enemy-avg/:platform/:puuid", async (req, res) => {
+  const { platform, puuid } = req.params as { platform: string; puuid: string };
+  const count = Math.min(Number(req.query.count) || 10, 15);
+  const cacheKey = `${platform}:${puuid}`;
+  const hit = enemyAvgCache.get(cacheKey);
+  if (hit && hit.exp > Date.now()) return res.json(hit.data);
+
+  try {
+    const ids = await getMatchIdsByPUUID(platform, puuid, count, 0);
+    if (!ids?.length) return res.json({ ok: true, tier: null, sample: 0 });
+
+    // Recolectar rivales únicos (equipo contrario al jugador), solo colas con rank.
+    const cutoff = Date.now() - 30 * 86400_000;
+    const enemies = new Set<string>();
+    for (const id of ids) {
+      const m: any = await getMatchById(platform, id);
+      const info = m?.info;
+      if (!info) continue;
+      if ((info.gameEndTimestamp ?? info.gameCreation ?? Date.now()) < cutoff) continue;
+      if (![420, 440].includes(info.queueId)) continue; // solo colas clasificatorias
+      const me = (info.participants || []).find((p: any) => p.puuid === puuid);
+      if (!me) continue;
+      for (const p of info.participants || []) {
+        if (p.teamId !== me.teamId && p.puuid) enemies.add(p.puuid);
+      }
+      if (enemies.size >= 24) break;
+    }
+
+    // Muestreo: hasta 12 rivales para no quemar rate limit.
+    const sample = Array.from(enemies).slice(0, 12);
+    const scores: number[] = [];
+    for (const ep of sample) {
+      try {
+        const entries = await getLeagueEntriesByPuuid(platform, ep);
+        const solo = entries.find(e => e.queueType === "RANKED_SOLO_5x5") ?? entries[0];
+        if (!solo?.tier) continue;
+        const t = TIER_ORDER.indexOf(solo.tier.toUpperCase());
+        if (t < 0) continue;
+        // master+ no tiene divisiones — cuenta como división tope.
+        const d = t >= 7 ? 3 : (DIV_ORDER[solo.rank as string] ?? 0);
+        scores.push(t * 4 + d);
+      } catch { /* rival sin rank o error puntual — seguir */ }
+    }
+
+    let payload: any = { ok: true, tier: null, rank: null, sample: scores.length };
+    if (scores.length >= 3) {
+      const avg = Math.round(scores.reduce((s, x) => s + x, 0) / scores.length);
+      const tierIdx = Math.min(9, Math.floor(avg / 4));
+      const divIdx = avg % 4;
+      const divLabel = ["IV", "III", "II", "I"][divIdx];
+      payload = {
+        ok: true,
+        tier: TIER_ORDER[tierIdx],
+        rank: tierIdx >= 7 ? null : divLabel, // master+ sin división
+        sample: scores.length,
+      };
+    }
+    enemyAvgCache.set(cacheKey, { data: payload, exp: Date.now() + 60 * 60 * 1000 });
+    return res.json(payload);
+  } catch (e: any) {
+    return res.status(200).json({ ok: false, tier: null, sample: 0, message: e?.message });
+  }
+});
+
 export default r;
