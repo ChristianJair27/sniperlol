@@ -163,9 +163,13 @@ router.get('/tier-list', async (req, res) => {
         if (id == null) return null; // skip champs we can't map to a portrait
         const wr    = Math.round(m.winRate * 100);
         // Meaningful, higher = better: tier-1 rank-1 ≈ 8.5-10, lower tiers drop off.
-        const score = parseFloat(
-          Math.min(10, Math.max(0, 10 - m.tier * 1.5 - (m.rank - 1) * 0.08)).toFixed(1)
-        );
+        // tier <= 0 = campeón nuevo/sin clasificar en OP.GG (ej. Locke al salir):
+        // NO es "mejor que tier 1" — le damos score neutro derivado del winrate.
+        const score = m.tier <= 0
+          ? parseFloat(Math.min(7, Math.max(3, (m.winRate - 0.44) * 50)).toFixed(1))
+          : parseFloat(
+              Math.min(10, Math.max(0, 10 - m.tier * 1.5 - (m.rank - 1) * 0.08)).toFixed(1)
+            );
         return {
           name: m.name, id, tier: m.tier, rank: m.rank, wr,
           win_rate: m.winRate, pick_rate: m.pickRate, ban_rate: m.banRate, score,
