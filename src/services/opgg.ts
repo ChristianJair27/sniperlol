@@ -366,7 +366,9 @@ export async function getCounters(championName: string, position: string): Promi
       .map(c => ({
         id: Number(c?.champion_id) || 0,
         name: String(c?.champion_name ?? ''),
-        winRate: c?.play ? (Number(c.win) || 0) / Number(c.play) : 0,
+        // win/play viene desde la perspectiva de my_champion (p.ej. Ahri gana
+        // 48.6% vs Qiyana) → el WR del COUNTER contra él es el complemento.
+        winRate: c?.play ? 1 - (Number(c.win) || 0) / Number(c.play) : 0,
         games: Number(c?.play) || 0,
       }))
       .filter(c => c.id && c.name)
