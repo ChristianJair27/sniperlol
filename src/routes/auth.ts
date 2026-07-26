@@ -279,21 +279,34 @@ r.get("/riot/callback", async (req, res) => {
     let user: DbUser | undefined;
     try {
       await conn.beginTransaction();
+      // Buscar por provider_id O por el email sintético: filas de versiones
+      // anteriores pueden tener el mismo email con provider_id distinto, y el
+      // INSERT chocaba con ER_DUP_ENTRY (key 'email').
       const [rows] = await conn.query<any[]>(
-        "SELECT * FROM users WHERE provider='riot' AND provider_id=? LIMIT 1",
-        [puuid]
+        "SELECT * FROM users WHERE (provider='riot' AND provider_id=?) OR email=? LIMIT 1",
+        [puuid, placeholderEmail]
       );
       if (rows.length === 0) {
         const [result]: any = await conn.query(
           `INSERT INTO users (email, name, avatar_url, role, provider, provider_id, password_hash)
-           VALUES (?, ?, NULL, 'user', 'riot', ?, NULL)`,
+           VALUES (?, ?, NULL, 'user', 'riot', ?, NULL)
+           ON DUPLICATE KEY UPDATE name=VALUES(name), provider='riot', provider_id=VALUES(provider_id)`,
           [placeholderEmail, displayName, puuid]
         );
-        const [rows2] = await conn.query<any[]>("SELECT * FROM users WHERE id = ? LIMIT 1", [result.insertId]);
+        const [rows2] = await conn.query<any[]>(
+          result.insertId
+            ? "SELECT * FROM users WHERE id = ? LIMIT 1"
+            : "SELECT * FROM users WHERE email = ? LIMIT 1",
+          [result.insertId || placeholderEmail]
+        );
         user = rows2[0] as DbUser;
       } else {
         const u = rows[0] as DbUser;
-        await conn.query(`UPDATE users SET name = COALESCE(?, name) WHERE id = ?`, [displayName, u.id]);
+        // Repara filas viejas: asegura provider/provider_id actuales
+        await conn.query(
+          `UPDATE users SET name = COALESCE(?, name), provider='riot', provider_id=? WHERE id = ?`,
+          [displayName, puuid, u.id]
+        );
         const [rows2] = await conn.query<any[]>("SELECT * FROM users WHERE id = ? LIMIT 1", [u.id]);
         user = rows2[0] as DbUser;
       }
