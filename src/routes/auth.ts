@@ -202,7 +202,12 @@ r.get("/riot/callback", async (req, res) => {
     const code = String(req.query.code || "");
     const state = String(req.query.state || "");
     const cookieState = (req as any).cookies?.rso_state;
-    if (!code) return res.redirect(`${WEB_ORIGIN}/login?error=rso`);
+    if (!code) {
+      // Riot regresó sin code: trae ?error=... con el motivo (access_denied,
+      // invalid_scope, etc). Lo registramos para diagnóstico.
+      console.warn("[rso] callback sin code. query:", JSON.stringify(req.query));
+      return res.redirect(`${WEB_ORIGIN}/login?error=rso`);
+    }
     if (!state || !cookieState || state !== cookieState) {
       return res.redirect(`${WEB_ORIGIN}/login?error=rso_state`);
     }
