@@ -159,6 +159,8 @@ async function initTables() {
     `ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS logo_url VARCHAR(1000)`,
     `ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS registered_by INT`,
     `ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS captain_user_id INT`,
+    // Soft-hide: torneos de prueba fuera de listas públicas sin borrar datos
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS hidden TINYINT(1) DEFAULT 0`,
   ]) { await pool.query(col).catch(() => {}); }
   // Seed only if empty
   const [[{ cnt }]] = await pool.query<any[]>('SELECT COUNT(*) AS cnt FROM tournaments');
@@ -235,7 +237,7 @@ function rowToTournament(row: any): TournamentData {
   };
 }
 
-async function getT(id: string): Promise<TournamentData | null> {
+export async function getT(id: string): Promise<TournamentData | null> {
   const [[row]] = await pool.query<any[]>('SELECT * FROM tournaments WHERE id = ?', [id]);
   return row ? rowToTournament(row) : null;
 }
@@ -276,7 +278,7 @@ function sanitizeBracketMatch(m: BracketMatch, access: ViewerAccess): BracketMat
   };
 }
 
-function sanitizeBracket(bracket: BracketMatch[] | undefined, access: ViewerAccess) {
+export function sanitizeBracket(bracket: BracketMatch[] | undefined, access: ViewerAccess) {
   if (!bracket) return undefined;
   return bracket.map(m => sanitizeBracketMatch(m, access));
 }
@@ -337,7 +339,7 @@ function serialize(t: TournamentData, access: ViewerAccess = 'public') {
   };
 }
 
-async function getRegs(tournamentId: string): Promise<TeamRegistration[]> {
+export async function getRegs(tournamentId: string): Promise<TeamRegistration[]> {
   const [rows] = await pool.query<any[]>(
     'SELECT * FROM tournament_registrations WHERE tournament_id = ? ORDER BY registered_at ASC',
     [tournamentId]
@@ -434,7 +436,7 @@ function isAdmin(req: any) { return req.auth?.role === 'admin'; }
 
 // ─── Match stats DB helpers ───────────────────────────────────────────────────
 
-async function getStoredMatchStats(tournamentId: string, bracketMatchId: string) {
+export async function getStoredMatchStats(tournamentId: string, bracketMatchId: string) {
   const [[row]] = await pool.query<any[]>(
     'SELECT parsed_data, game_end_ts FROM tournament_match_stats WHERE tournament_id=? AND bracket_match_id=?',
     [tournamentId, bracketMatchId]
@@ -727,7 +729,9 @@ async function applyResult(
 // GET all — list never includes bracket/codes; detail uses GET /:id
 router.get('/', optionalAuth, async (req: any, res) => {
   try {
-    const [rows] = await pool.query<any[]>('SELECT * FROM tournaments ORDER BY created_at DESC');
+    const [rows] = await pool.query<any[]>(
+      'SELECT * FROM tournaments WHERE COALESCE(hidden,0)=0 ORDER BY created_at DESC'
+    );
     const out = await Promise.all(rows.map(async (r) => {
       const t = rowToTournament(r);
       const access = await getViewerAccess(t, req.auth);
@@ -1234,6 +1238,14 @@ router.post('/:id/checkin', requireAuth, async (req: any, res) => {
       [t.id, teamName]
     );
     if (!reg) return res.status(404).json({ error:'Equipo no encontrado' });
+    // Autorización por membresía real (no por captainRiotId del body, que el
+    // cliente puede omitir): quien registró al equipo, un jugador del roster
+    // (invitación aceptada) o el organizador/admin del torneo.
+    const uid = req.auth?.userId;
+    const rosterPlayers: RosterPlayer[] = typeof reg.players === 'string' ? JSON.parse(reg.players) : (reg.players ?? []);
+    const isMember = reg.registered_by === uid || rosterPlayers.some(p => p.userId === uid);
+    if (!isMember && !isOwner(req, t))
+      return res.status(403).json({ error:'Solo un miembro del equipo puede hacer check-in' });
     if (captainRiotId && reg.captain_riot_id!==captainRiotId)
       return res.status(403).json({ error:'Riot ID del capitán no coincide' });
     if (reg.checked_in) return res.status(400).json({ error:'Ya hizo check-in' });
@@ -1757,13 +1769,10 @@ router.post('/:id/auto-sync', async (req, res) => {
   }
 });
 
-// Global stats — aggregated from all completed bracket matches in this tournament
-router.get('/:id/global-stats', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const t = await getT(id);
-    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
-
+// Global stats — aggregated from all completed bracket matches in this tournament.
+// Extraída a función para reutilizarla desde la API pública (/api/public/v1).
+export async function computeGlobalStats(id: string) {
+  {
     const [rows] = await pool.query<any[]>(
       `SELECT parsed_data, game_duration FROM tournament_match_stats
        WHERE tournament_id = ? AND game_end_ts IS NOT NULL
@@ -1772,7 +1781,7 @@ router.get('/:id/global-stats', async (req, res) => {
     );
 
     if (rows.length === 0) {
-      return res.json({ tournamentId: id, matchesCompleted: 0, players: [], lastUpdated: Date.now() });
+      return { tournamentId: id, matchesCompleted: 0, players: [] as any[], lastUpdated: Date.now() };
     }
 
     type Acc = {
@@ -1859,7 +1868,16 @@ router.get('/:id/global-stats', async (req, res) => {
       };
     });
 
-    res.json({ tournamentId: id, matchesCompleted: rows.length, players, lastUpdated: Date.now() });
+    return { tournamentId: id, matchesCompleted: rows.length, players, lastUpdated: Date.now() };
+  }
+}
+
+router.get('/:id/global-stats', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const t = await getT(id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    res.json(await computeGlobalStats(id));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

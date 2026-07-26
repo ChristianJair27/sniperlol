@@ -21,6 +21,8 @@ import aiRoutes from './routes/ai.routes.js';
 import aiPublicRouter from './routes/ai-public.routes.js';
 
 import tournamentsRouter from './routes/tournaments.routes.js';
+import publicApiRouter from './routes/public-api.routes.js';
+import integrationsRouter from './routes/integrations.routes.js';
 import socialRouter from './routes/social.routes.js';
 import champSelectRouter from './routes/champ-select.routes.js';
 import lcuProxyRouter from './routes/lcu-proxy.routes.js';
@@ -98,6 +100,9 @@ app.use('/api', aiRoutes);
 app.use('/api/ai', aiPublicRouter);
 
 app.use('/api/tournaments', tournamentsRouter);
+// API pública v1 (solo lectura, CORS abierto) — documentada en PUBLIC_API.md
+app.use('/api/public/v1', publicApiRouter);
+app.use('/api/integrations', integrationsRouter);
 app.use('/api/social', socialRouter);
 app.use('/api/champ-select', champSelectRouter);
 app.use('/api/lcu-proxy', lcuProxyRouter);
