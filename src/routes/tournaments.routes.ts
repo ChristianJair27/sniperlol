@@ -71,6 +71,9 @@ interface TournamentData {
   region?: string;
   logoUrl?: string;
   bannerUrl?: string;
+  // Fearless draft: campeones ya jugados en el torneo quedan bloqueados para
+  // picks siguientes (la plataforma los muestra; el lobby no lo puede forzar).
+  fearless?: boolean;
 }
 
 // ─── DB init ──────────────────────────────────────────────────────────────────
@@ -161,6 +164,7 @@ async function initTables() {
     `ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS captain_user_id INT`,
     // Soft-hide: torneos de prueba fuera de listas públicas sin borrar datos
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS hidden TINYINT(1) DEFAULT 0`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS fearless TINYINT(1) DEFAULT 0`,
   ]) { await pool.query(col).catch(() => {}); }
   // Seed only if empty
   const [[{ cnt }]] = await pool.query<any[]>('SELECT COUNT(*) AS cnt FROM tournaments');
@@ -234,6 +238,7 @@ function rowToTournament(row: any): TournamentData {
     region:     row.region                 || 'la1',
     logoUrl:    row.logo_url               || undefined,
     bannerUrl:  row.banner_url             || undefined,
+    fearless:   !!row.fearless,
   };
 }
 
@@ -334,7 +339,7 @@ function serialize(t: TournamentData, access: ViewerAccess = 'public') {
     checkinDeadline:t.checkinDeadline,
     codesAvailable: access === 'owner' ? t.codePool.length : undefined,
     createdBy: access === 'owner' ? t.createdBy : undefined,
-    region:t.region||'la1', logoUrl:t.logoUrl, bannerUrl:t.bannerUrl,
+    region:t.region||'la1', logoUrl:t.logoUrl, bannerUrl:t.bannerUrl, fearless:!!t.fearless,
     viewerAccess: access,
   };
 }
@@ -1401,6 +1406,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         format: t.format, patch: version, region: t.region, phase: t.phase, status,
         prizePool: t.prize, prizeFinal: null, teamsRegistered: regs.length, teamsMax: t.maxParticipants,
         checkinDeadline: t.checkinDeadline ?? null, logoUrl: t.logoUrl, bannerUrl: t.bannerUrl,
+        fearless: !!t.fearless,
       },
       bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
     });
@@ -1935,7 +1941,7 @@ router.get('/:id/code-info/:code', requireAuth, async (req: any, res) => {
 
 // ─── PATCH /:id — update logo/banner/region (owner only) ─────────────────────
 router.patch('/:id', requireAuth, async (req: any, res) => {
-  const { logoUrl, bannerUrl, region, name, prize, description } = req.body;
+  const { logoUrl, bannerUrl, region, name, prize, description, fearless } = req.body;
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
@@ -1947,7 +1953,57 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
     if (prize      !== undefined) t.prize      = prize;
     if (description !== undefined) t.description = description;
     await saveT(t);
+    if (fearless !== undefined) {
+      await pool.query('UPDATE tournaments SET fearless=? WHERE id=?', [fearless ? 1 : 0, t.id]);
+      t.fearless = !!fearless;
+    }
     res.json({ success: true, tournament: serialize(t) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Fearless draft: campeones ya usados por equipo en este torneo ─────────────
+// El lobby de Riot no puede forzarlo; la plataforma lo rastrea y lo muestra.
+// Asignación por Riot ID del roster (gamertag → equipo); lo que no se puede
+// atribuir cae en `unassigned` (igual está bloqueado globalmente).
+router.get('/:id/fearless', async (req, res) => {
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+
+    const regs = await getRegs(t.id);
+    const byRiotId = new Map<string, string>(); // riotId lower → teamName
+    for (const reg of regs) for (const p of reg.players || []) {
+      const rid = (p.riotId || p.name || '').toLowerCase();
+      if (rid) byRiotId.set(rid, reg.teamName);
+    }
+
+    const [rows] = await pool.query<any[]>(
+      `SELECT parsed_data FROM tournament_match_stats WHERE tournament_id=? AND game_end_ts IS NOT NULL`,
+      [t.id]
+    );
+    const teams = new Map<string, Set<string>>();
+    const unassigned = new Set<string>();
+    const all = new Set<string>();
+    for (const row of rows) {
+      const d: any = typeof row.parsed_data === 'string' ? JSON.parse(row.parsed_data) : row.parsed_data;
+      for (const p of [...(d.blueTeam ?? []), ...(d.redTeam ?? [])]) {
+        if (!p.championName) continue;
+        all.add(p.championName);
+        const rid = `${p.summonerName}#${p.tagLine || ''}`.toLowerCase();
+        const team = byRiotId.get(rid) ?? byRiotId.get((p.summonerName || '').toLowerCase());
+        if (team) {
+          if (!teams.has(team)) teams.set(team, new Set());
+          teams.get(team)!.add(p.championName);
+        } else unassigned.add(p.championName);
+      }
+    }
+    res.json({
+      fearless: !!t.fearless,
+      gamesCounted: rows.length,
+      teams: [...teams.entries()].map(([team, champs]) => ({ team, usedChampions: [...champs].sort() })),
+      unassigned: [...unassigned].sort(),
+      allUsed: [...all].sort(),
+    });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 

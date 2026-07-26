@@ -55,6 +55,7 @@ function publicTournament(t: any, teamsRegistered?: number) {
     description: t.description ?? '',
     logoUrl: t.logoUrl ?? null,
     bannerUrl: t.bannerUrl ?? null,
+    fearless: !!t.fearless,
   };
 }
 
