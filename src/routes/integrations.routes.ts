@@ -11,6 +11,7 @@
 import { Router } from 'express';
 import { pool } from '../db.js';
 import { getT } from './tournaments.routes.js';
+import { sendTournamentInvitationEmail, isDeliverableEmail } from '../services/mail.service.js';
 
 const router = Router();
 
@@ -50,9 +51,29 @@ router.post('/lqc/register', async (req, res) => {
     locality: pick('localidad', 'locality') || undefined,
     gender: pick('genero', 'género', 'gender') || undefined,
     source: 'lqc-form',
+    // La UI de ATAK.GG muestra "PENDIENTE" hasta que el jugador acepte desde su cuenta
+    inviteEmail: pick('correo', 'correo_electronico', 'email') || undefined,
+    inviteStatus: 'pending' as const,
   };
   const captainName  = pick('capitan', 'capitan_nombre', 'nombre_capitan', 'captainName', 'captain_name');
   const captainPhone = pick('capitan_celular', 'celular_capitan', 'captainPhone', 'captain_phone');
+
+  // Invita al jugador a ATAK.GG por correo (crear cuenta + seguir su torneo).
+  // Best-effort: si el SMTP falla, el registro NO se bloquea.
+  const inviteByEmail = (t: { id: string; name: string }) => {
+    if (!player.email || !isDeliverableEmail(player.email)) return;
+    sendTournamentInvitationEmail({
+      toEmail: player.email,
+      toName: nombre || gamertag,
+      inviterName: captainName || 'LQC',
+      tournamentName: t.name,
+      teamName,
+      tournamentId: t.id,
+      playerSlotName: gamertag,
+    }).then(r => {
+      if (r.previewUrl) console.log('[lqc/register] email preview:', r.previewUrl);
+    }).catch(e => console.warn('[lqc/register] email no enviado:', e.message));
+  };
 
   try {
     const t = await getT(tournamentId);
@@ -78,6 +99,7 @@ router.post('/lqc/register', async (req, res) => {
          [captainName, captainPhone, player.email].filter(Boolean).join(' · ')]
       );
       await pool.query('UPDATE tournaments SET participants = participants + 1 WHERE id = ?', [tournamentId]);
+      inviteByEmail(t);
       return res.json({ ok: true, action: 'team_created', team: teamName, player: gamertag });
     }
 
@@ -90,6 +112,7 @@ router.post('/lqc/register', async (req, res) => {
       players.push(player);
     }
     await pool.query('UPDATE tournament_registrations SET players=? WHERE id=?', [JSON.stringify(players), reg.id]);
+    if (idx < 0) inviteByEmail(t); // solo al agregarse, no en cada update
     return res.json({ ok: true, action: idx >= 0 ? 'player_updated' : 'player_added', team: teamName, player: gamertag, teamSize: players.length });
   } catch (err: any) {
     console.error('[lqc/register]', err.message);
