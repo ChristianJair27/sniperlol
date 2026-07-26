@@ -446,4 +446,39 @@ r.post("/login", async (req, res) => {
   res.json({ ok: true, token, user: { id: u.id, email: u.email, name: u.name, avatar_url: u.avatar_url, role: u.role } });
 });
 
+// ── Recuperación de contraseña ────────────────────────────────────────────────
+// Sin tabla extra: token JWT firmado (15 min) con propósito 'pwreset'. El link
+// llega por correo (mismo SMTP; en dev sin SMTP sale preview URL en el log).
+r.post("/forgot-password", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  // Siempre 200 — no revelamos si el correo existe
+  const ok = () => res.json({ ok: true, msg: "Si el correo existe, enviamos un enlace de recuperación." });
+  if (!email) return ok();
+  try {
+    const [[u]] = await pool.query<any[]>("SELECT id, email, name FROM users WHERE email=?", [email]);
+    if (!u) return ok();
+    const token = jwt.sign({ sub: String(u.id), purpose: "pwreset" }, JWT_SECRET, { expiresIn: "15m" });
+    const link = `${WEB_ORIGIN}/reset-password?token=${encodeURIComponent(token)}`;
+    const { sendPasswordResetEmail } = await import("../services/mail.service.js");
+    const rr = await sendPasswordResetEmail({ toEmail: u.email, toName: u.name, resetUrl: link });
+    if (rr.previewUrl) console.log("[forgot-password] preview:", rr.previewUrl);
+  } catch (e: any) { console.warn("[forgot-password]", e.message); }
+  return ok();
+});
+
+r.post("/reset-password", async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password || String(password).length < 6) {
+    return res.status(400).json({ ok: false, msg: "Token y contraseña (mín. 6) requeridos" });
+  }
+  try {
+    const payload: any = jwt.verify(String(token), JWT_SECRET);
+    if (payload.purpose !== "pwreset") throw new Error("propósito inválido");
+    await pool.query("UPDATE users SET password_hash=? WHERE id=?", [hashPassword(String(password)), Number(payload.sub)]);
+    return res.json({ ok: true, msg: "Contraseña actualizada. Ya puedes iniciar sesión." });
+  } catch {
+    return res.status(400).json({ ok: false, msg: "El enlace expiró o no es válido. Solicita uno nuevo." });
+  }
+});
+
 export default r;

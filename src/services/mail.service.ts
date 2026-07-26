@@ -133,3 +133,28 @@ export async function sendTournamentInvitationEmail(params: TournamentInviteEmai
     return { sent: false };
   }
 }
+// ── Password reset ────────────────────────────────────────────────────────────
+export async function sendPasswordResetEmail(params: { toEmail: string; toName?: string | null; resetUrl: string }): Promise<{ sent: boolean; previewUrl?: string }> {
+  const { toEmail, toName, resetUrl } = params;
+  const from = process.env.SMTP_FROM || 'ATAK.GG <noreply@atak.gg>';
+  const greeting = toName ? `Hola ${toName}` : 'Hola';
+  const html = `<div style="font-family:Arial,sans-serif;background:#0a0a0c;color:#eee;padding:32px;border-radius:12px;max-width:520px;margin:auto">
+    <h2 style="color:#ef4444;margin-top:0">ATAK<span style="color:#fff">.GG</span></h2>
+    <p>${greeting},</p>
+    <p>Recibimos una solicitud para restablecer tu contrase&ntilde;a. El enlace vence en <b>15 minutos</b>.</p>
+    <p style="text-align:center;margin:28px 0">
+      <a href="${resetUrl}" style="background:#dc2626;color:#fff;padding:12px 28px;border-radius:10px;text-decoration:none;font-weight:bold">Restablecer contrase&ntilde;a</a>
+    </p>
+    <p style="color:#888;font-size:12px">Si no fuiste t&uacute;, ignora este correo &mdash; tu cuenta sigue segura.</p>
+  </div>`;
+  try {
+    const transport = await ensureTransporter();
+    const info = await transport.sendMail({ from, to: toEmail, subject: 'Restablecer contrasena - ATAK.GG', text: `${greeting}: restablece tu contrasena (15 min): ${resetUrl}`, html });
+    let previewUrl: string | undefined;
+    if (!process.env.SMTP_HOST) previewUrl = nodemailer.getTestMessageUrl(info) || undefined;
+    return { sent: true, previewUrl };
+  } catch (e: any) {
+    console.warn('[mail] reset no enviado:', e.message);
+    return { sent: false };
+  }
+}
