@@ -247,6 +247,8 @@ Comportamiento: primer jugador de un equipo lo crea; los siguientes se agregan (
 
 Los equipos aparecen al instante en `GET /tournaments/lqc-2026` (campo `teams`) — con eso pintas la lista de inscritos en la página de la LQC con tus propios estilos/animaciones.
 
+**Bajas (borrar jugador/equipo):** el MISMO webhook maneja los DELETE. En Supabase, configura el Database Webhook con los eventos **INSERT, UPDATE y DELETE** apuntando a la misma URL — al borrar una fila, el jugador se da de baja en ATAK.GG (si era el último del equipo, cae el equipo completo). También puedes llamarlo directo desde tu dashboard: `POST /api/integrations/lqc/unregister` con `{ "equipo": "...", "gamertag": "..." }` (sin `gamertag` borra el equipo entero). Todo idempotente. Nota: con el torneo ya iniciado, las bajas se rechazan (409) — se gestionan con el organizador.
+
 ## Versionado
 
 La superficie `/api/public/v1` es estable: no se quitarán campos ni cambiarán tipos dentro de v1. Campos nuevos pueden agregarse sin aviso (parser tolerante, por favor). Cambios incompatibles saldrán como `/api/public/v2`.

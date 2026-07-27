@@ -31,6 +31,36 @@ function checkSecret(req: any): 'ok' | 'bad' | 'unconfigured' {
   return secrets.includes(req.header('X-LQC-Secret') || '') ? 'ok' : 'bad';
 }
 
+// Baja de jugador/equipo (DELETE en su Supabase, o llamada directa).
+// Idempotente: si ya no existe, responde ok con action:'not_found'.
+async function removePlayerOrTeam(tournamentId: string, teamName: string, gamertag: string) {
+  const t = await getT(tournamentId);
+  if (!t) return { status: 404 as const, body: { ok: false, error: `Torneo ${tournamentId} no existe` } };
+  if (t.phase !== 'registration' && t.phase !== 'checkin') {
+    return { status: 409 as const, body: { ok: false, error: `Torneo ya iniciado (${t.phase}) — bajas solo con el organizador` } };
+  }
+  const [[reg]] = await pool.query<any[]>(
+    'SELECT * FROM tournament_registrations WHERE tournament_id=? AND LOWER(team_name)=LOWER(?)',
+    [tournamentId, teamName]
+  );
+  if (!reg) return { status: 200 as const, body: { ok: true, action: 'not_found', team: teamName } };
+
+  let players: any[] = typeof reg.players === 'string' ? JSON.parse(reg.players) : (reg.players ?? []);
+  if (gamertag) {
+    const before = players.length;
+    players = players.filter(p => (p.riotId || p.name || '').toLowerCase() !== gamertag.toLowerCase());
+    if (players.length === before) return { status: 200 as const, body: { ok: true, action: 'not_found', team: teamName, player: gamertag } };
+    if (players.length > 0) {
+      await pool.query('UPDATE tournament_registrations SET players=? WHERE id=?', [JSON.stringify(players), reg.id]);
+      return { status: 200 as const, body: { ok: true, action: 'player_removed', team: teamName, player: gamertag, teamSize: players.length } };
+    }
+    // último jugador → cae el equipo completo
+  }
+  await pool.query('DELETE FROM tournament_registrations WHERE id=?', [reg.id]);
+  await pool.query('UPDATE tournaments SET participants = GREATEST(0, participants - 1) WHERE id = ?', [tournamentId]);
+  return { status: 200 as const, body: { ok: true, action: 'team_removed', team: teamName } };
+}
+
 router.post('/lqc/register', async (req, res) => {
   const auth = checkSecret(req);
   if (auth === 'unconfigured') return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
@@ -39,8 +69,23 @@ router.post('/lqc/register', async (req, res) => {
   const tournamentId = process.env.LQC_TOURNAMENT_ID;
   if (!tournamentId) return bad(res, 503, 'Falta LQC_TOURNAMENT_ID');
 
-  // Supabase Database Webhook manda { type, table, record, ... }; también
-  // aceptamos el objeto plano si lo llaman a mano.
+  // DELETE de Supabase (webhook con eventos INSERT/UPDATE/DELETE apuntando aquí):
+  // la fila borrada viene en old_record → damos de baja al jugador/equipo.
+  if (req.body?.type === 'DELETE') {
+    const old: any = req.body?.old_record ?? {};
+    const teamName = pickFrom(old, 'equipo', 'team', 'team_name', 'teamName');
+    const gamertag = pickFrom(old, 'gamertag', 'game_tag', 'riot_id', 'riotId');
+    if (!teamName) return bad(res, 400, 'DELETE sin equipo en old_record');
+    try {
+      const r2 = await removePlayerOrTeam(tournamentId, teamName, gamertag);
+      return res.status(r2.status).json(r2.body);
+    } catch (err: any) {
+      console.error('[lqc/register DELETE]', err.message);
+      return bad(res, 500, err.message);
+    }
+  }
+
+  // INSERT y UPDATE de Supabase (record) — o el objeto plano si lo llaman a mano.
   const r: any = req.body?.record ?? req.body ?? {};
   // Acepta snake_case (columnas Supabase) y camelCase
   const pick = (...keys: string[]) => {
@@ -206,6 +251,29 @@ router.post('/lqc/unregister', async (req, res) => {
       ).catch(() => {});
     }
     return res.json({ ok: true, action: 'player_removed', team: reg.team_name, player: gamertag, teamSize: players.length });
+  } catch (err: any) {
+    console.error('[lqc/unregister]', err.message);
+    return bad(res, 500, err.message);
+  }
+});
+
+// Baja explícita (para el dashboard de Sebas si prefiere llamarla directo):
+// POST /api/integrations/lqc/unregister { equipo, gamertag? }
+// Sin gamertag → borra el equipo completo.
+router.post('/lqc/unregister', async (req, res) => {
+  const auth = checkSecret(req);
+  if (auth === 'unconfigured') return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
+  if (auth === 'bad') return bad(res, 401, 'Secreto inválido');
+  const tournamentId = process.env.LQC_TOURNAMENT_ID;
+  if (!tournamentId) return bad(res, 503, 'Falta LQC_TOURNAMENT_ID');
+
+  const r: any = req.body?.old_record ?? req.body?.record ?? req.body ?? {};
+  const teamName = pickFrom(r, 'equipo', 'team', 'team_name', 'teamName');
+  const gamertag = pickFrom(r, 'gamertag', 'game_tag', 'riot_id', 'riotId');
+  if (!teamName) return bad(res, 400, 'equipo requerido');
+  try {
+    const r2 = await removePlayerOrTeam(tournamentId, teamName, gamertag);
+    return res.status(r2.status).json(r2.body);
   } catch (err: any) {
     console.error('[lqc/unregister]', err.message);
     return bad(res, 500, err.message);
