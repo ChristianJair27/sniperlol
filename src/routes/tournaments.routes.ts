@@ -45,11 +45,13 @@ interface RosterPlayer {
   inviteStatus?: 'pending' | 'accepted';
 }
 interface TeamRegistration {
+  id: number;
   teamName: string; captainRiotId: string;
   players: RosterPlayer[];
   contact: string; registeredAt: string;
   checkedIn: boolean; checkedInAt?: string;
   registeredBy?: number;
+  captainUserId?: number;
 }
 interface TournamentInvitation {
   id: number; tournamentId: string; tournamentName: string;
@@ -350,11 +352,13 @@ export async function getRegs(tournamentId: string): Promise<TeamRegistration[]>
     [tournamentId]
   );
   return rows.map(r => ({
+    id: Number(r.id),
     teamName: r.team_name, captainRiotId: r.captain_riot_id,
     players: parseJson(r.players) || [],
     contact: r.contact || '', registeredAt: r.registered_at,
     checkedIn: !!r.checked_in, checkedInAt: r.checked_in_at || undefined,
     registeredBy: r.registered_by || undefined,
+    captainUserId: r.captain_user_id || undefined,
   }));
 }
 
@@ -1211,6 +1215,171 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
 router.get('/:id/registrations', async (req, res) => {
   try { res.json(await getRegs(req.params.id)); }
   catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE registration — el organizador elimina un equipo antes de que inicie el torneo
+router.delete('/:id/registrations/:regId', requireAuth, async (req: any, res) => {
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador puede eliminar equipos' });
+    if (t.phase !== 'registration' && t.phase !== 'checkin')
+      return res.status(400).json({ error: 'El torneo ya inició; no se pueden eliminar equipos' });
+
+    const [[reg]] = await pool.query<any[]>(
+      'SELECT id, team_name FROM tournament_registrations WHERE tournament_id=? AND id=?',
+      [t.id, req.params.regId]
+    );
+    if (!reg) return res.status(404).json({ error: 'Equipo no encontrado' });
+
+    await pool.query('DELETE FROM tournament_registrations WHERE id=?', [reg.id]);
+    await pool.query(
+      'DELETE FROM tournament_invitations WHERE tournament_id=? AND team_name=?',
+      [t.id, reg.team_name]
+    );
+    await pool.query('UPDATE tournaments SET participants=GREATEST(participants-1,0) WHERE id=?', [t.id]);
+
+    res.json({ success: true, teamName: reg.team_name });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH registration — el capitán (o el organizador) edita el roster mientras
+// las inscripciones siguen abiertas. Recibe el array completo de players con la
+// misma forma que /register: { name, riotId } o { name, inviteEmail }.
+router.patch('/:id/registrations/:regId', requireAuth, async (req: any, res) => {
+  const { players } = req.body;
+  if (!Array.isArray(players) || players.length < 5) {
+    return res.status(400).json({ error: 'Datos incompletos (mínimo 5 jugadores)' });
+  }
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (t.phase !== 'registration')
+      return res.status(400).json({ error: 'Solo se puede editar el equipo mientras las inscripciones están abiertas' });
+
+    const [[reg]] = await pool.query<any[]>(
+      'SELECT * FROM tournament_registrations WHERE tournament_id=? AND id=?',
+      [t.id, req.params.regId]
+    );
+    if (!reg) return res.status(404).json({ error: 'Equipo no encontrado' });
+
+    const userId = req.auth.userId;
+    const captainUserId = Number(reg.captain_user_id || reg.registered_by) || null;
+    const isCaptain = captainUserId === userId || Number(reg.registered_by) === userId;
+    if (!isCaptain && !isOwner(req, t))
+      return res.status(403).json({ error: 'Solo el capitán o el organizador pueden editar el equipo' });
+
+    const platform = t.region || 'la1';
+    const linked = captainUserId ? await getLinkedRiotAccount(captainUserId) : null;
+    const oldPlayers: RosterPlayer[] = parseJson(reg.players) || [];
+    const oldByEmail = new Map(
+      oldPlayers.filter(p => p.inviteEmail)
+        .map(p => [p.inviteEmail!.toLowerCase(), p] as const)
+    );
+
+    const [[editorUser]] = await pool.query<any[]>(
+      'SELECT name, email FROM users WHERE id = ? LIMIT 1', [userId]
+    );
+    const inviterName = editorUser?.name || editorUser?.email?.split('@')[0] || 'Capitán';
+
+    const normalizedPlayers: RosterPlayer[] = [];
+    const invitationsSent: string[] = [];
+    const keepInvitedUserIds: number[] = [];
+    // Invitaciones diferidas: solo se crean/reindexan cuando todo el roster validó
+    const inviteOps: Array<() => Promise<void>> = [];
+
+    for (let i = 0; i < players.length; i++) {
+      const raw = players[i] || {};
+      const name = String(raw.name || '').trim() || `Jugador ${i + 1}`;
+      const riotId = String(raw.riotId || '').trim();
+      const inviteEmail = String(raw.inviteEmail || '').trim();
+      const slot = i;
+
+      if (inviteEmail) {
+        const invitedUserId = await findUserByEmail(inviteEmail);
+        if (!invitedUserId) {
+          return res.status(400).json({
+            error: `No hay cuenta ATAK.GG con el correo ${inviteEmail}. El jugador debe registrarse primero.`,
+            slot,
+          });
+        }
+        if (invitedUserId === captainUserId) {
+          if (!linked) return res.status(400).json({ error: 'El capitán debe vincular su cuenta de LoL para ocupar este slot' });
+          normalizedPlayers.push({ name, riotId: linked.riotId, puuid: linked.puuid, userId: invitedUserId, inviteStatus: 'accepted' });
+          continue;
+        }
+        const prev = oldByEmail.get(inviteEmail.toLowerCase());
+        if (prev && prev.inviteStatus === 'accepted') {
+          // Ya aceptó: conservar sus datos (riotId/puuid/userId)
+          normalizedPlayers.push({ ...prev, name });
+          keepInvitedUserIds.push(invitedUserId);
+          continue;
+        }
+        normalizedPlayers.push({ name, inviteEmail, inviteStatus: 'pending' });
+        keepInvitedUserIds.push(invitedUserId);
+        const isNew = !prev;
+        inviteOps.push(async () => {
+          // Idempotente: si ya existía la invitación solo reindexa slot; email solo si es nueva
+          await createInvitation(
+            t.id, reg.team_name, invitedUserId, userId, slot, name,
+            isNew ? { tournamentName: t.name, inviterName } : undefined
+          );
+        });
+        if (isNew) invitationsSent.push(inviteEmail);
+        continue;
+      }
+
+      if (!riotId) {
+        return res.status(400).json({ error: `Slot ${slot + 1}: ingresa Riot ID o invita por correo`, slot });
+      }
+      if (!/^.+#.{2,}$/.test(riotId)) {
+        return res.status(400).json({ error: `Riot ID inválido en slot ${slot + 1}: ${riotId}` });
+      }
+      const resolved = await resolveRiotIdToPuuid(riotId, platform);
+      if (!resolved) {
+        return res.status(400).json({ error: `Cuenta no encontrada: ${riotId}`, slot });
+      }
+      const matchedUserId = await findUserByRiotId(riotId);
+      normalizedPlayers.push({
+        name,
+        riotId: `${resolved.gameName}#${resolved.tagLine}`,
+        puuid: resolved.puuid,
+        userId: matchedUserId || undefined,
+        inviteStatus: 'accepted',
+      });
+      if (matchedUserId) keepInvitedUserIds.push(matchedUserId);
+    }
+
+    for (const op of inviteOps) await op();
+
+    // Cancelar invitaciones pendientes de jugadores que ya no están en el roster
+    if (keepInvitedUserIds.length) {
+      await pool.query(
+        `DELETE FROM tournament_invitations
+         WHERE tournament_id=? AND team_name=? AND status='pending' AND invited_user_id NOT IN (?)`,
+        [t.id, reg.team_name, keepInvitedUserIds]
+      );
+    } else {
+      await pool.query(
+        `DELETE FROM tournament_invitations WHERE tournament_id=? AND team_name=? AND status='pending'`,
+        [t.id, reg.team_name]
+      );
+    }
+
+    await pool.query(
+      'UPDATE tournament_registrations SET players=? WHERE id=?',
+      [JSON.stringify(normalizedPlayers), reg.id]
+    );
+
+    res.json({
+      success: true,
+      players: normalizedPlayers,
+      invitationsSent: invitationsSent.length,
+      message: invitationsSent.length
+        ? `Equipo actualizado. Invitaciones enviadas a ${invitationsSent.length} jugador(es).`
+        : 'Equipo actualizado.',
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // Close registration → checkin

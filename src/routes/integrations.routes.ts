@@ -17,6 +17,12 @@ const router = Router();
 
 function bad(res: any, code: number, error: string) { return res.status(code).json({ ok: false, error }); }
 
+// Acepta snake_case (columnas Supabase) y camelCase
+function pickFrom(r: any, ...keys: string[]) {
+  for (const k of keys) { const v = r?.[k]; if (v != null && String(v).trim() !== '') return String(v).trim(); }
+  return '';
+}
+
 router.post('/lqc/register', async (req, res) => {
   const secret = process.env.LQC_WEBHOOK_SECRET;
   if (!secret) return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
@@ -116,6 +122,84 @@ router.post('/lqc/register', async (req, res) => {
     return res.json({ ok: true, action: idx >= 0 ? 'player_updated' : 'player_added', team: teamName, player: gamertag, teamSize: players.length });
   } catch (err: any) {
     console.error('[lqc/register]', err.message);
+    return bad(res, 500, err.message);
+  }
+});
+
+// POST /api/integrations/lqc/unregister
+//   Baja desde el dashboard de admin de la LQC. Dos modos:
+//   - Solo `equipo`            → elimina el equipo completo del torneo.
+//   - `equipo` + `gamertag`    → quita solo a ese jugador; si era el último,
+//                                elimina el equipo.
+//   Acepta el objeto plano o un Database Webhook de Supabase de tipo DELETE
+//   ({ type:'DELETE', old_record:{...} }). Idempotente: si el equipo/jugador ya
+//   no existe responde ok:true con action:'already_absent'.
+//   Solo funciona mientras el torneo no haya iniciado (registration/checkin).
+router.post('/lqc/unregister', async (req, res) => {
+  const secret = process.env.LQC_WEBHOOK_SECRET;
+  if (!secret) return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
+  if (req.header('X-LQC-Secret') !== secret) return bad(res, 401, 'Secreto inválido');
+
+  const tournamentId = process.env.LQC_TOURNAMENT_ID;
+  if (!tournamentId) return bad(res, 503, 'Falta LQC_TOURNAMENT_ID');
+
+  const r: any = req.body?.old_record ?? req.body?.record ?? req.body ?? {};
+  const teamName = pickFrom(r, 'equipo', 'team', 'team_name', 'teamName');
+  const gamertag = pickFrom(r, 'gamertag', 'game_tag', 'riot_id', 'riotId');
+  if (!teamName) return bad(res, 400, 'equipo es requerido');
+
+  try {
+    const t = await getT(tournamentId);
+    if (!t) return bad(res, 404, `Torneo ${tournamentId} no existe`);
+    if (t.phase !== 'registration' && t.phase !== 'checkin') {
+      return bad(res, 409, `El torneo ya inició (${t.phase}); las bajas se hacen desde ATAK.GG`);
+    }
+
+    const [[reg]] = await pool.query<any[]>(
+      'SELECT * FROM tournament_registrations WHERE tournament_id=? AND LOWER(team_name)=LOWER(?)',
+      [tournamentId, teamName]
+    );
+    if (!reg) return res.json({ ok: true, action: 'already_absent', team: teamName });
+
+    const deleteTeam = async () => {
+      await pool.query('DELETE FROM tournament_registrations WHERE id=?', [reg.id]);
+      await pool.query(
+        'DELETE FROM tournament_invitations WHERE tournament_id=? AND team_name=?',
+        [tournamentId, reg.team_name]
+      );
+      await pool.query('UPDATE tournaments SET participants=GREATEST(participants-1,0) WHERE id=?', [tournamentId]);
+    };
+
+    if (!gamertag) {
+      await deleteTeam();
+      return res.json({ ok: true, action: 'team_deleted', team: reg.team_name });
+    }
+
+    const players: any[] = typeof reg.players === 'string' ? JSON.parse(reg.players) : (reg.players ?? []);
+    const idx = players.findIndex(p => (p.riotId || p.name || '').toLowerCase() === gamertag.toLowerCase());
+    if (idx < 0) {
+      return res.json({ ok: true, action: 'already_absent', team: reg.team_name, player: gamertag, teamSize: players.length });
+    }
+    const [removed] = players.splice(idx, 1);
+
+    if (players.length === 0) {
+      await deleteTeam();
+      return res.json({ ok: true, action: 'team_deleted', team: reg.team_name, reason: 'last_player_removed' });
+    }
+
+    await pool.query('UPDATE tournament_registrations SET players=? WHERE id=?', [JSON.stringify(players), reg.id]);
+    // Cancelar su invitación pendiente (si el jugador tenía correo de invitación)
+    if (removed?.inviteEmail) {
+      await pool.query(
+        `DELETE ti FROM tournament_invitations ti
+         JOIN users u ON u.id = ti.invited_user_id
+         WHERE ti.tournament_id=? AND ti.team_name=? AND ti.status='pending' AND LOWER(u.email)=LOWER(?)`,
+        [tournamentId, reg.team_name, removed.inviteEmail]
+      ).catch(() => {});
+    }
+    return res.json({ ok: true, action: 'player_removed', team: reg.team_name, player: gamertag, teamSize: players.length });
+  } catch (err: any) {
+    console.error('[lqc/unregister]', err.message);
     return bad(res, 500, err.message);
   }
 });
