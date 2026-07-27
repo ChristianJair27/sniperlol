@@ -76,6 +76,8 @@ interface TournamentData {
   // Fearless draft: campeones ya jugados en el torneo quedan bloqueados para
   // picks siguientes (la plataforma los muestra; el lobby no lo puede forzar).
   fearless?: boolean;
+  // Formato del bracket: eliminación directa (default) o round robin (liga).
+  bracketType?: 'single_elim' | 'round_robin';
 }
 
 // ─── DB init ──────────────────────────────────────────────────────────────────
@@ -167,6 +169,7 @@ async function initTables() {
     // Soft-hide: torneos de prueba fuera de listas públicas sin borrar datos
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS hidden TINYINT(1) DEFAULT 0`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS fearless TINYINT(1) DEFAULT 0`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bracket_type VARCHAR(20) DEFAULT 'single_elim'`,
   ]) { await pool.query(col).catch(() => {}); }
   // Seed only if empty
   const [[{ cnt }]] = await pool.query<any[]>('SELECT COUNT(*) AS cnt FROM tournaments');
@@ -241,6 +244,7 @@ function rowToTournament(row: any): TournamentData {
     logoUrl:    row.logo_url               || undefined,
     bannerUrl:  row.banner_url             || undefined,
     fearless:   !!row.fearless,
+    bracketType: (row.bracket_type as any) || 'single_elim',
   };
 }
 
@@ -342,6 +346,7 @@ function serialize(t: TournamentData, access: ViewerAccess = 'public') {
     codesAvailable: access === 'owner' ? t.codePool.length : undefined,
     createdBy: access === 'owner' ? t.createdBy : undefined,
     region:t.region||'la1', logoUrl:t.logoUrl, bannerUrl:t.bannerUrl, fearless:!!t.fearless,
+    bracketType:t.bracketType||'single_elim',
     viewerAccess: access,
   };
 }
@@ -565,6 +570,32 @@ function buildMatchStatsResponse(data: any, riotMatchIdStr: string, isComplete: 
 }
 
 // ─── Bracket generator ────────────────────────────────────────────────────────
+// Round robin (liga, como el LQC): todos contra todos por el método del círculo.
+// Cada ronda = jornada; N equipos → N-1 jornadas (N par con BYE si es impar).
+function generateRoundRobin(teams: string[]): BracketMatch[] {
+  const list = [...teams];
+  if (list.length % 2 === 1) list.push('BYE');
+  const n = list.length;
+  const rounds = n - 1;
+  const matches: BracketMatch[] = [];
+  const rot = [...list];
+  for (let r = 1; r <= rounds; r++) {
+    let mn = 1;
+    for (let i = 0; i < n / 2; i++) {
+      const t1 = rot[i], t2 = rot[n - 1 - i];
+      if (t1 === 'BYE' || t2 === 'BYE') continue; // jornada de descanso
+      matches.push({
+        id: `r${r}m${mn}`, round: r, matchNumber: mn,
+        team1: t1, team2: t2, winner: null, code: null, matchStatus: 'ready',
+      });
+      mn++;
+    }
+    // rotación: fijo rot[0], el resto gira
+    rot.splice(1, 0, rot.pop()!);
+  }
+  return matches;
+}
+
 function generateBracket(teams: string[]): BracketMatch[] {
   const n = Math.pow(2, Math.ceil(Math.log2(Math.max(teams.length, 2))));
   const padded = [...teams];
@@ -708,14 +739,17 @@ async function applyResult(
     score2: score2 !== undefined ? score2 : match.score2,
   };
 
-  // Advance winner to next round
-  const nextId = `r${match.round + 1}m${Math.ceil(match.matchNumber / 2)}`;
-  const ni = t.bracket!.findIndex(m => m.id === nextId);
-  if (ni !== -1) {
-    if (match.matchNumber % 2 === 1) t.bracket![ni].team1 = winner;
-    else                            t.bracket![ni].team2 = winner;
-    if (t.bracket![ni].team1 && t.bracket![ni].team2) {
-      await assignCodeToMatch(t, ni);
+  // Advance winner to next round — solo en eliminación directa; en round robin
+  // no hay avance (todos juegan contra todos, standings deciden).
+  if ((t.bracketType || 'single_elim') === 'single_elim') {
+    const nextId = `r${match.round + 1}m${Math.ceil(match.matchNumber / 2)}`;
+    const ni = t.bracket!.findIndex(m => m.id === nextId);
+    if (ni !== -1) {
+      if (match.matchNumber % 2 === 1) t.bracket![ni].team1 = winner;
+      else                            t.bracket![ni].team2 = winner;
+      if (t.bracket![ni].team1 && t.bracket![ni].team2) {
+        await assignCodeToMatch(t, ni);
+      }
     }
   }
 
@@ -728,9 +762,14 @@ async function applyResult(
       .map((s, i) => ({ ...s, position: i + 1 }));
   }
 
-  // Completion
-  const maxRound = Math.max(...t.bracket!.map(m => m.round));
-  if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') t.phase = 'complete';
+  // Completion: single-elim termina con la final; round robin cuando TODOS
+  // los partidos están completos.
+  if ((t.bracketType || 'single_elim') === 'round_robin') {
+    if (t.bracket!.every(m => m.matchStatus === 'complete')) t.phase = 'complete';
+  } else {
+    const maxRound = Math.max(...t.bracket!.map(m => m.round));
+    if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') t.phase = 'complete';
+  }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -1451,7 +1490,7 @@ router.post('/:id/start', requireAuth, async (req: any, res) => {
     if (activeRegs.length<2) return res.status(400).json({ error:'Mínimo 2 equipos' });
 
     const teams = activeRegs.map(r=>r.teamName);
-    const bracket = generateBracket(teams);
+    const bracket = (t.bracketType === 'round_robin') ? generateRoundRobin(teams) : generateBracket(teams);
     t.bracket = bracket;
     // Assign an allowlisted, metadata-tagged code to each ready round-1 match.
     for (let i = 0; i < bracket.length; i++) {
@@ -1472,7 +1511,7 @@ router.get('/:id/bracket', optionalAuth, async (req: any, res) => {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error:'Torneo no encontrado' });
     const access = await getViewerAccess(t, req.auth);
-    res.json({ bracket: sanitizeBracket(t.bracket || [], access), phase: t.phase, viewerAccess: access });
+    res.json({ bracket: sanitizeBracket(t.bracket || [], access), phase: t.phase, viewerAccess: access, bracketType: t.bracketType || 'single_elim' });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1510,6 +1549,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
     const bracketArr: BracketMatch[] = t.bracket || [];
     const maxRound = bracketArr.length ? Math.max(...bracketArr.map(m => m.round)) : 0;
     const rlabel = (r: number) => {
+      if ((t.bracketType || 'single_elim') === 'round_robin') return `Jornada ${r}`;
       const d = maxRound - r;
       return d === 0 ? 'Final' : d === 1 ? 'Semifinales' : d === 2 ? 'Cuartos' : `Ronda ${r}`;
     };
@@ -1576,6 +1616,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         prizePool: t.prize, prizeFinal: null, teamsRegistered: regs.length, teamsMax: t.maxParticipants,
         checkinDeadline: t.checkinDeadline ?? null, logoUrl: t.logoUrl, bannerUrl: t.bannerUrl,
         fearless: !!t.fearless,
+        bracketType: t.bracketType || 'single_elim',
       },
       bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
     });
@@ -2125,6 +2166,15 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
     if (fearless !== undefined) {
       await pool.query('UPDATE tournaments SET fearless=? WHERE id=?', [fearless ? 1 : 0, t.id]);
       t.fearless = !!fearless;
+    }
+    const { bracketType } = req.body;
+    if (bracketType !== undefined) {
+      if (!['single_elim', 'round_robin'].includes(bracketType))
+        return res.status(400).json({ error: 'bracketType inválido (single_elim | round_robin)' });
+      if (t.phase === 'active' || t.phase === 'complete')
+        return res.status(400).json({ error: 'No se puede cambiar el formato con el torneo iniciado' });
+      await pool.query('UPDATE tournaments SET bracket_type=? WHERE id=?', [bracketType, t.id]);
+      t.bracketType = bracketType;
     }
     res.json({ success: true, tournament: serialize(t) });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
