@@ -35,6 +35,11 @@ interface BracketMatch {
   // hard lower bound so roster-history recovery can never pick a game played
   // BEFORE the code existed (e.g. an old scrim/custom in the captain's history).
   codeActivatedAt?: number;
+  // Series (Bo3/Bo5): juegos ya jugados de este enfrentamiento. gameId (arriba)
+  // apunta al último juego para compat con la vista de stats.
+  games?: Array<{ gameId: number; gameRegion?: string; winner?: string | null }>;
+  // Juegos necesarios para ganar la serie (1=Bo1 default, 2=Bo3, 3=Bo5).
+  seriesTo?: number;
 }
 interface RosterPlayer {
   name: string;
@@ -76,8 +81,12 @@ interface TournamentData {
   // Fearless draft: campeones ya jugados en el torneo quedan bloqueados para
   // picks siguientes (la plataforma los muestra; el lobby no lo puede forzar).
   fearless?: boolean;
-  // Formato del bracket: eliminación directa (default) o round robin (liga).
-  bracketType?: 'single_elim' | 'round_robin';
+  // Formato del bracket: eliminación directa (default), round robin (liga) o suizo.
+  bracketType?: 'single_elim' | 'round_robin' | 'swiss';
+  // Series: juegos necesarios para ganar un enfrentamiento (1=Bo1, 2=Bo3, 3=Bo5).
+  seriesTo?: number;
+  // Override para la final (p.ej. Bo3 todo el torneo y final Bo5 → finalSeriesTo=3).
+  finalSeriesTo?: number;
 }
 
 // ─── DB init ──────────────────────────────────────────────────────────────────
@@ -170,6 +179,11 @@ async function initTables() {
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS hidden TINYINT(1) DEFAULT 0`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS fearless TINYINT(1) DEFAULT 0`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bracket_type VARCHAR(20) DEFAULT 'single_elim'`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS series_to INT DEFAULT 1`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS final_series_to INT DEFAULT 1`,
+    // Series Bo3/Bo5: una fila de stats POR JUEGO (antes: una por enfrentamiento)
+    `ALTER TABLE tournament_match_stats DROP INDEX unique_bracket_match`,
+    `ALTER TABLE tournament_match_stats ADD UNIQUE KEY unique_bracket_game (tournament_id, bracket_match_id, game_id)`,
   ]) { await pool.query(col).catch(() => {}); }
   // Seed only if empty
   const [[{ cnt }]] = await pool.query<any[]>('SELECT COUNT(*) AS cnt FROM tournaments');
@@ -245,6 +259,8 @@ function rowToTournament(row: any): TournamentData {
     bannerUrl:  row.banner_url             || undefined,
     fearless:   !!row.fearless,
     bracketType: (row.bracket_type as any) || 'single_elim',
+    seriesTo:      Number(row.series_to) || 1,
+    finalSeriesTo: Number(row.final_series_to) || Number(row.series_to) || 1,
   };
 }
 
@@ -452,7 +468,8 @@ function isAdmin(req: any) { return req.auth?.role === 'admin'; }
 
 export async function getStoredMatchStats(tournamentId: string, bracketMatchId: string) {
   const [[row]] = await pool.query<any[]>(
-    'SELECT parsed_data, game_end_ts FROM tournament_match_stats WHERE tournament_id=? AND bracket_match_id=?',
+    // Series Bo3/Bo5: puede haber varias filas (una por juego) — la más reciente
+    'SELECT parsed_data, game_end_ts FROM tournament_match_stats WHERE tournament_id=? AND bracket_match_id=? ORDER BY game_end_ts DESC LIMIT 1',
     [tournamentId, bracketMatchId]
   );
   if (!row) return null;
@@ -592,6 +609,77 @@ function generateRoundRobin(teams: string[]): BracketMatch[] {
     }
     // rotación: fijo rot[0], el resto gira
     rot.splice(1, 0, rot.pop()!);
+  }
+  return matches;
+}
+
+// Suizo: la ronda 1 es aleatoria; las siguientes se generan al terminar cada
+// ronda (POST /:id/next-round) pareando por récord y evitando revanchas.
+function generateSwissRound1(teams: string[]): BracketMatch[] {
+  const list = [...teams];
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  const matches: BracketMatch[] = [];
+  let mn = 1;
+  for (let i = 0; i + 1 < list.length; i += 2) {
+    matches.push({ id: `r1m${mn}`, round: 1, matchNumber: mn, team1: list[i], team2: list[i + 1], winner: null, code: null, matchStatus: 'ready' });
+    mn++;
+  }
+  // Equipo impar: BYE = victoria gratis en la ronda
+  if (list.length % 2 === 1) {
+    matches.push({ id: `r1m${mn}`, round: 1, matchNumber: mn, team1: list[list.length - 1], team2: 'BYE', winner: list[list.length - 1], code: null, matchStatus: 'complete' });
+  }
+  return matches;
+}
+
+/** Parea la siguiente ronda suiza: por récord (wins desc), sin revanchas. */
+function pairSwissRound(t: TournamentData, round: number): BracketMatch[] {
+  const played = new Set<string>();
+  for (const m of t.bracket || []) {
+    if (m.team1 && m.team2) played.add([m.team1, m.team2].sort().join('|'));
+  }
+  const wins = new Map<string, number>();
+  for (const s of t.standings || []) wins.set(s.team, s.wins);
+  const teams = [...(t.standings || [])].sort((a, b) => b.wins - a.wins || b.points - a.points).map(s => s.team);
+
+  // Greedy con backtracking: el mejor disponible contra el mejor rival aún no enfrentado
+  const result: Array<[string, string]> = [];
+  const pool = [...teams];
+  function backtrack(): boolean {
+    if (pool.length < 2) return true;
+    const a = pool.shift()!;
+    for (let i = 0; i < pool.length; i++) {
+      const b = pool[i];
+      if (played.has([a, b].sort().join('|'))) continue;
+      pool.splice(i, 1);
+      result.push([a, b]);
+      if (backtrack()) return true;
+      result.pop();
+      pool.splice(i, 0, b);
+    }
+    pool.unshift(a);
+    return false;
+  }
+  if (!backtrack()) {
+    // Sin pareo perfecto posible: permitir revanchas como último recurso
+    result.length = 0;
+    const p2 = [...teams];
+    while (p2.length >= 2) result.push([p2.shift()!, p2.shift()!]);
+  }
+
+  const matches: BracketMatch[] = result.map(([t1, t2], i) => ({
+    id: `r${round}m${i + 1}`, round, matchNumber: i + 1,
+    team1: t1, team2: t2, winner: null, code: null, matchStatus: 'ready',
+    seriesTo: t.seriesTo || 1,
+  }));
+  // BYE para el sobrante (impar)
+  if (pool.length === 1 || teams.length % 2 === 1) {
+    const rest = teams.filter(x => !result.some(([a, b]) => a === x || b === x));
+    if (rest.length === 1) {
+      matches.push({ id: `r${round}m${matches.length + 1}`, round, matchNumber: matches.length + 1, team1: rest[0], team2: 'BYE', winner: rest[0], code: null, matchStatus: 'complete', seriesTo: t.seriesTo || 1 });
+    }
   }
   return matches;
 }
@@ -764,8 +852,12 @@ async function applyResult(
 
   // Completion: single-elim termina con la final; round robin cuando TODOS
   // los partidos están completos.
-  if ((t.bracketType || 'single_elim') === 'round_robin') {
+  const bt = t.bracketType || 'single_elim';
+  if (bt === 'round_robin') {
     if (t.bracket!.every(m => m.matchStatus === 'complete')) t.phase = 'complete';
+  } else if (bt === 'swiss') {
+    // Suizo no se auto-completa: el organizador decide cuántas rondas
+    // (POST /:id/next-round) y cierra con POST /:id/complete.
   } else {
     const maxRound = Math.max(...t.bracket!.map(m => m.round));
     if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') t.phase = 'complete';
@@ -1490,7 +1582,16 @@ router.post('/:id/start', requireAuth, async (req: any, res) => {
     if (activeRegs.length<2) return res.status(400).json({ error:'Mínimo 2 equipos' });
 
     const teams = activeRegs.map(r=>r.teamName);
-    const bracket = (t.bracketType === 'round_robin') ? generateRoundRobin(teams) : generateBracket(teams);
+    const bracket = t.bracketType === 'round_robin' ? generateRoundRobin(teams)
+                  : t.bracketType === 'swiss'       ? generateSwissRound1(teams)
+                  : generateBracket(teams);
+    // Series: estampar seriesTo en cada partido; en eliminación la final usa finalSeriesTo
+    const maxR = Math.max(...bracket.map(m => m.round));
+    for (const m of bracket) {
+      m.seriesTo = (t.bracketType !== 'round_robin' && t.bracketType !== 'swiss' && m.round === maxR)
+        ? (t.finalSeriesTo || t.seriesTo || 1)
+        : (t.seriesTo || 1);
+    }
     t.bracket = bracket;
     // Assign an allowlisted, metadata-tagged code to each ready round-1 match.
     for (let i = 0; i < bracket.length; i++) {
@@ -1549,7 +1650,9 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
     const bracketArr: BracketMatch[] = t.bracket || [];
     const maxRound = bracketArr.length ? Math.max(...bracketArr.map(m => m.round)) : 0;
     const rlabel = (r: number) => {
-      if ((t.bracketType || 'single_elim') === 'round_robin') return `Jornada ${r}`;
+      const bt = t.bracketType || 'single_elim';
+      if (bt === 'round_robin') return `Jornada ${r}`;
+      if (bt === 'swiss') return `Ronda ${r}`;
       const d = maxRound - r;
       return d === 0 ? 'Final' : d === 1 ? 'Semifinales' : d === 2 ? 'Cuartos' : `Ronda ${r}`;
     };
@@ -1617,6 +1720,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         checkinDeadline: t.checkinDeadline ?? null, logoUrl: t.logoUrl, bannerUrl: t.bannerUrl,
         fearless: !!t.fearless,
         bracketType: t.bracketType || 'single_elim',
+        seriesTo: t.seriesTo || 1, finalSeriesTo: t.finalSeriesTo || t.seriesTo || 1,
       },
       bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
     });
@@ -1956,6 +2060,49 @@ router.post('/:id/matches/:matchId/detect-from-code', requireAuth, async (req: a
   }
 });
 
+// ── Suizo: generar la siguiente ronda (pareo por récord, sin revanchas) ───────
+router.post('/:id/next-round', requireAuth, async (req: any, res) => {
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el creador puede hacer esto' });
+    if (t.bracketType !== 'swiss') return res.status(400).json({ error: 'Solo para torneos suizos' });
+    if (t.phase !== 'active' || !t.bracket?.length) return res.status(400).json({ error: 'Torneo no activo' });
+
+    const maxRound = Math.max(...t.bracket.map(m => m.round));
+    const pending = t.bracket.filter(m => m.round === maxRound && m.matchStatus !== 'complete');
+    if (pending.length) {
+      return res.status(409).json({ error: `Aún hay ${pending.length} partido(s) sin terminar en la ronda ${maxRound}`, pending: pending.map(m => m.id) });
+    }
+
+    const newMatches = pairSwissRound(t, maxRound + 1);
+    if (!newMatches.length) return res.status(400).json({ error: 'No hay pareos posibles' });
+    t.bracket = [...t.bracket, ...newMatches];
+    // Códigos para los partidos reales de la nueva ronda
+    for (let i = 0; i < t.bracket.length; i++) {
+      const m = t.bracket[i];
+      if (m.round === maxRound + 1 && m.matchStatus === 'ready' && !m.code) {
+        await assignCodeToMatch(t, i);
+      }
+    }
+    await saveT(t);
+    res.json({ success: true, round: maxRound + 1, matches: sanitizeBracket(newMatches, 'owner') });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Cerrar torneo manualmente (suizo: el organizador decide cuántas rondas) ──
+router.post('/:id/complete', requireAuth, async (req: any, res) => {
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el creador puede hacer esto' });
+    if (t.phase !== 'active') return res.status(400).json({ error: 'Torneo no activo' });
+    t.phase = 'complete';
+    await saveT(t);
+    res.json({ success: true, champion: t.standings?.[0]?.team ?? null });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 // Sincronizar gameIds + stats + resultados automáticos (owner o admin)
 router.post('/:id/sync-games', requireAuth, async (req: any, res) => {
   const { id } = req.params;
@@ -2167,14 +2314,22 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
       await pool.query('UPDATE tournaments SET fearless=? WHERE id=?', [fearless ? 1 : 0, t.id]);
       t.fearless = !!fearless;
     }
-    const { bracketType } = req.body;
+    const { bracketType, seriesTo, finalSeriesTo } = req.body;
+    const locked = t.phase === 'active' || t.phase === 'complete';
     if (bracketType !== undefined) {
-      if (!['single_elim', 'round_robin'].includes(bracketType))
-        return res.status(400).json({ error: 'bracketType inválido (single_elim | round_robin)' });
-      if (t.phase === 'active' || t.phase === 'complete')
-        return res.status(400).json({ error: 'No se puede cambiar el formato con el torneo iniciado' });
+      if (!['single_elim', 'round_robin', 'swiss'].includes(bracketType))
+        return res.status(400).json({ error: 'bracketType inválido (single_elim | round_robin | swiss)' });
+      if (locked) return res.status(400).json({ error: 'No se puede cambiar el formato con el torneo iniciado' });
       await pool.query('UPDATE tournaments SET bracket_type=? WHERE id=?', [bracketType, t.id]);
       t.bracketType = bracketType;
+    }
+    if (seriesTo !== undefined || finalSeriesTo !== undefined) {
+      if (locked) return res.status(400).json({ error: 'No se pueden cambiar las series con el torneo iniciado' });
+      const st = Number(seriesTo ?? t.seriesTo ?? 1), fst = Number(finalSeriesTo ?? t.finalSeriesTo ?? st);
+      if (![1, 2, 3].includes(st) || ![1, 2, 3].includes(fst))
+        return res.status(400).json({ error: 'seriesTo/finalSeriesTo: 1 (Bo1), 2 (Bo3) o 3 (Bo5)' });
+      await pool.query('UPDATE tournaments SET series_to=?, final_series_to=? WHERE id=?', [st, fst, t.id]);
+      t.seriesTo = st; t.finalSeriesTo = fst;
     }
     res.json({ success: true, tournament: serialize(t) });
   } catch (err: any) { res.status(500).json({ error: err.message }); }

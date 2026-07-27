@@ -12,6 +12,8 @@ type BracketMatch = {
   gameId?: number; gameRegion?: string;
   team1Puuids?: string[]; team2Puuids?: string[];
   codeActivatedAt?: number;
+  games?: Array<{ gameId: number; gameRegion?: string; winner?: string | null }>;
+  seriesTo?: number;
 };
 
 type TournamentData = {
@@ -27,6 +29,8 @@ type TournamentData = {
   region?: string;
   logoUrl?: string;
   bannerUrl?: string;
+  bracketType?: string;
+  seriesTo?: number;
 };
 
 function parseJson(v: unknown) {
@@ -63,6 +67,8 @@ async function getT(id: string): Promise<TournamentData | null> {
     region: row.region || 'la1',
     logoUrl: row.logo_url || undefined,
     bannerUrl: row.banner_url || undefined,
+    bracketType: row.bracket_type || 'single_elim',
+    seriesTo: Number(row.series_to) || 1,
   };
 }
 
@@ -100,6 +106,21 @@ export async function tryDetectGameId(
     return { gameId: Number(latest.gameId), platform };
   } catch {
     return null;
+  }
+}
+
+/** Series Bo3/Bo5: TODOS los juegos registrados con el código del enfrentamiento. */
+export async function detectAllGamesByCode(
+  code: string, fallbackRegion: string
+): Promise<Array<{ gameId: number; platform: string }>> {
+  try {
+    const games = await getGamesByCode(code);
+    return (games || []).map((g: any) => ({
+      gameId: Number(g.gameId),
+      platform: riotRegionToPlatform(g.region || fallbackRegion),
+    })).filter(g => Number.isFinite(g.gameId) && g.gameId > 0);
+  } catch {
+    return [];
   }
 }
 
@@ -361,9 +382,9 @@ async function collectTeamPuuids(
  * so an admin links it manually instead of guessing wrong.
  */
 export async function recoverGameFromRoster(
-  t: TournamentData, match: BracketMatch
+  t: TournamentData, match: BracketMatch, excludeGameIds?: Set<number>
 ): Promise<{ gameId: number; platform: string } | null> {
-  if (!match.team1 || !match.team2) return null;
+  if (!match.team1 || !match.team2 || match.team2 === 'BYE' || match.team1 === 'BYE') return null;
   const platform = match.gameRegion || t.region || 'la1';
 
   const { team1Puuids, team2Puuids, captain1, captain2 } = await collectTeamPuuids(t.id, match, platform);
@@ -392,6 +413,7 @@ export async function recoverGameFromRoster(
   for (const [riotMid] of candidates) {
     const parts = riotMid.split('_');
     const gameId = Number(parts[parts.length - 1]);
+    if (excludeGameIds?.has(gameId)) continue; // juego ya registrado en la serie
     const pf = parts[0].toLowerCase();
     const data = await getMatchById(pf, riotMid);
     const info = data?.info;
@@ -455,56 +477,60 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
     const detail: SyncDetail = { matchId: m.id };
 
     try {
-      // 1. Detect gameId from tournament code
-      if (!m.gameId && m.code) {
-        const detected = await tryDetectGameId(m.code, t.region || 'la1');
-        if (detected) {
-          t.bracket[i].gameId = detected.gameId;
-          t.bracket[i].gameRegion = detected.platform;
-          detail.gameIdDetected = detected.gameId;
-          changed = true;
-        }
-      }
+      const seriesTo = m.seriesTo || 1;
+      const known = new Set<number>((m.games || []).map(g => g.gameId));
+      if (m.gameId) known.add(m.gameId); // compat Bo1 previo a series
 
-      // 1b. Recover from roster match history if code lookup failed
-      if (!t.bracket[i].gameId) {
-        const recovered = await recoverGameFromRoster(t, t.bracket[i]);
-        if (recovered) {
-          t.bracket[i].gameId = recovered.gameId;
-          t.bracket[i].gameRegion = recovered.platform;
+      // 1. Detectar TODOS los juegos del código (series pueden tener varios)
+      const found: Array<{ gameId: number; platform: string }> = [];
+      if (m.code) found.push(...await detectAllGamesByCode(m.code, t.region || 'la1'));
+
+      // 1b. Recovery por historial del roster si el código no arrojó nada nuevo
+      const newFromCode = found.filter(g => !known.has(g.gameId));
+      if (!newFromCode.length && m.matchStatus !== 'complete') {
+        const recovered = await recoverGameFromRoster(t, m, known);
+        if (recovered && !known.has(recovered.gameId)) {
+          found.push(recovered);
           detail.gameIdRecovered = recovered.gameId;
-          changed = true;
           console.log(`[tournament-sync] recovered gameId ${recovered.gameId} for ${m.id} via roster`);
         }
       }
 
-      const match = t.bracket[i];
-      if (!match.gameId) {
-        details.push(detail);
-        continue;
+      // 2. Procesar cada juego nuevo: stats por juego + ganador del juego
+      for (const g of found) {
+        if (known.has(g.gameId)) continue;
+        const fetched = await fetchMatchData(g.gameId, g.platform || t.region || 'la1');
+        if (!fetched) continue;
+        const info = fetched.data.info;
+        if (!info.gameEndTimestamp) continue; // juego aún en curso
+        known.add(g.gameId);
+
+        const riotMid = riotMatchId(g.gameId, fetched.platform);
+        const parsed = buildMatchStatsResponse(fetched.data, riotMid, true);
+        await saveMatchStats(t.id, m.id, riotMid, g.gameId, parsed, info.gameDuration, info.gameEndTimestamp);
+        detail.statsCached = true;
+        changed = true;
+
+        const gameWinner = await resolveWinnerFromMatch(t, m, fetched.data);
+        t.bracket[i].games = [...(t.bracket[i].games || []), { gameId: g.gameId, gameRegion: fetched.platform, winner: gameWinner }];
+        t.bracket[i].gameId = g.gameId;           // último juego (compat con vista de stats)
+        t.bracket[i].gameRegion = fetched.platform;
+        detail.gameIdDetected = g.gameId;
       }
 
-      // 2. Fetch + cache stats
-      const fetched = await fetchMatchData(match.gameId, match.gameRegion || t.region || 'la1');
-      if (fetched) {
-        const info = fetched.data.info;
-        const isComplete = !!info.gameEndTimestamp;
-        const riotMid = riotMatchId(match.gameId, fetched.platform);
-        const parsed = buildMatchStatsResponse(fetched.data, riotMid, isComplete);
-        if (isComplete) {
-          await saveMatchStats(t.id, match.id, riotMid, match.gameId, parsed, info.gameDuration, info.gameEndTimestamp);
-          detail.statsCached = true;
+      // 3. Marcador de la serie y cierre al llegar a seriesTo
+      const match = t.bracket[i];
+      if (match.matchStatus !== 'complete' && t.phase === 'active' && (match.games?.length || 0) > 0) {
+        const s1 = match.games!.filter(g => g.winner === match.team1).length;
+        const s2 = match.games!.filter(g => g.winner === match.team2).length;
+        if (match.score1 !== s1 || match.score2 !== s2) {
+          t.bracket[i].score1 = s1; t.bracket[i].score2 = s2; changed = true;
+        }
+        const seriesWinner = s1 >= seriesTo ? match.team1 : s2 >= seriesTo ? match.team2 : null;
+        if (seriesWinner) {
+          await applyResultInPlace(t, i, seriesWinner);
+          detail.winnerResolved = seriesWinner;
           changed = true;
-
-          // 3. Auto-resolve winner if match still open
-          if (match.matchStatus !== 'complete' && t.phase === 'active') {
-            const winner = await resolveWinnerFromMatch(t, match, fetched.data);
-            if (winner) {
-              await applyResultInPlace(t, i, winner);
-              detail.winnerResolved = winner;
-              changed = true;
-            }
-          }
         }
       }
     } catch (e: any) {
@@ -522,14 +548,18 @@ async function applyResultInPlace(t: TournamentData, mi: number, winner: string)
   const match = t.bracket![mi];
   const loser = winner === match.team1 ? match.team2 : match.team1;
   t.bracket![mi] = { ...match, winner, matchStatus: 'complete' };
+  const bt = t.bracketType || 'single_elim';
 
-  const nextId = `r${match.round + 1}m${Math.ceil(match.matchNumber / 2)}`;
-  const ni = t.bracket!.findIndex(m => m.id === nextId);
-  if (ni !== -1) {
-    if (match.matchNumber % 2 === 1) t.bracket![ni].team1 = winner;
-    else t.bracket![ni].team2 = winner;
-    if (t.bracket![ni].team1 && t.bracket![ni].team2) {
-      t.bracket![ni].matchStatus = 'ready';
+  // Avance de ganador: solo eliminación directa (RR/suizo no tienen árbol)
+  if (bt === 'single_elim') {
+    const nextId = `r${match.round + 1}m${Math.ceil(match.matchNumber / 2)}`;
+    const ni = t.bracket!.findIndex(m => m.id === nextId);
+    if (ni !== -1) {
+      if (match.matchNumber % 2 === 1) t.bracket![ni].team1 = winner;
+      else t.bracket![ni].team2 = winner;
+      if (t.bracket![ni].team1 && t.bracket![ni].team2) {
+        t.bracket![ni].matchStatus = 'ready';
+      }
     }
   }
 
@@ -541,9 +571,15 @@ async function applyResultInPlace(t: TournamentData, mi: number, winner: string)
       .map((s, idx) => ({ ...s, position: idx + 1 }));
   }
 
-  const maxRound = Math.max(...t.bracket!.map(m => m.round));
-  if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') {
-    t.phase = 'complete';
+  if (bt === 'round_robin') {
+    if (t.bracket!.every(m => m.matchStatus === 'complete')) t.phase = 'complete';
+  } else if (bt === 'swiss') {
+    // el organizador cierra con /complete tras la última ronda
+  } else {
+    const maxRound = Math.max(...t.bracket!.map(m => m.round));
+    if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') {
+      t.phase = 'complete';
+    }
   }
 }
 
