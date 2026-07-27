@@ -23,10 +23,18 @@ function pickFrom(r: any, ...keys: string[]) {
   return '';
 }
 
+// LQC_WEBHOOK_SECRET admite varios secretos separados por coma
+// (rotación sin caída: "nuevo,viejo" mientras el otro lado migra al nuevo).
+function checkSecret(req: any): 'ok' | 'bad' | 'unconfigured' {
+  const secrets = (process.env.LQC_WEBHOOK_SECRET || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!secrets.length) return 'unconfigured';
+  return secrets.includes(req.header('X-LQC-Secret') || '') ? 'ok' : 'bad';
+}
+
 router.post('/lqc/register', async (req, res) => {
-  const secret = process.env.LQC_WEBHOOK_SECRET;
-  if (!secret) return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
-  if (req.header('X-LQC-Secret') !== secret) return bad(res, 401, 'Secreto inválido');
+  const auth = checkSecret(req);
+  if (auth === 'unconfigured') return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
+  if (auth === 'bad') return bad(res, 401, 'Secreto inválido');
 
   const tournamentId = process.env.LQC_TOURNAMENT_ID;
   if (!tournamentId) return bad(res, 503, 'Falta LQC_TOURNAMENT_ID');
@@ -136,9 +144,9 @@ router.post('/lqc/register', async (req, res) => {
 //   no existe responde ok:true con action:'already_absent'.
 //   Solo funciona mientras el torneo no haya iniciado (registration/checkin).
 router.post('/lqc/unregister', async (req, res) => {
-  const secret = process.env.LQC_WEBHOOK_SECRET;
-  if (!secret) return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
-  if (req.header('X-LQC-Secret') !== secret) return bad(res, 401, 'Secreto inválido');
+  const auth = checkSecret(req);
+  if (auth === 'unconfigured') return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
+  if (auth === 'bad') return bad(res, 401, 'Secreto inválido');
 
   const tournamentId = process.env.LQC_TOURNAMENT_ID;
   if (!tournamentId) return bad(res, 503, 'Falta LQC_TOURNAMENT_ID');
