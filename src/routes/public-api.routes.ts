@@ -77,6 +77,32 @@ function publicMatch(m: any) {
 
 // ── Endpoints ────────────────────────────────────────────────────────────────
 
+// Validar Riot ID (para formularios externos: el sitio LQC es estático y no
+// puede llamar a Riot con key). Cache fuerte para no quemar rate limit.
+router.get('/validate-riot-id', async (req, res) => {
+  const riotId = String(req.query.riotId || '').trim();
+  const m = riotId.match(/^(.{3,16})#(.{2,5})$/);
+  if (!m) return res.json({ ok: true, data: { valid: false, reason: 'format', hint: 'Formato: Nombre#TAG' } });
+  try {
+    const data = await cached(`rid:${riotId.toLowerCase()}`, async () => {
+      const { getAccountByRiotId } = await import('../services/riot.js');
+      try {
+        const acc: any = await getAccountByRiotId(m[1].trim(), m[2].trim(), { platformHint: 'la1' });
+        return acc?.puuid
+          ? { valid: true, gameName: acc.gameName, tagLine: acc.tagLine }
+          : { valid: false, reason: 'not_found' };
+      } catch (e: any) {
+        if (e?.response?.status === 404 || /404/.test(e?.message || '')) return { valid: false, reason: 'not_found' };
+        throw e;
+      }
+    });
+    res.json({ ok: true, data });
+  } catch (err: any) {
+    // Riot caído/rate limit: no bloquear el formulario — que decida el consumidor
+    res.status(200).json({ ok: true, data: { valid: null, reason: 'unavailable' } });
+  }
+});
+
 // Lista de torneos
 router.get('/tournaments', async (_req, res) => {
   try {

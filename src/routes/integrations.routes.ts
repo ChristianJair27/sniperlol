@@ -116,6 +116,20 @@ router.post('/lqc/register', async (req, res) => {
   };
   const captainName  = pick('capitan', 'capitan_nombre', 'nombre_capitan', 'captainName', 'captain_name');
   const captainPhone = pick('capitan_celular', 'celular_capitan', 'captainPhone', 'captain_phone');
+  // Rol titular/suplente si el form lo manda (opcional)
+  const rol = pick('rol', 'role', 'tipo');
+  if (rol) (player as any).role = rol.toLowerCase();
+
+  // Resolver PUUID al registrar (best-effort): con esto la atribución de stats,
+  // fearless y ganadores funciona aunque el jugador nunca cree cuenta en ATAK.
+  const ridMatch = gamertag.match(/^(.{3,16})#(.{2,5})$/);
+  if (ridMatch) {
+    try {
+      const { getAccountByRiotId } = await import('../services/riot.js');
+      const acc: any = await getAccountByRiotId(ridMatch[1].trim(), ridMatch[2].trim(), { platformHint: 'la1' });
+      if (acc?.puuid) (player as any).puuid = acc.puuid;
+    } catch { /* Riot caído o ID inexistente: el registro entra igual */ }
+  }
 
   // Invita al jugador a ATAK.GG por correo (crear cuenta + seguir su torneo).
   // Best-effort: si el SMTP falla, el registro NO se bloquea.
