@@ -271,6 +271,119 @@ router.post('/lqc/unregister', async (req, res) => {
   }
 });
 
+// ── Registro de EQUIPO COMPLETO en una sola llamada (atómico) ─────────────────
+// POST /api/integrations/lqc/register-team
+// { equipo, capitan_nombre?, capitan_celular?, jugadores: [{gamertag, nombre, ...}] }
+// El roster enviado REEMPLAZA al existente (el capitán manda la lista completa).
+// Transacción + SELECT FOR UPDATE: sin carreras aunque lleguen envíos simultáneos.
+async function buildPlayerFrom(rec: any) {
+  const gamertag = pickFrom(rec, 'gamertag', 'game_tag', 'riot_id', 'riotId');
+  const p: any = {
+    name: gamertag || pickFrom(rec, 'nombre', 'name'),
+    riotId: gamertag || undefined,
+    realName: pickFrom(rec, 'nombre', 'name', 'full_name') || undefined,
+    phone: pickFrom(rec, 'celular', 'phone', 'telefono') || undefined,
+    email: pickFrom(rec, 'correo', 'correo_electronico', 'email') || undefined,
+    birthDate: pickFrom(rec, 'fecha_nacimiento', 'fechaNacimiento', 'birth_date') || undefined,
+    schooling: pickFrom(rec, 'escolaridad', 'schooling') || undefined,
+    municipality: pickFrom(rec, 'municipio', 'municipality') || undefined,
+    locality: pickFrom(rec, 'localidad', 'locality') || undefined,
+    gender: pickFrom(rec, 'genero', 'género', 'gender') || undefined,
+    source: 'lqc-form',
+    inviteEmail: pickFrom(rec, 'correo', 'correo_electronico', 'email') || undefined,
+    inviteStatus: 'pending' as const,
+  };
+  const rol = pickFrom(rec, 'rol', 'role', 'tipo');
+  if (rol) p.role = rol.toLowerCase();
+  const m = (gamertag || '').match(/^(.{3,16})#(.{2,5})$/);
+  if (m) {
+    try {
+      const { getAccountByRiotId } = await import('../services/riot.js');
+      const acc: any = await getAccountByRiotId(m[1].trim(), m[2].trim(), { platformHint: 'la1' });
+      if (acc?.puuid) p.puuid = acc.puuid;
+    } catch { /* best-effort */ }
+  }
+  return p;
+}
+
+router.post('/lqc/register-team', async (req, res) => {
+  const auth = checkSecret(req);
+  if (auth === 'unconfigured') return bad(res, 503, 'Integración no configurada (falta LQC_WEBHOOK_SECRET)');
+  if (auth === 'bad') return bad(res, 401, 'Secreto inválido');
+  const tournamentId = process.env.LQC_TOURNAMENT_ID;
+  if (!tournamentId) return bad(res, 503, 'Falta LQC_TOURNAMENT_ID');
+
+  const b: any = req.body?.record ?? req.body ?? {};
+  const teamName = pickFrom(b, 'equipo', 'team', 'team_name', 'teamName');
+  const captainName = pickFrom(b, 'capitan', 'capitan_nombre', 'nombre_capitan', 'captainName', 'captain_name');
+  const captainPhone = pickFrom(b, 'capitan_celular', 'celular_capitan', 'captainPhone', 'captain_phone');
+  const list: any[] = Array.isArray(b.jugadores) ? b.jugadores : Array.isArray(b.players) ? b.players : [];
+  if (!teamName || !list.length) return bad(res, 400, 'equipo y jugadores[] requeridos');
+  if (list.length > 7) return bad(res, 409, 'Máximo 7 jugadores (5 titulares + 2 suplentes)');
+
+  try {
+    const t = await getT(tournamentId);
+    if (!t) return bad(res, 404, `Torneo ${tournamentId} no existe`);
+    if (t.phase !== 'registration') return bad(res, 409, `El torneo ya no está en fase de registro (${t.phase})`);
+
+    // PUUIDs fuera de la transacción (llamadas a Riot lentas — no bloquear filas)
+    const players = await Promise.all(list.map(buildPlayerFrom));
+    const captainRiot = captainName || players[0]?.riotId || players[0]?.name || '';
+    const contact = [captainName, captainPhone, players[0]?.email].filter(Boolean).join(' · ');
+
+    const conn = await pool.getConnection();
+    let action = 'team_updated';
+    try {
+      await conn.beginTransaction();
+      const [[reg]] = await conn.query<any[]>(
+        'SELECT id FROM tournament_registrations WHERE tournament_id=? AND LOWER(team_name)=LOWER(?) FOR UPDATE',
+        [tournamentId, teamName]
+      );
+      if (!reg) {
+        const [[{ c }]] = await conn.query<any[]>(
+          'SELECT COUNT(*) AS c FROM tournament_registrations WHERE tournament_id=?', [tournamentId]
+        );
+        if (Number(c) >= (t.maxParticipants || 32)) {
+          await conn.rollback(); conn.release();
+          return bad(res, 409, 'Torneo lleno');
+        }
+        // ON DUPLICATE cubre la carrera extrema de dos creaciones simultáneas
+        const [ins]: any = await conn.query(
+          `INSERT INTO tournament_registrations (tournament_id, team_name, captain_riot_id, players, contact)
+           VALUES (?,?,?,?,?)
+           ON DUPLICATE KEY UPDATE players=VALUES(players), captain_riot_id=VALUES(captain_riot_id), contact=VALUES(contact)`,
+          [tournamentId, teamName, captainRiot, JSON.stringify(players), contact]
+        );
+        if (ins.affectedRows === 1) { // 1 = insert nuevo; 2 = duplicate-update
+          await conn.query('UPDATE tournaments SET participants = participants + 1 WHERE id=?', [tournamentId]);
+          action = 'team_created';
+        }
+      } else {
+        await conn.query(
+          'UPDATE tournament_registrations SET players=?, captain_riot_id=?, contact=? WHERE id=?',
+          [JSON.stringify(players), captainRiot, contact, reg.id]
+        );
+      }
+      await conn.commit();
+    } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
+
+    // Invitaciones por correo (best-effort, fuera de la transacción)
+    for (const p of players) {
+      if (!p.email || !isDeliverableEmail(p.email)) continue;
+      sendTournamentInvitationEmail({
+        toEmail: p.email, toName: p.realName || p.name, inviterName: captainName || 'LQC',
+        tournamentName: t.name, teamName, tournamentId: t.id, playerSlotName: p.riotId || p.name,
+      }).catch(e => console.warn('[lqc/register-team] email:', e.message));
+    }
+
+    return res.json({ ok: true, action, team: teamName, teamSize: players.length,
+      withPuuid: players.filter(p => p.puuid).length });
+  } catch (err: any) {
+    console.error('[lqc/register-team]', err.message);
+    return bad(res, 500, err.message);
+  }
+});
+
 // Baja explícita (para el dashboard de Sebas si prefiere llamarla directo):
 // POST /api/integrations/lqc/unregister { equipo, gamertag? }
 // Sin gamertag → borra el equipo completo.
