@@ -85,6 +85,11 @@ interface TournamentData {
   bracketType?: 'single_elim' | 'round_robin' | 'swiss';
   // Series: juegos necesarios para ganar un enfrentamiento (1=Bo1, 2=Bo3, 3=Bo5).
   seriesTo?: number;
+  // Registro externo (p.ej. formulario de la liga): la UI manda ahí y el
+  // registro directo en ATAK se bloquea para no-organizadores.
+  registrationUrl?: string;
+  // Reglamento (PDF/URL) mostrado en la pestaña Reglas.
+  rulesUrl?: string;
   // Override para la final (p.ej. Bo3 todo el torneo y final Bo5 → finalSeriesTo=3).
   finalSeriesTo?: number;
 }
@@ -180,6 +185,8 @@ async function initTables() {
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS fearless TINYINT(1) DEFAULT 0`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bracket_type VARCHAR(20) DEFAULT 'single_elim'`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS series_to INT DEFAULT 1`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS registration_url VARCHAR(500)`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rules_url VARCHAR(500)`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS final_series_to INT DEFAULT 1`,
     // Series Bo3/Bo5: una fila de stats POR JUEGO (antes: una por enfrentamiento)
     `ALTER TABLE tournament_match_stats DROP INDEX unique_bracket_match`,
@@ -261,6 +268,8 @@ function rowToTournament(row: any): TournamentData {
     bracketType: (row.bracket_type as any) || 'single_elim',
     seriesTo:      Number(row.series_to) || 1,
     finalSeriesTo: Number(row.final_series_to) || Number(row.series_to) || 1,
+    registrationUrl: row.registration_url || undefined,
+    rulesUrl:        row.rules_url || undefined,
   };
 }
 
@@ -363,6 +372,7 @@ function serialize(t: TournamentData, access: ViewerAccess = 'public') {
     createdBy: access === 'owner' ? t.createdBy : undefined,
     region:t.region||'la1', logoUrl:t.logoUrl, bannerUrl:t.bannerUrl, fearless:!!t.fearless,
     bracketType:t.bracketType||'single_elim',
+    registrationUrl:t.registrationUrl, rulesUrl:t.rulesUrl,
     viewerAccess: access,
   };
 }
@@ -1218,6 +1228,14 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
     if (t.phase !== 'registration') return res.status(400).json({ error: 'Inscripciones cerradas' });
+    // Registro externo obligatorio (p.ej. formulario de la liga): solo el
+    // organizador puede registrar directo (para correcciones manuales).
+    if (t.registrationUrl && !isOwner(req, t)) {
+      return res.status(403).json({
+        error: 'Las inscripciones de este torneo se hacen en el sitio oficial de la liga',
+        registrationUrl: t.registrationUrl,
+      });
+    }
     if (t.participants >= t.maxParticipants) return res.status(400).json({ error: 'Torneo lleno' });
 
     const userId = req.auth.userId;
@@ -1721,6 +1739,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         fearless: !!t.fearless,
         bracketType: t.bracketType || 'single_elim',
         seriesTo: t.seriesTo || 1, finalSeriesTo: t.finalSeriesTo || t.seriesTo || 1,
+        registrationUrl: t.registrationUrl ?? null, rulesUrl: t.rulesUrl ?? null,
       },
       bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
     });
@@ -2305,6 +2324,14 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
     if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el creador puede editar' });
     if (logoUrl    !== undefined) t.logoUrl    = logoUrl    || undefined;
     if (bannerUrl  !== undefined) t.bannerUrl  = bannerUrl  || undefined;
+    const { registrationUrl, rulesUrl } = req.body;
+    if (registrationUrl !== undefined || rulesUrl !== undefined) {
+      await pool.query('UPDATE tournaments SET registration_url=COALESCE(?, registration_url), rules_url=COALESCE(?, rules_url) WHERE id=?',
+        [registrationUrl === undefined ? null : (registrationUrl || null),
+         rulesUrl === undefined ? null : (rulesUrl || null), t.id]);
+      if (registrationUrl !== undefined) t.registrationUrl = registrationUrl || undefined;
+      if (rulesUrl !== undefined) t.rulesUrl = rulesUrl || undefined;
+    }
     if (region     !== undefined) t.region     = region     || 'la1';
     if (name       !== undefined) t.name       = name;
     if (prize      !== undefined) t.prize      = prize;
