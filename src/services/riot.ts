@@ -16,15 +16,24 @@ const limiterMatchById = new Bottleneck({
   minTime: 1200,  // ~0.8 req/s (muy seguro para dev keys)
 });
 
-/* === CACHÉ sencillo para match by id (5 min) === */
+/* === CACHÉ para match by id ===
+   Una partida TERMINADA es inmutable: cachearla 5 min era quemar rate limit
+   re-pidiendo lo mismo a Riot (429 en perfiles con historial largo).
+   TTL 24h + tope LRU sencillo para no crecer sin límite. */
 const matchCache = new Map<string, { data: any; exp: number }>();
+const MATCH_CACHE_MAX = 3000;
 function getCachedMatch(id: string) {
   const e = matchCache.get(id);
   if (e && e.exp > Date.now()) return e.data;
   if (e) matchCache.delete(id);
   return null;
 }
-function setCachedMatch(id: string, data: any, ttlMs = 5 * 60 * 1000) {
+function setCachedMatch(id: string, data: any, ttlMs = 24 * 60 * 60 * 1000) {
+  if (matchCache.size >= MATCH_CACHE_MAX) {
+    // descarta el más antiguo (los Map iteran en orden de inserción)
+    const oldest = matchCache.keys().next().value;
+    if (oldest) matchCache.delete(oldest);
+  }
   matchCache.set(id, { data, exp: Date.now() + ttlMs });
 }
 
