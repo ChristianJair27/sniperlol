@@ -142,6 +142,7 @@ router.get('/summoner-full', async (req, res) => {
       is_fresh_blood: profile.is_fresh_blood,
       season_play,
       season_win_rate: season_play > 0 ? Math.round((solo.wins / season_play) * 100) : null,
+      previous_seasons: profile.previous_seasons ?? [],
     });
   } catch (err: any) {
     res.status(500).json({ ok: false, msg: err?.message });

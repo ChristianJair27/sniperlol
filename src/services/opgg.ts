@@ -547,6 +547,8 @@ export interface OPGGFullProfile {
   is_hot_streak: boolean;
   is_veteran: boolean;
   is_fresh_blood: boolean;
+  // Historial de temporadas pasadas (elo final por season, de OP.GG)
+  previous_seasons: Array<{ season_id: number; display?: string; tier: string | null; division: number | null; lp: number | null; tier_image_url?: string | null }>;
 }
 
 export async function getSummonerFullProfile(
@@ -574,6 +576,7 @@ export async function getSummonerFullProfile(
         'data.summoner.ranked_most_champions.my_champion_stats',
         'data.summoner.ranked_most_champions.my_champion_stats.rank',
         'data.summoner.ranked_most_champions.my_champion_stats.champion_name',
+        'data.summoner.previous_seasons',
       ],
     });
 
@@ -639,6 +642,16 @@ export async function getSummonerFullProfile(
       is_hot_streak: solo?.is_hot_streak ?? false,
       is_veteran: solo?.is_veteran ?? false,
       is_fresh_blood: solo?.is_fresh_blood ?? false,
+      previous_seasons: (Array.isArray(summoner.previous_seasons) ? summoner.previous_seasons : [])
+        .map((s: any) => ({
+          season_id: s.season_id ?? s.id ?? 0,
+          display: s.display_value ?? s.display ?? String(s.season_id ?? ''),
+          tier: s.tier_info?.tier ?? s.tier ?? null,
+          division: s.tier_info?.division ?? s.division ?? null,
+          lp: s.tier_info?.lp ?? s.lp ?? null,
+          tier_image_url: s.tier_info?.tier_image_url ?? null,
+        }))
+        .filter((s: any) => s.tier),
     };
 
     cache.set(cacheKey, { data: profile, exp: Date.now() + CACHE_TTL });
