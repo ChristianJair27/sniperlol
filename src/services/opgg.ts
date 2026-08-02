@@ -131,6 +131,12 @@ async function callTool(name: string, args: Record<string, any>): Promise<any> {
   if (name === 'lol_get_summoner_profile') {
     console.log('[opgg-raw] first 800 chars:\n', text.slice(0, 800));
   }
+  // Algunas tools (esports, skins) devuelven JSON plano en vez del formato
+  // de texto custom de OP.GG — detectarlo antes del parser.
+  const trimmed = text.trim();
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try { return JSON.parse(trimmed); } catch { /* sigue al parser custom */ }
+  }
   return parseOPGGText(text);
 }
 
@@ -704,4 +710,39 @@ export async function getSummonerRank(
     console.warn('[opgg] summoner rank failed:', err?.message);
     return null;
   }
+}
+
+// ── Esports (OP.GG MCP): calendario y standings de ligas pro ──────────────────
+export async function getEsportsSchedules(league?: string): Promise<any[]> {
+  const cacheKey = `esports:sched:${league || 'all'}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) return cached.data as any[];
+  const parsed = await callTool('lol_esports_list_schedules', league ? { league } : {});
+  const list = Array.isArray(parsed) ? parsed : (parsed?.data?.schedules ?? parsed?.data ?? []);
+  const arr = Array.isArray(list) ? list : [];
+  cache.set(cacheKey, { data: arr, exp: Date.now() + 10 * 60 * 1000 });
+  return arr;
+}
+
+export async function getEsportsStandings(league: string): Promise<any[]> {
+  const cacheKey = `esports:stand:${league}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) return cached.data as any[];
+  const parsed = await callTool('lol_esports_list_team_standings', { short_name: league });
+  const list = Array.isArray(parsed) ? parsed : (parsed?.data?.standings ?? parsed?.data ?? []);
+  const arr = Array.isArray(list) ? list : [];
+  cache.set(cacheKey, { data: arr, exp: Date.now() + 30 * 60 * 1000 });
+  return arr;
+}
+
+// ── Skins en oferta (rotación de tienda) ──────────────────────────────────────
+export async function getDiscountedSkins(): Promise<any[]> {
+  const cacheKey = 'skins:sale';
+  const cached = cache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) return cached.data as any[];
+  const parsed = await callTool('lol_list_discounted_skins', {});
+  const list = Array.isArray(parsed) ? parsed : (parsed?.data?.skins ?? parsed?.data ?? []);
+  const arr = Array.isArray(list) ? list : [];
+  cache.set(cacheKey, { data: arr, exp: Date.now() + 6 * 60 * 60 * 1000 });
+  return arr;
 }

@@ -5,7 +5,7 @@
 // GET /api/opgg/raw?game_name=Faker&tag_line=KR1&region=KR   ← diagnostic: raw MCP text
 import { Router } from 'express';
 import axios from 'axios';
-import { getSummonerRank, getSummonerFullProfile, normaliseRegion, getChampionBuild, getLaneMeta, resolveChampionId, getAramAugments, getArenaAugmentMeta, getCounters } from '../services/opgg.js';
+import { getSummonerRank, getSummonerFullProfile, normaliseRegion, getChampionBuild, getLaneMeta, resolveChampionId, getAramAugments, getArenaAugmentMeta, getCounters, getEsportsSchedules, getEsportsStandings, getDiscountedSkins } from '../services/opgg.js';
 
 const router = Router();
 
@@ -213,6 +213,42 @@ router.get('/tier-list', async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ ok: false, msg: err?.message });
   }
+});
+
+// GET /api/opgg/esports/schedules?league=LCK — calendario de partidos pro
+router.get('/esports/schedules', async (req, res) => {
+  try {
+    const schedules = await getEsportsSchedules((req.query.league as string) || undefined);
+    res.json({ ok: true, schedules });
+  } catch (err: any) { res.status(500).json({ ok: false, msg: err?.message }); }
+});
+
+// GET /api/opgg/esports/standings?league=LCK — tabla de posiciones
+router.get('/esports/standings', async (req, res) => {
+  const league = ((req.query.league as string) || 'LCK').toUpperCase();
+  try {
+    const standings = await getEsportsStandings(league);
+    res.json({ ok: true, league, standings });
+  } catch (err: any) { res.status(500).json({ ok: false, msg: err?.message }); }
+});
+
+// GET /api/opgg/skins-sale — skins en oferta esta rotación
+router.get('/skins-sale', async (_req, res) => {
+  try {
+    const skins = await getDiscountedSkins();
+    res.json({ ok: true, skins });
+  } catch (err: any) { res.status(500).json({ ok: false, msg: err?.message }); }
+});
+
+// GET /api/opgg/build?champion=Ahri&position=MIDDLE — runas/ítems/skills meta
+router.get('/build', async (req, res) => {
+  const champion = (req.query.champion as string ?? '').trim();
+  const position = (req.query.position as string ?? 'MIDDLE').trim();
+  if (!champion) return res.status(400).json({ ok: false, msg: 'champion requerido' });
+  try {
+    const build = await getChampionBuild(champion, position);
+    res.json({ ok: true, champion, position, build });
+  } catch (err: any) { res.status(500).json({ ok: false, msg: err?.message }); }
 });
 
 // GET /api/opgg/raw — returns the raw OP.GG MCP text so we can inspect the schema
