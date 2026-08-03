@@ -27,10 +27,19 @@ const riotAxios = axios.create({
 
 // ─── Provider ────────────────────────────────────────────────────────────────
 // Un provider se crea una vez y se reutiliza para todos los torneos
+// Sprint 0: sin TOURNAMENT_CALLBACK_URL en producción el provider quedaría
+// registrado apuntando a un dominio que NO controlamos (atak.gg era el fallback
+// silencioso). En prod: fallo ruidoso al arranque. En dev: warn + dominio real.
+const CALLBACK_FALLBACK = 'https://atakback.revolution505.com/api/tournaments/tournament-callback';
+if (!process.env.TOURNAMENT_CALLBACK_URL) {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('[FATAL] TOURNAMENT_CALLBACK_URL no está configurado — obligatorio en producción (los providers de Riot registran esta URL).');
+  }
+  console.warn(`[riot-tournament] TOURNAMENT_CALLBACK_URL ausente — usando fallback dev: ${CALLBACK_FALLBACK}`);
+}
+
 export const createProvider = async (): Promise<{ id: number }> => {
-  const base =
-    process.env.TOURNAMENT_CALLBACK_URL ||
-    'https://atak.gg/api/tournaments/tournament-callback';
+  const base = process.env.TOURNAMENT_CALLBACK_URL || CALLBACK_FALLBACK;
   // Riot does not sign callbacks, so embed a shared secret in the registered URL.
   // The callback handler rejects any POST whose ?key= doesn't match.
   const secret = process.env.TOURNAMENT_CALLBACK_SECRET;
