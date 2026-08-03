@@ -7,8 +7,41 @@ import {
   getSummonerByPUUID,
   getSummonerByName,
 } from "../services/riot.js";
+import { requireAuth } from "../middlewares/requireAuth.js";
 
 const r = Router();
+
+// ── Sprint 0: auditoría de config de PROD sin acceso al panel de Coolify ─────
+// Solo flags booleanos / valores no sensibles. NUNCA secretos. Admin-only.
+r.get("/config", requireAuth, (req: any, res) => {
+  if (req.auth?.role !== "admin") return res.status(403).json({ error: "Solo admin" });
+  const has = (k: string) => Boolean(process.env[k] && String(process.env[k]).trim());
+  res.json({
+    node_env: process.env.NODE_ENV || null,
+    riot: {
+      stub_mode: process.env.RIOT_STUB_MODE === "true",
+      region: process.env.RIOT_REGION || null,
+      default_platform: process.env.DEFAULT_PLATFORM || null,
+      api_key_set: has("RIOT_API_KEY"),
+      api_key_suffix: process.env.RIOT_API_KEY ? process.env.RIOT_API_KEY.slice(-4) : null,
+      callback_url_set: has("TOURNAMENT_CALLBACK_URL"),
+      callback_secret_set: has("TOURNAMENT_CALLBACK_SECRET"),
+      max_tournaments_per_month: Number(process.env.RIOT_MAX_TOURNAMENTS_PER_MONTH || 5),
+      max_codes_per_tournament: Number(process.env.RIOT_MAX_CODES_PER_TOURNAMENT || 300),
+    },
+    integrations: {
+      lqc_webhook_secret_set: has("LQC_WEBHOOK_SECRET"),
+      lqc_tournament_id: process.env.LQC_TOURNAMENT_ID || null,
+    },
+    auth: {
+      rso_configured: has("RSO_CLIENT_ID") && has("RSO_CLIENT_SECRET") && has("RSO_REDIRECT_URI"),
+      google_configured: has("GOOGLE_CLIENT_ID") && has("GOOGLE_CLIENT_SECRET"),
+      jwt_secret_set: has("JWT_SECRET"),
+    },
+    mail: { smtp_configured: has("SMTP_HOST") && has("SMTP_USER") },
+    db: { mysql_host_set: has("MYSQL_HOST") },
+  });
+});
 
 /**
  * Ejemplos:
