@@ -191,7 +191,32 @@ async function initTables() {
     // Series Bo3/Bo5: una fila de stats POR JUEGO (antes: una por enfrentamiento)
     `ALTER TABLE tournament_match_stats DROP INDEX unique_bracket_match`,
     `ALTER TABLE tournament_match_stats ADD UNIQUE KEY unique_bracket_game (tournament_id, bracket_match_id, game_id)`,
-  ]) { await pool.query(col).catch(() => {}); }
+    // Sprint 0: gate de organizador + cuotas + logs de auditoría
+    `ALTER TABLE users MODIFY provider ENUM('local','google','riot') NOT NULL DEFAULT 'local'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS organizer_status ENUM('none','approved','suspended') NOT NULL DEFAULT 'none'`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS codes_generated INT NOT NULL DEFAULT 0`,
+    `CREATE TABLE IF NOT EXISTS access_denied_log (
+      id INT AUTO_INCREMENT PRIMARY KEY, user_id BIGINT NULL,
+      endpoint VARCHAR(120) NOT NULL, reason VARCHAR(60) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_user (user_id), KEY idx_when (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS callback_log (
+      id INT AUTO_INCREMENT PRIMARY KEY, received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      code VARCHAR(100) NULL, valid_key TINYINT(1) NOT NULL DEFAULT 0, payload LONGTEXT NULL,
+      KEY idx_when (received_at), KEY idx_code (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  ]) {
+    // Errores benignos (columna/índice ya existe) se ignoran; el resto SE LOGUEA.
+    // El .catch(()=>{}) silencioso de antes fue lo que escondió el bug del enum.
+    try { await pool.query(col); }
+    catch (e: any) {
+      const benign = ['ER_DUP_FIELDNAME', 'ER_DUP_KEYNAME', 'ER_TABLE_EXISTS_ERROR', 'ER_CANT_DROP_FIELD_OR_KEY'];
+      if (!benign.includes(e.code)) {
+        console.error(`[initTables] DDL FALLÓ (${e.code}): ${col.slice(0, 80)}… → ${e.message}`);
+      }
+    }
+  }
   // Seed only if empty
   const [[{ cnt }]] = await pool.query<any[]>('SELECT COUNT(*) AS cnt FROM tournaments');
   if (Number(cnt) === 0) {
@@ -473,6 +498,55 @@ function isOwner(req: any, t: TournamentData) {
   return req.auth?.userId === t.createdBy || req.auth?.role === 'admin';
 }
 function isAdmin(req: any) { return req.auth?.role === 'admin'; }
+
+// ── Sprint 0: gate de capacidad Riot (base del futuro gate de pago) ───────────
+// (a) crear registro de torneo → cualquier usuario auth (sin cambios)
+// (b) crear torneo en RIOT / generar códigos reales → organizer approved o admin.
+// 'approved' se convertirá en 'plan activo' en la fase de billing: un solo punto.
+const RIOT_MAX_TOURNAMENTS_PER_MONTH = Number(process.env.RIOT_MAX_TOURNAMENTS_PER_MONTH || 5);
+const RIOT_MAX_CODES_PER_TOURNAMENT = Number(process.env.RIOT_MAX_CODES_PER_TOURNAMENT || 300);
+
+async function logDenied(userId: number | null, endpoint: string, reason: string) {
+  try {
+    await pool.query('INSERT INTO access_denied_log (user_id, endpoint, reason) VALUES (?,?,?)',
+      [userId ?? null, endpoint, reason]);
+  } catch (e: any) { console.warn('[access-log]', e.message); }
+}
+
+type CapResult = { ok: true } | { ok: false; status: number; error: string; reason: string };
+async function riotCapability(req: any): Promise<CapResult> {
+  const uid = req.auth?.userId ?? null;
+  if (req.auth?.role === 'admin') return { ok: true };
+  const [[u]] = await pool.query<any[]>('SELECT role, organizer_status FROM users WHERE id=?', [uid]);
+  if (!u) return { ok: false, status: 403, error: 'Usuario no encontrado', reason: 'no_user' };
+  if (u.role === 'admin' || u.organizer_status === 'approved') return { ok: true };
+  if (u.organizer_status === 'suspended') {
+    return { ok: false, status: 403, reason: 'suspended',
+      error: 'Tu acceso de organizador está suspendido. Escríbenos a kister@revolution505.com.' };
+  }
+  return { ok: false, status: 403, reason: 'not_organizer',
+    error: 'Crear torneos con códigos oficiales de Riot requiere acceso de organizador. Solicítalo en kister@revolution505.com — la creación de torneos sin códigos sigue disponible.' };
+}
+
+/** Cuota mensual: torneos Riot creados por este usuario en los últimos 30 días. */
+async function monthlyRiotQuotaExceeded(userId: number): Promise<boolean> {
+  const [[{ c }]] = await pool.query<any[]>(
+    `SELECT COUNT(*) c FROM tournaments
+     WHERE created_by=? AND riot_tournament_id IS NOT NULL
+       AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)`, [userId]);
+  return Number(c) >= RIOT_MAX_TOURNAMENTS_PER_MONTH;
+}
+
+/** Cuota por torneo: códigos ya generados + los que se piden. */
+async function codesQuotaExceeded(tournamentId: string, toAdd: number): Promise<boolean> {
+  const [[row]] = await pool.query<any[]>('SELECT codes_generated FROM tournaments WHERE id=?', [tournamentId]);
+  return (Number(row?.codes_generated) || 0) + toAdd > RIOT_MAX_CODES_PER_TOURNAMENT;
+}
+
+async function bumpCodesGenerated(tournamentId: string, n: number) {
+  try { await pool.query('UPDATE tournaments SET codes_generated = codes_generated + ? WHERE id=?', [n, tournamentId]); }
+  catch (e: any) { console.warn('[codes-quota]', e.message); }
+}
 
 // ─── Match stats DB helpers ───────────────────────────────────────────────────
 
@@ -802,15 +876,22 @@ async function assignCodeToMatch(t: TournamentData, mi: number): Promise<string 
 
   let code: string | null = null;
   if (t.riotTournamentId) {
-    try {
-      const metadata = JSON.stringify({ tId: t.id, mId: match.id });
-      const codes = await generateCodes(t.riotTournamentId, 1, {
-        metadata,
-        allowedParticipants: [...team1Puuids, ...team2Puuids],
-      });
-      code = codes[0] || null;
-    } catch (e: any) {
-      console.error(`[assignCode] Riot code gen falló para ${match.id}:`, e.message);
+    // Cuota por torneo (Sprint 0): si se excede, cae al pool pre-generado.
+    // La capacidad ya está gateada aguas arriba: sin gate no hay riotTournamentId.
+    if (await codesQuotaExceeded(t.id, 1)) {
+      console.warn(`[assignCode] cuota de códigos excedida en ${t.id} — usando pool`);
+    } else {
+      try {
+        const metadata = JSON.stringify({ tId: t.id, mId: match.id });
+        const codes = await generateCodes(t.riotTournamentId, 1, {
+          metadata,
+          allowedParticipants: [...team1Puuids, ...team2Puuids],
+        });
+        code = codes[0] || null;
+        if (code) await bumpCodesGenerated(t.id, 1);
+      } catch (e: any) {
+        console.error(`[assignCode] Riot code gen falló para ${match.id}:`, e.message);
+      }
     }
   }
   // Fallback: a pre-generated pooled code (no allowlist / no metadata).
@@ -902,6 +983,16 @@ router.post('/', requireAuth, async (req: any, res) => {
   let initialCodes: string[] = [];
 
   if (createRiot) {
+    // Gate (b): torneo REAL en Riot solo para organizadores aprobados/admin
+    const cap = await riotCapability(req);
+    if (!cap.ok) {
+      await logDenied(req.auth?.userId, 'POST /tournaments createRiot', cap.reason);
+      return res.status(cap.status).json({ error: cap.error });
+    }
+    if (await monthlyRiotQuotaExceeded(req.auth.userId)) {
+      await logDenied(req.auth?.userId, 'POST /tournaments createRiot', 'monthly_quota');
+      return res.status(429).json({ error: `Límite de ${RIOT_MAX_TOURNAMENTS_PER_MONTH} torneos Riot por mes alcanzado. Contacta a soporte si necesitas más.` });
+    }
     try {
       const providerId = await getOrCreateProviderId();
       const rt = await createTournament(providerId, name);
@@ -930,6 +1021,7 @@ router.post('/', requireAuth, async (req: any, res) => {
       [id,name,'registration',0,newT.maxParticipants,newT.prize,startDate,newT.format,
        newT.description,riotTournamentId??null,JSON.stringify(initialCodes),req.auth.userId]
     );
+    if (initialCodes.length) await bumpCodesGenerated(id, initialCodes.length);
     res.json({ success:true, tournament:serialize(newT) });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
@@ -943,8 +1035,21 @@ router.post('/tournament-callback', async (req, res) => {
   // a ?key= that only we know. Without this, anyone could POST a forged result and
   // advance a bracket. If the secret isn't configured we allow it (back-compat) but warn.
   const secret = process.env.TOURNAMENT_CALLBACK_SECRET;
+  const validKey = !secret || (req.query as any).key === secret;
+
+  // Sprint 0: persistir TODO callback (válidos e inválidos — los inválidos son
+  // intentos de abuso que queremos ver). Solo escritura; el polling sigue siendo
+  // la fuente de verdad para resultados.
+  try {
+    await pool.query(
+      'INSERT INTO callback_log (code, valid_key, payload) VALUES (?,?,?)',
+      [String(req.body?.shortCode ?? '').slice(0, 100) || null, validKey ? 1 : 0,
+       JSON.stringify(req.body ?? {}).slice(0, 60000)]
+    );
+  } catch (e: any) { console.warn('[callback-log]', e.message); }
+
   if (secret) {
-    if ((req.query as any).key !== secret) {
+    if (!validKey) {
       console.warn('[Callback] rechazado: key inválida o ausente');
       return res.status(403).send('Forbidden');
     }
@@ -2272,15 +2377,33 @@ router.post('/:id/generate-codes', requireAuth, async (req: any, res) => {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error:'Torneo no encontrado' });
     if (!isOwner(req, t)) return res.status(403).json({ error:'Solo el creador puede hacer esto' });
+
+    // Gate (b) + cuotas anti-abuso (Sprint 0)
+    const cap = await riotCapability(req);
+    if (!cap.ok) {
+      await logDenied(req.auth?.userId, 'POST /generate-codes', cap.reason);
+      return res.status(cap.status).json({ error: cap.error });
+    }
+    const n = Math.max(1, Math.min(Number(count) || 10, 100));
+    if (await codesQuotaExceeded(t.id, n)) {
+      await logDenied(req.auth?.userId, 'POST /generate-codes', 'codes_quota');
+      return res.status(429).json({ error: `Límite de ${RIOT_MAX_CODES_PER_TOURNAMENT} códigos por torneo alcanzado.` });
+    }
+    if (!t.riotTournamentId && await monthlyRiotQuotaExceeded(req.auth.userId)) {
+      await logDenied(req.auth?.userId, 'POST /generate-codes', 'monthly_quota');
+      return res.status(429).json({ error: `Límite de ${RIOT_MAX_TOURNAMENTS_PER_MONTH} torneos Riot por mes alcanzado.` });
+    }
+
     const providerId = await getOrCreateProviderId();
     let riotTournamentId = t.riotTournamentId;
     if (!riotTournamentId) {
       const rt = await createTournament(providerId, t.name);
       riotTournamentId = rt.id; t.riotTournamentId = riotTournamentId;
     }
-    const newCodes = await generateCodes(riotTournamentId!, count);
+    const newCodes = await generateCodes(riotTournamentId!, n);
     t.codePool = [...t.codePool, ...newCodes];
     await saveT(t);
+    await bumpCodesGenerated(t.id, newCodes.length);
     res.json({ success:true, generated:newCodes.length, poolSize:t.codePool.length });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
