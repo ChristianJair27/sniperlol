@@ -208,12 +208,15 @@ export async function getSummonerByName(platform: Platform | string, name: strin
 }
 
 // ===== Spectator-V5 (PLATFORM) =====
-export async function getLiveGame(platform: Platform | string, summonerId: string) {
+// OJO v5: el path se llama "by-summoner" pero el identificador es el PUUID
+// (Riot conservó el nombre del path de v4). Pasarle el summonerId de v4 da 404
+// SIEMPRE — ese era el bug que tenía muerto el modo espectador con key de prod.
+export async function getLiveGame(platform: Platform | string, puuid: string) {
   const key = normalizePlatform(platform as string);
   const base = PLATFORM_HOST[key];
   if (!base) return null;
 
-  const url = `${base}/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(summonerId)}`;
+  const url = `${base}/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
   try {
     const { data } = await riot.get(url);
     return data as any;
@@ -228,7 +231,9 @@ export async function getLiveGameByPuuid(platform: Platform | string, puuid: str
   const base = PLATFORM_HOST[key];
   if (!base) return null;
 
-  const url = `${base}/lol/spectator/v5/active-games/by-puuid/${encodeURIComponent(puuid)}`;
+  // "by-puuid" NO existe en Spectator-V5 (Riot responde 403 a rutas
+  // desconocidas). El endpoint correcto es by-summoner/{puuid}.
+  const url = `${base}/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
   try {
     const { data } = await riot.get(url);
     return data as any;

@@ -67,7 +67,8 @@ r.get('/by-puuid/:platform/:puuid', async (req, res, next) => {
 
     const liveCk = `live:${platform}:${sid}`;
     let data = cGet(liveCk);
-    if (!data) { data = await getLiveGame(platform as any, sid); cSet(liveCk, data, 60_000); }
+    // v5: el identificador es el PUUID (summoner.id daba 404 siempre).
+    if (!data) { data = await getLiveGame(platform as any, puuid); cSet(liveCk, data, 60_000); }
     if (!data) return res.status(404).json({ ok: false, inGame: false });
     res.json({ ok: true, inGame: true, summonerId: sid, data: enrichGame(data) });
   } catch (e) { next(e); }

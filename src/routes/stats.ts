@@ -328,6 +328,10 @@ r.get("/matches/:regional/:matchId", async (req, res) => {
       championLevel: me.champLevel,
       gold: me.goldEarned,
       totalDamageDealtToChampions: me.totalDamageDealtToChampions,
+      // Visión para la share card del perfil (aditivo; las respuestas cacheadas
+      // viejas no lo traen y el frontend lo tolera como undefined).
+      wardsPlaced: me.wardsPlaced,
+      visionScore: me.visionScore,
 
       items,
       trinket,
@@ -364,6 +368,10 @@ r.get("/matches/:regional/:matchId", async (req, res) => {
 /**
  * GET /api/stats/spectator/:platform/:puuid
  */
+
+// Caché del enriquecimiento por jugador del espectador (rank + maestría):
+// el frontend re-consulta cada 30s y estos datos no cambian durante la partida.
+const spectatorEnrichCache = new Map<string, { at: number; rank: any; mastery: any }>();
 
 r.get("/spectator/:platform/:puuid", async (req, res) => {
   try {
@@ -413,13 +421,19 @@ r.get("/spectator/:platform/:puuid", async (req, res) => {
     }
 
     let g: any = null;
+    // Si TODAS las respuestas de spectator son 403, el problema no es "no está
+    // jugando": es que la key de Riot no tiene Spectator-V5 en su scope. Antes
+    // eso terminaba en un 404 engañoso ("no active game").
+    let sawForbidden = false;
 
     if (summoner?.id) {
-      // Preferred path: we have a summoner id on a known platform
+      // Preferred path: platform confirmada por el lookup del summoner.
+      // v5 exige el PUUID (no summoner.id — eso daba 404 siempre).
       try {
-        g = await getLiveGame(usedPlatform as any, summoner.id);
+        g = await getLiveGame(usedPlatform as any, puuid);
       } catch (e: any) {
         const st = e?.response?.status;
+        if (st === 403) sawForbidden = true;
         if (st === 404 || st === 403) {
           // continue to fallback below
         } else {
@@ -435,19 +449,21 @@ r.get("/spectator/:platform/:puuid", async (req, res) => {
 
       for (const pf of tryPlatforms) {
         try {
-          const directUrl = `https://${pf}.api.riotgames.com/lol/spectator/v5/active-games/by-puuid/${encodeURIComponent(puuid)}`;
+          // v5: el path correcto es by-summoner/{PUUID} ("by-puuid" no existe y Riot da 403).
+          const directUrl = `https://${pf}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
           const directRes = await riotGet(directUrl, { headers: { "X-Riot-Token": RIOT_KEY } });
           const directData = directRes?.data;
 
           if (directData && Array.isArray(directData.participants) && directData.participants.length > 0) {
             g = directData;
             usedPlatform = pf;
-            console.log(`[spectator] SUCCESS via direct by-puuid fallback on platform ${pf}`);
+            console.log(`[spectator] SUCCESS via direct by-summoner(puuid) fallback on platform ${pf}`);
             break;
           }
         } catch (e: any) {
           const st = e?.response?.status;
-          if (st === 404 || st === 403) {
+          if (st === 403) { sawForbidden = true; continue; }
+          if (st === 404) {
             continue; // expected, player not on this platform
           }
           // Network errors (DNS ENOTFOUND, connection refused, etc.) have no response.status.
@@ -461,10 +477,17 @@ r.get("/spectator/:platform/:puuid", async (req, res) => {
     }
 
     if (!g) {
-      return res.status(404).json({ 
+      if (sawForbidden) {
+        console.warn('[spectator] Riot devolvió 403 en Spectator-V5: la API key no tiene este endpoint en su scope. Solicitar acceso en el Developer Portal.');
+        return res.status(403).json({
+          error: "spectator_forbidden",
+          message: "La API key no tiene acceso a Spectator-V5 (solicitar el endpoint a Riot en el Developer Portal).",
+        });
+      }
+      return res.status(404).json({
         error: "No active game found after full probing (summoner lookup + direct by-puuid fallback)",
         triedPlatforms: tryPlatforms,
-        puuid 
+        puuid
       });
     }
 
@@ -473,11 +496,17 @@ r.get("/spectator/:platform/:puuid", async (req, res) => {
 const participants = (g.participants || []).map((p: any) => {
   // spectator-v5 trae spell1Id, spell2Id y perks con perkIds, perkStyle, perkSubStyle
   const perkIds: number[] = p?.perks?.perkIds || [];
-  // keystone suele venir como el primer perk de la rama primaria
+  // keystone suele viene como el primer perk de la rama primaria
   const keystone = perkIds[0];
+  // v5 entrega el nombre como un solo campo "riotId" = "Nombre#TAG"
+  // (riotIdGameName era v4 — por eso todos salían como "Invocador").
+  const riotId: string = p.riotId || '';
+  const riotName = riotId.includes('#') ? riotId.slice(0, riotId.indexOf('#')) : riotId;
 
   return {
-    summonerName: p.riotIdGameName || p.summonerName || "Invocador",
+    summonerName: riotName || p.riotIdGameName || p.summonerName || "Invocador",
+    riotId: riotId || null,
+    profileIconId: p.profileIconId ?? null,
     championId: p.championId,
     teamId: p.teamId,
     puuid: p.puuid,
@@ -491,35 +520,68 @@ const participants = (g.participants || []).map((p: any) => {
       subStyle: p?.perks?.perkSubStyle,
     },
 
-    // placeholder rank; lo completamos abajo si ?rank=1
-    rank: null as null | { tier: string; rank: string; lp: number },
+    // placeholders; los completamos abajo si ?rank=1
+    rank: null as null | { tier: string; rank: string; lp: number; wins?: number; losses?: number; winRate?: number | null; hotStreak?: boolean },
+    mastery: null as null | { points: number; level: number },
   };
 });
 
 if (String(req.query.rank) === "1") {
-  // Trae rank para cada summonerId (máximo 10 → OK con rate limits suaves)
+  // Enriquecimiento por jugador (máximo 10, en paralelo, cacheado 10 min):
+  //  - league-v4: tier/división/LP + wins/losses (→ WR temporada) + hotStreak
+  //  - champion-mastery-v4: puntos/nivel con EL campeón que está jugando
+  //    (→ etiquetas "Main", "Primera vez", etc. en el espectador)
   const axiosOpts = { headers: { "X-Riot-Token": RIOT_KEY } };
   await Promise.allSettled(
     participants.map(async (pp: any, i: number) => {
       try {
-        const sum = await riotGet<{ id: string }>(
-          `https://${usedPlatform}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/${encodeURIComponent(pp.puuid || "")}`,
-          axiosOpts
-        );
-        if (!sum?.data?.id) return;
-
-        const le = await riotGet<any[]>(
-          `https://${usedPlatform}.api.riotgames.com/lol/league/v4/entries/by-summoner/${sum.data.id}`,
-          axiosOpts
-        );
-        const best = (le.data || []).find((x: any) => x.queueType === "RANKED_SOLO_5x5") || (le.data || [])[0];
-        if (best) {
-          participants[i].rank = {
-            tier: best.tier,
-            rank: best.rank,
-            lp: best.leaguePoints,
-          };
+        const cacheKey = `enrich:${usedPlatform}:${pp.puuid}:${pp.championId}`;
+        const hit = spectatorEnrichCache.get(cacheKey);
+        if (hit && Date.now() - hit.at < 10 * 60_000) {
+          participants[i].rank = hit.rank;
+          participants[i].mastery = hit.mastery;
+          return;
         }
+
+        // league-v4 by-puuid directo: summoner-v4 ya NO devuelve `id` (Riot
+        // retiró los summonerIds), así que la cadena vieja por by-summoner
+        // moría en silencio y todos salían "unranked".
+        let rank: any = null;
+        try {
+          const le = await riotGet<any[]>(
+            `https://${usedPlatform}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(pp.puuid || "")}`,
+            axiosOpts
+          );
+          const best = (le.data || []).find((x: any) => x.queueType === "RANKED_SOLO_5x5") || (le.data || [])[0];
+          if (best) {
+            const wins = best.wins ?? 0, losses = best.losses ?? 0;
+            rank = {
+              tier: best.tier,
+              rank: best.rank,
+              lp: best.leaguePoints,
+              wins, losses,
+              winRate: wins + losses > 0 ? Math.round((wins / (wins + losses)) * 100) : null,
+              hotStreak: !!best.hotStreak,
+            };
+          }
+        } catch { /* unranked o error puntual → sin chip de elo */ }
+
+        let mastery: any = null;
+        try {
+          const m = await riotGet<any>(
+            `https://${usedPlatform}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/${encodeURIComponent(pp.puuid || "")}/by-champion/${pp.championId}`,
+            axiosOpts
+          );
+          if (m?.data) mastery = { points: m.data.championPoints ?? 0, level: m.data.championLevel ?? 0 };
+        } catch (e: any) {
+          // 404 = nunca ha jugado este campeón → dato útil, no error
+          if (e?.response?.status === 404) mastery = { points: 0, level: 0 };
+        }
+
+        participants[i].rank = rank;
+        participants[i].mastery = mastery;
+        if (spectatorEnrichCache.size > 500) spectatorEnrichCache.clear();
+        spectatorEnrichCache.set(cacheKey, { at: Date.now(), rank, mastery });
       } catch {}
     })
   );
@@ -1051,6 +1113,75 @@ r.get("/match-timeline/:regional/:matchId", async (req, res) => {
     });
   } catch (e:any) {
     return res.status(e?.response?.status || 500).json({
+      message: e?.message || "match-timeline failed",
+    });
+  }
+});
+
+/**
+ * GET /api/stats/match-replay/:regional/:matchId
+ * Payload compacto para el visor de repetición 2D (minimapa broadcast):
+ * posiciones por jugador en cada frame (1/min), kills con coordenadas y
+ * objetivos (torres/dragones/barón/heraldo). 100% Match-V5 Timeline oficial.
+ * Los datos de una partida terminada son inmutables → caché larga en memoria.
+ */
+const replayCache = new Map<string, any>();
+r.get("/match-replay/:regional/:matchId", async (req, res) => {
+  try {
+    const { regional, matchId } = req.params as { regional: string; matchId: string };
+    if (!RIOT_KEY) return res.status(500).json({ message: "RIOT_API_KEY missing" });
+
+    const ck = `${regional}:${matchId}`;
+    if (replayCache.has(ck)) return res.json(replayCache.get(ck));
+
+    const headers = { "X-Riot-Token": RIOT_KEY };
+    const { data: tl } = await riotGet<any>(
+      `https://${regional}.api.riotgames.com/lol/match/v5/matches/${matchId}/timeline`,
+      { headers }
+    );
+
+    const rawFrames = tl?.info?.frames ?? [];
+    // participantId (1-10) → puuid; el frontend cruza con el match para champion/team.
+    const participants = (tl?.info?.participants ?? []).map((p: any) => ({
+      participantId: p.participantId,
+      puuid: p.puuid,
+    }));
+
+    const frames = rawFrames.map((f: any) => ({
+      t: Math.round((f.timestamp ?? 0) / 1000),
+      p: Object.fromEntries(
+        Object.entries<any>(f.participantFrames || {}).map(([pid, pf]) => [pid, {
+          x: pf?.position?.x ?? null,
+          y: pf?.position?.y ?? null,
+          g: pf?.totalGold ?? 0,
+          l: pf?.level ?? 1,
+        }])
+      ),
+    }));
+
+    const events: any[] = [];
+    for (const f of rawFrames) {
+      for (const ev of (f.events || [])) {
+        const t = Math.round((ev.timestamp ?? 0) / 1000);
+        if (ev.type === "CHAMPION_KILL") {
+          events.push({ t, type: "kill", x: ev.position?.x, y: ev.position?.y, k: ev.killerId ?? 0, v: ev.victimId ?? 0 });
+        } else if (ev.type === "BUILDING_KILL") {
+          events.push({ t, type: ev.buildingType === "INHIBITOR_BUILDING" ? "inhib" : "tower", x: ev.position?.x, y: ev.position?.y, teamId: ev.teamId });
+        } else if (ev.type === "ELITE_MONSTER_KILL") {
+          const mt = String(ev.monsterType || "");
+          const type = mt.includes("DRAGON") ? "dragon" : mt.includes("BARON") ? "baron" : mt.includes("HERALD") ? "herald" : mt.includes("HORDE") ? "grubs" : "monster";
+          events.push({ t, type, x: ev.position?.x, y: ev.position?.y, k: ev.killerId ?? 0 });
+        }
+      }
+    }
+
+    const out = { matchId, participants, frames, events };
+    // Cap sencillo para no crecer sin límite (una repetición pesa ~50-150KB).
+    if (replayCache.size > 300) replayCache.clear();
+    replayCache.set(ck, out);
+    return res.json(out);
+  } catch (e: any) {
+    return res.status(e?.response?.status || 500).json({
       message: e?.response?.data?.status?.message || e?.message || "timeline failed",
     });
   }
@@ -1095,15 +1226,17 @@ r.get("/live/:platform/:puuid", async (req, res) => {
     let game: any = null;
 
     if (summoner?.id) {
-      game = await getLiveGame(usedPlatform as any, summoner.id);
+      // v5 exige el PUUID (summoner.id de v4 daba 404 siempre).
+      game = await getLiveGame(usedPlatform as any, puuid);
     }
 
     if (!game) {
-      // Fallback for /live route too (direct by-puuid)
-      console.log(`[/live] No summoner or no game via by-summoner. Trying direct by-puuid fallback...`);
+      // Fallback for /live route too (direct, plataforma por plataforma)
+      console.log(`[/live] No summoner or no game via primary. Trying direct by-summoner(puuid) fallback...`);
       for (const pf of tryPlatforms) {
         try {
-          const directUrl = `https://${pf}.api.riotgames.com/lol/spectator/v5/active-games/by-puuid/${encodeURIComponent(puuid)}`;
+          // v5: by-summoner/{PUUID} — "by-puuid" no existe (Riot da 403).
+          const directUrl = `https://${pf}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
           const directRes = await riotGet(directUrl, { headers: { "X-Riot-Token": RIOT_KEY } });
           if (directRes?.data?.participants?.length > 0) {
             game = directRes.data;
