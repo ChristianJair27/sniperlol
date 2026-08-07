@@ -11,7 +11,17 @@
 import { Router } from 'express';
 import { pool } from '../db.js';
 import { getT } from './tournaments.routes.js';
-import { sendTournamentInvitationEmail, isDeliverableEmail } from '../services/mail.service.js';
+import { sendTournamentInvitationEmail, isDeliverableEmail, fixCommonEmailTypos } from '../services/mail.service.js';
+
+// Normaliza + auto-corrige typos inequívocos de dominio (.con→.com, gmial→gmail...).
+// El registro llega por webhook: el jugador ya no está enfrente para corregirlo,
+// así que se corrige aquí ANTES de guardar/invitar y se deja rastro en logs.
+const cleanEmail = (raw?: string): string | undefined => {
+  if (!raw) return undefined;
+  const { email, fixed, original } = fixCommonEmailTypos(raw);
+  if (fixed) console.warn(`[lqc] email con typo auto-corregido: "${original}" → "${email}"`);
+  return email;
+};
 
 const router = Router();
 
@@ -103,7 +113,7 @@ router.post('/lqc/register', async (req, res) => {
     riotId: gamertag,
     realName: nombre || undefined,
     phone: pick('celular', 'phone', 'telefono') || undefined,
-    email: pick('correo', 'correo_electronico', 'email') || undefined,
+    email: cleanEmail(pick('correo', 'correo_electronico', 'email')),
     birthDate: pick('fecha_nacimiento', 'fechaNacimiento', 'birth_date') || undefined,
     schooling: pick('escolaridad', 'schooling') || undefined,
     municipality: pick('municipio', 'municipality') || undefined,
@@ -111,7 +121,7 @@ router.post('/lqc/register', async (req, res) => {
     gender: pick('genero', 'género', 'gender') || undefined,
     source: 'lqc-form',
     // La UI de ATAK.GG muestra "PENDIENTE" hasta que el jugador acepte desde su cuenta
-    inviteEmail: pick('correo', 'correo_electronico', 'email') || undefined,
+    inviteEmail: cleanEmail(pick('correo', 'correo_electronico', 'email')),
     inviteStatus: 'pending' as const,
   };
   const captainName  = pick('capitan', 'capitan_nombre', 'nombre_capitan', 'captainName', 'captain_name');
@@ -283,14 +293,14 @@ async function buildPlayerFrom(rec: any) {
     riotId: gamertag || undefined,
     realName: pickFrom(rec, 'nombre', 'name', 'full_name') || undefined,
     phone: pickFrom(rec, 'celular', 'phone', 'telefono') || undefined,
-    email: pickFrom(rec, 'correo', 'correo_electronico', 'email') || undefined,
+    email: cleanEmail(pickFrom(rec, 'correo', 'correo_electronico', 'email')),
     birthDate: pickFrom(rec, 'fecha_nacimiento', 'fechaNacimiento', 'birth_date') || undefined,
     schooling: pickFrom(rec, 'escolaridad', 'schooling') || undefined,
     municipality: pickFrom(rec, 'municipio', 'municipality') || undefined,
     locality: pickFrom(rec, 'localidad', 'locality') || undefined,
     gender: pickFrom(rec, 'genero', 'género', 'gender') || undefined,
     source: 'lqc-form',
-    inviteEmail: pickFrom(rec, 'correo', 'correo_electronico', 'email') || undefined,
+    inviteEmail: cleanEmail(pickFrom(rec, 'correo', 'correo_electronico', 'email')),
     inviteStatus: 'pending' as const,
   };
   const rol = pickFrom(rec, 'rol', 'role', 'tipo');

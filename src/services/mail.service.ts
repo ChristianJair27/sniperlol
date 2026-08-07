@@ -18,6 +18,49 @@ export function isDeliverableEmail(email: string): boolean {
   return true;
 }
 
+// ── Corrección de typos frecuentes de dominio ────────────────────────────────
+// Los registros de la LQC llegan por webhook (el jugador ya no está enfrente
+// para corregir), así que los typos INEQUÍVOCOS se auto-corrigen y se deja
+// rastro en logs. Caso real: "aramperez9@icloud.con" rebotó la invitación.
+// Regla: solo TLDs que NO existen (.con, .cmo...) o dominios de proveedores
+// conocidos mal escritos. NUNCA tocar TLDs reales genéricos (.co es Colombia,
+// .cm es Camerún) salvo cuando van pegados a un proveedor conocido (gmail.co).
+const TLD_TYPOS: Record<string, string> = {
+  '.con': '.com', '.cmo': '.com', '.ocm': '.com', '.vom': '.com',
+  '.xom': '.com', '.comm': '.com', '.coom': '.com', '.comn': '.com',
+};
+const DOMAIN_TYPOS: Record<string, string> = {
+  'gmial.com': 'gmail.com', 'gamil.com': 'gmail.com', 'gmal.com': 'gmail.com',
+  'gnail.com': 'gmail.com', 'gmaill.com': 'gmail.com', 'gmail.co': 'gmail.com',
+  'gmail.cm': 'gmail.com',
+  'hotmial.com': 'hotmail.com', 'hotmali.com': 'hotmail.com', 'hotmil.com': 'hotmail.com',
+  'hotmai.com': 'hotmail.com', 'hormail.com': 'hotmail.com', 'hotmail.co': 'hotmail.com',
+  'outlok.com': 'outlook.com', 'outloook.com': 'outlook.com', 'oulook.com': 'outlook.com',
+  'outlook.co': 'outlook.com',
+  'iclod.com': 'icloud.com', 'icluod.com': 'icloud.com', 'icloud.co': 'icloud.com',
+  'yaho.com': 'yahoo.com', 'yahho.com': 'yahoo.com', 'yahoo.co': 'yahoo.com',
+  'live.co': 'live.com',
+};
+
+/**
+ * Corrige typos inequívocos de dominio. Devuelve el email normalizado
+ * (trim + lowercase), si hubo corrección, y el original cuando la hubo.
+ */
+export function fixCommonEmailTypos(raw: string): { email: string; fixed: boolean; original?: string } {
+  const email = (raw || '').trim().toLowerCase();
+  const at = email.lastIndexOf('@');
+  if (at < 1 || at === email.length - 1) return { email, fixed: false };
+  const local = email.slice(0, at);
+  let domain = email.slice(at + 1);
+  const before = domain;
+  for (const [bad, good] of Object.entries(TLD_TYPOS)) {
+    if (domain.endsWith(bad)) { domain = domain.slice(0, -bad.length) + good; break; }
+  }
+  if (DOMAIN_TYPOS[domain]) domain = DOMAIN_TYPOS[domain];
+  const fixed = domain !== before;
+  return { email: `${local}@${domain}`, fixed, original: fixed ? raw.trim() : undefined };
+}
+
 let transporter: Transporter | null = null;
 
 async function ensureTransporter(): Promise<Transporter> {
