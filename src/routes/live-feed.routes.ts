@@ -69,6 +69,11 @@ function sanitizeSnapshot(body: any) {
     matchLabel: str(body?.matchLabel, 120),
     streamUrl: str(body?.streamUrl, 300),
     tournamentId: str(body?.tournamentId, 64),
+    // Para el overlay de caster: nombres y logos de los equipos
+    team1: str(body?.team1, 40),
+    team2: str(body?.team2, 40),
+    logo1: str(body?.logo1, 300),
+    logo2: str(body?.logo2, 300),
     players: Array.isArray(body?.players) ? body.players.slice(0, 10).map(sanitizePlayer) : [],
     events: Array.isArray(body?.events) ? body.events.slice(-80).map(sanitizeEvent) : [],
   };

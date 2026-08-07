@@ -37,6 +37,11 @@ const SOURCE = args.source || 'https://127.0.0.1:2999/liveclientdata/allgamedata
 const INTERVAL = Math.max(1000, Number(args.interval) || 2000);
 const LABEL = args.label || '';
 const STREAM = args.stream || '';
+// Para el overlay de caster (/broadcast/<canal>/overlay en OBS)
+const TEAM1 = args.team1 || '';
+const TEAM2 = args.team2 || '';
+const LOGO1 = args.logo1 || '';
+const LOGO2 = args.logo2 || '';
 
 if (!CHANNEL || !/^[a-z0-9_-]{2,64}$/.test(CHANNEL) || !TOKEN) {
   console.error('Uso: node atak-companion.mjs --channel <canal> --token <LIVE_FEED_TOKEN> [--backend <url>] [--label "..."] [--stream <m3u8>]');
@@ -113,6 +118,10 @@ function buildSnapshot(d) {
     mapName: d.gameData?.mapName ?? '',
     matchLabel: LABEL,
     streamUrl: STREAM,
+    team1: TEAM1,
+    team2: TEAM2,
+    logo1: LOGO1,
+    logo2: LOGO2,
     players,
     events,
   };

@@ -78,7 +78,24 @@ node atak-companion.mjs --channel test --token TU_TOKEN --backend http://localho
 | `--label "<texto>"` | Título visible del match |
 | `--stream <m3u8>` | URL HLS si también transmites video |
 | `--interval <ms>` | Frecuencia de envío (default 2000) |
+| `--team1 / --team2 <nombre>` | Nombres de equipos para el overlay de caster |
+| `--logo1 / --logo2 <url>` | Logos de equipos para el overlay |
 | `--source <url>` | (debug) URL alternativa del Live Client Data |
+
+## Overlay de caster para OBS (branding LQC)
+
+Además de la página pública `/broadcast/<canal>`, existe el overlay transparente
+estilo LCK para poner ENCIMA de la captura del juego en OBS:
+
+1. En OBS: **Fuente → Navegador**, URL
+   `https://atakgg.revolution505.com/broadcast/<canal>/overlay`, 1920x1080.
+2. Muestra: barra superior con equipos/kills/torres (colores y logo LQC),
+   dragones tomados por tipo, reloj, **timers reales de Dragón/Heraldo/Barón**
+   (calculados de los eventos: cada toma reinicia su respawn) y scoreboard
+   inferior con items/KDA/CS/niveles/muertes.
+3. Los nombres/logos de equipos salen de `--team1/--team2/--logo1/--logo2`
+   (o se parsean del `--label "X vs Y"`).
+4. Vista previa sin OBS: agrega `?bg=1` a la URL (pinta un fondo de prueba).
 
 ## Límites honestos
 
