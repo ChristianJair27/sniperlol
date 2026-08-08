@@ -189,14 +189,31 @@ router.post('/lqc/register', async (req, res) => {
     // Equipo existente — upsert del jugador por gamertag (idempotente)
     const players: any[] = typeof reg.players === 'string' ? JSON.parse(reg.players) : (reg.players ?? []);
     const idx = players.findIndex(p => (p.riotId || p.name || '').toLowerCase() === gamertag.toLowerCase());
-    if (idx >= 0) players[idx] = { ...players[idx], ...player };
-    else {
+    let emailChanged = false;
+    if (idx >= 0) {
+      const prev = players[idx];
+      const prevEmail = String(prev.inviteEmail || prev.email || '').toLowerCase();
+      players[idx] = { ...prev, ...player };
+      // Un update NO degrada una invitación ya aceptada a 'pending'.
+      if (prev.inviteStatus === 'accepted') players[idx].inviteStatus = 'accepted';
+      // Correo corregido (p.ej. typo .con→.com arreglado en el admin de la LQC):
+      // re-enviar la invitación automáticamente si sigue pendiente. Sin esto,
+      // la corrección sincronizaba el dato pero el jugador nunca recibía nada.
+      const newEmail = String(player.inviteEmail || '').toLowerCase();
+      emailChanged = Boolean(newEmail) && newEmail !== prevEmail;
+    } else {
       if (players.length >= 7) return bad(res, 409, `Equipo ${teamName} ya tiene 7 jugadores (5 titulares + 2 suplentes)`);
       players.push(player);
     }
     await pool.query('UPDATE tournament_registrations SET players=? WHERE id=?', [JSON.stringify(players), reg.id]);
-    if (idx < 0) inviteByEmail(t); // solo al agregarse, no en cada update
-    return res.json({ ok: true, action: idx >= 0 ? 'player_updated' : 'player_added', team: teamName, player: gamertag, teamSize: players.length });
+    if (idx < 0) inviteByEmail(t); // alta nueva → invitación
+    else if (emailChanged && players[idx].inviteStatus === 'pending') inviteByEmail(t); // correo corregido → re-invitación
+    return res.json({
+      ok: true,
+      action: idx >= 0 ? 'player_updated' : 'player_added',
+      team: teamName, player: gamertag, teamSize: players.length,
+      ...(idx >= 0 ? { emailChanged, invitationResent: emailChanged && players[idx].inviteStatus === 'pending' } : {}),
+    });
   } catch (err: any) {
     console.error('[lqc/register]', err.message);
     return bad(res, 500, err.message);
