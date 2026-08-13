@@ -31,6 +31,9 @@ type TournamentData = {
   bannerUrl?: string;
   bracketType?: string;
   seriesTo?: number;
+  finalSeriesTo?: number;
+  /** Suizo: rondas planeadas → habilita avance automático + cierre. */
+  swissRounds?: number;
 };
 
 function parseJson(v: unknown) {
@@ -69,6 +72,8 @@ async function getT(id: string): Promise<TournamentData | null> {
     bannerUrl: row.banner_url || undefined,
     bracketType: row.bracket_type || 'single_elim',
     seriesTo: Number(row.series_to) || 1,
+    finalSeriesTo: Number(row.final_series_to) || Number(row.series_to) || 1,
+    swissRounds: row.swiss_rounds ? Number(row.swiss_rounds) : undefined,
   };
 }
 
@@ -537,6 +542,54 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
       detail.error = e.message;
     }
     details.push(detail);
+  }
+
+  // ── Avance automático suizo (opt-in: solo si el organizador fijó rondas) ──
+  // Al completarse todos los partidos de la ronda vigente: genera la siguiente
+  // con códigos, o cierra el torneo si era la última planeada. El organizador
+  // conserva el control manual (next-round / complete) en todo momento.
+  if (t.bracketType === 'swiss' && t.phase === 'active' && t.swissRounds && t.bracket.length) {
+    try {
+      const maxRound = Math.max(...t.bracket.map(m => m.round));
+      const roundDone = t.bracket
+        .filter(m => m.round === maxRound)
+        .every(m => m.matchStatus === 'complete');
+
+      if (roundDone) {
+        if (maxRound >= t.swissRounds) {
+          t.phase = 'complete';
+          changed = true;
+          console.log(
+            `[tournament-sync] ${t.id}: ronda final ${maxRound}/${t.swissRounds} completa → torneo cerrado. ` +
+            `Campeón: ${t.standings?.[0]?.team ?? '—'}`
+          );
+        } else {
+          // Import dinámico: evita el ciclo routes ↔ service en el top-level.
+          const routes = await import('../routes/tournaments.routes.js');
+          const newMatches = routes.pairSwissRound(t as any, maxRound + 1);
+          if (newMatches.length) {
+            t.bracket = [...t.bracket, ...(newMatches as any)];
+            for (let i = 0; i < t.bracket.length; i++) {
+              const m = t.bracket[i];
+              if (m.round === maxRound + 1 && m.matchStatus === 'ready' && !m.code) {
+                try {
+                  await routes.assignCodeToMatch(t as any, i);
+                } catch (e: any) {
+                  console.error(`[tournament-sync] código para ${m.id} falló:`, e.message);
+                }
+              }
+            }
+            changed = true;
+            console.log(
+              `[tournament-sync] ${t.id}: ronda ${maxRound} completa → ronda ${maxRound + 1} generada ` +
+              `(${newMatches.length} partidos, auto)`
+            );
+          }
+        }
+      }
+    } catch (e: any) {
+      console.error(`[tournament-sync] auto-advance ${t.id} falló:`, e.message);
+    }
   }
 
   if (changed) await saveT(t);

@@ -92,6 +92,10 @@ interface TournamentData {
   rulesUrl?: string;
   // Override para la final (p.ej. Bo3 todo el torneo y final Bo5 → finalSeriesTo=3).
   finalSeriesTo?: number;
+  // Suizo: nº de rondas planeadas. Si está definido, el sync avanza de ronda
+  // solo y cierra el torneo al terminar la última; la última ronda usa
+  // finalSeriesTo. undefined = manual (botón "Siguiente ronda").
+  swissRounds?: number;
 }
 
 // ─── DB init ──────────────────────────────────────────────────────────────────
@@ -188,6 +192,9 @@ async function initTables() {
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS registration_url VARCHAR(500)`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rules_url VARCHAR(500)`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS final_series_to INT DEFAULT 1`,
+    // Suizo: nº de rondas planeadas → habilita avance automático de ronda.
+    // NULL = manual (comportamiento clásico con el botón "Siguiente ronda").
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS swiss_rounds INT DEFAULT NULL`,
     // Series Bo3/Bo5: una fila de stats POR JUEGO (antes: una por enfrentamiento)
     `ALTER TABLE tournament_match_stats DROP INDEX unique_bracket_match`,
     `ALTER TABLE tournament_match_stats ADD UNIQUE KEY unique_bracket_game (tournament_id, bracket_match_id, game_id)`,
@@ -293,6 +300,7 @@ function rowToTournament(row: any): TournamentData {
     bracketType: (row.bracket_type as any) || 'single_elim',
     seriesTo:      Number(row.series_to) || 1,
     finalSeriesTo: Number(row.final_series_to) || Number(row.series_to) || 1,
+    swissRounds:   row.swiss_rounds ? Number(row.swiss_rounds) : undefined,
     registrationUrl: row.registration_url || undefined,
     rulesUrl:        row.rules_url || undefined,
   };
@@ -718,8 +726,9 @@ function generateSwissRound1(teams: string[]): BracketMatch[] {
   return matches;
 }
 
-/** Parea la siguiente ronda suiza: por récord (wins desc), sin revanchas. */
-function pairSwissRound(t: TournamentData, round: number): BracketMatch[] {
+/** Parea la siguiente ronda suiza: por récord (wins desc), sin revanchas.
+ *  Exportada: el sync en background la usa para el avance automático. */
+export function pairSwissRound(t: TournamentData, round: number): BracketMatch[] {
   const played = new Set<string>();
   for (const m of t.bracket || []) {
     if (m.team1 && m.team2) played.add([m.team1, m.team2].sort().join('|'));
@@ -753,16 +762,21 @@ function pairSwissRound(t: TournamentData, round: number): BracketMatch[] {
     while (p2.length >= 2) result.push([p2.shift()!, p2.shift()!]);
   }
 
+  // La última ronda planeada es "la final" del suizo → usa finalSeriesTo
+  // (p.ej. todo Bo3 y la ronda de cierre Bo5).
+  const isFinalRound = t.swissRounds != null && round >= t.swissRounds;
+  const roundSeriesTo = isFinalRound ? (t.finalSeriesTo || t.seriesTo || 1) : (t.seriesTo || 1);
+
   const matches: BracketMatch[] = result.map(([t1, t2], i) => ({
     id: `r${round}m${i + 1}`, round, matchNumber: i + 1,
     team1: t1, team2: t2, winner: null, code: null, matchStatus: 'ready',
-    seriesTo: t.seriesTo || 1,
+    seriesTo: roundSeriesTo,
   }));
   // BYE para el sobrante (impar)
   if (pool.length === 1 || teams.length % 2 === 1) {
     const rest = teams.filter(x => !result.some(([a, b]) => a === x || b === x));
     if (rest.length === 1) {
-      matches.push({ id: `r${round}m${matches.length + 1}`, round, matchNumber: matches.length + 1, team1: rest[0], team2: 'BYE', winner: rest[0], code: null, matchStatus: 'complete', seriesTo: t.seriesTo || 1 });
+      matches.push({ id: `r${round}m${matches.length + 1}`, round, matchNumber: matches.length + 1, team1: rest[0], team2: 'BYE', winner: rest[0], code: null, matchStatus: 'complete', seriesTo: roundSeriesTo });
     }
   }
   return matches;
@@ -863,7 +877,7 @@ async function resolveTeamPuuids(t: TournamentData, teamName: string | null): Pr
 // match, restricting it to both teams' registered players (allowlist) and
 // embedding {tId, mId} in the code metadata so the Riot callback can resolve
 // the result automatically. Mutates t.bracket[mi]; caller is responsible for saveT.
-async function assignCodeToMatch(t: TournamentData, mi: number): Promise<string | null> {
+export async function assignCodeToMatch(t: TournamentData, mi: number): Promise<string | null> {
   const match = t.bracket![mi];
   if (!match.team1 || !match.team2) return null;
 
@@ -1844,6 +1858,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         fearless: !!t.fearless,
         bracketType: t.bracketType || 'single_elim',
         seriesTo: t.seriesTo || 1, finalSeriesTo: t.finalSeriesTo || t.seriesTo || 1,
+        swissRounds: t.swissRounds ?? null,
         registrationUrl: t.registrationUrl ?? null, rulesUrl: t.rulesUrl ?? null,
       },
       bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
@@ -2464,8 +2479,17 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
       await pool.query('UPDATE tournaments SET fearless=? WHERE id=?', [fearless ? 1 : 0, t.id]);
       t.fearless = !!fearless;
     }
-    const { bracketType, seriesTo, finalSeriesTo } = req.body;
+    const { bracketType, seriesTo, finalSeriesTo, swissRounds } = req.body;
     const locked = t.phase === 'active' || t.phase === 'complete';
+    // Rondas suizas planeadas: se puede ajustar incluso con el torneo activo
+    // (es el interruptor del avance automático, no cambia partidos ya jugados).
+    if (swissRounds !== undefined) {
+      const sr = swissRounds === null ? null : Number(swissRounds);
+      if (sr !== null && (!Number.isInteger(sr) || sr < 1 || sr > 12))
+        return res.status(400).json({ error: 'swissRounds: entero 1-12 o null (manual)' });
+      await pool.query('UPDATE tournaments SET swiss_rounds=? WHERE id=?', [sr, t.id]);
+      t.swissRounds = sr ?? undefined;
+    }
     if (bracketType !== undefined) {
       if (!['single_elim', 'round_robin', 'swiss'].includes(bracketType))
         return res.status(400).json({ error: 'bracketType inválido (single_elim | round_robin | swiss)' });
