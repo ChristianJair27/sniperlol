@@ -56,6 +56,12 @@ r.get("/resolve", async (req, res) => {
       )}/${encodeURIComponent(tagLine)}`,
       { headers: { "X-Riot-Token": RIOT_KEY } }
     );
+    // Índice de autocompletado: todo invocador buscado con éxito queda
+    // registrado (fire-and-forget; nunca bloquea la respuesta).
+    upsertSeenSummoner({
+      puuid: data.puuid, gameName: data.gameName, tagLine: data.tagLine, platform: String(region),
+    }).catch(() => {});
+
     return res.json({ puuid: data.puuid, gameName: data.gameName, tagLine: data.tagLine });
   } catch (e: any) {
     console.error("RESOLVE ERR →", e?.response?.status, e?.response?.data);
@@ -101,6 +107,11 @@ r.get("/summary/:platform/:puuid", async (req, res) => {
       summoner = { name: "—", level: 0, id: "" };
       warnings.push("No se pudo obtener nombre/level del invocador.");
     }
+  }
+
+  // Índice de autocompletado: completa icono y nivel del perfil ya resuelto.
+  if (summoner.profileIconId != null) {
+    updateSeenSummonerProfile(puuid, summoner.profileIconId, summoner.level, pfUsed || platform).catch(() => {});
   }
 
   // B) league-v4 (rank) — use the by-PUUID endpoint (reliable; summonerId is deprecated/unstable).
@@ -833,6 +844,154 @@ async function initProfileCommentsTable() {
   `);
 }
 initProfileCommentsTable().catch(e => console.error('[profile-comments] init error:', e.message));
+
+// ─── Índice de invocadores vistos (autocompletado del buscador) ───────────────
+// Se alimenta solo: cada /resolve exitoso registra al jugador y cada /summary
+// completa su icono y nivel. /suggest lo consulta con prefijo tipo LoG.
+async function initSeenSummonersTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS seen_summoners (
+      puuid           VARCHAR(200) PRIMARY KEY,
+      game_name       VARCHAR(64)  NOT NULL,
+      tag_line        VARCHAR(16)  NOT NULL,
+      platform        VARCHAR(8)   NOT NULL DEFAULT 'la1',
+      profile_icon_id INT NULL,
+      level           INT NULL,
+      searches        INT NOT NULL DEFAULT 1,
+      last_seen       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_seen_name (game_name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+}
+initSeenSummonersTable().catch(e => console.error('[seen-summoners] init error:', e.message));
+
+async function upsertSeenSummoner(p: { puuid: string; gameName: string; tagLine: string; platform: string }) {
+  if (!p.puuid || !p.gameName || !p.tagLine) return;
+  await pool.query(
+    `INSERT INTO seen_summoners (puuid, game_name, tag_line, platform)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       game_name = VALUES(game_name), tag_line = VALUES(tag_line),
+       platform = VALUES(platform), searches = searches + 1, last_seen = CURRENT_TIMESTAMP`,
+    [p.puuid, p.gameName.slice(0, 64), p.tagLine.slice(0, 16), p.platform.toLowerCase().slice(0, 8)],
+  );
+}
+
+async function updateSeenSummonerProfile(puuid: string, iconId: number, level: number, platform: string) {
+  await pool.query(
+    `UPDATE seen_summoners
+     SET profile_icon_id = ?, level = ?, platform = ?
+     WHERE puuid = ?`,
+    [iconId, level || null, String(platform || '').toLowerCase().slice(0, 8), puuid],
+  );
+}
+
+/**
+ * POST /api/stats/profile-icons  { players: [{ riotId, puuid?, platform? }] }
+ * → { icons: { "nombre#tag" (lowercase): { profileIconId, level } } }
+ * Iconos de perfil para rosters (vista de equipos del torneo). Sirve del caché
+ * seen_summoners y solo va a Riot por los que faltan (secuencial, respeta 429).
+ */
+r.post("/profile-icons", async (req, res) => {
+  const list: any[] = Array.isArray(req.body?.players) ? req.body.players.slice(0, 60) : [];
+  const out: Record<string, { profileIconId: number | null; level: number | null }> = {};
+
+  for (const it of list) {
+    const riotId = String(it?.riotId || "").trim();
+    const [gameName, tagLine] = riotId.split("#");
+    if (!gameName || !tagLine) continue;
+    const key = riotId.toLowerCase();
+    if (out[key]) continue;
+
+    try {
+      // 1) caché
+      const [rows] = await pool.query<any[]>(
+        `SELECT puuid, profile_icon_id, level FROM seen_summoners
+         WHERE game_name = ? AND tag_line = ? LIMIT 1`,
+        [gameName, tagLine],
+      );
+      if (rows[0]?.profile_icon_id != null) {
+        out[key] = { profileIconId: rows[0].profile_icon_id, level: rows[0].level };
+        continue;
+      }
+
+      const platform = String(it?.platform || "la1").toLowerCase();
+
+      // 2) puuid (del payload, del caché, o resolviendo el Riot ID)
+      let puuid = String(it?.puuid || rows[0]?.puuid || "");
+      if (!puuid && RIOT_KEY) {
+        const regional = platformToRegional(platform);
+        const { data } = await riotGet<any>(
+          `https://${regional}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`,
+          { headers: { "X-Riot-Token": RIOT_KEY } },
+        );
+        puuid = data?.puuid || "";
+        if (puuid) {
+          await upsertSeenSummoner({
+            puuid, gameName: data.gameName || gameName, tagLine: data.tagLine || tagLine, platform,
+          }).catch(() => {});
+        }
+      }
+      if (!puuid) { out[key] = { profileIconId: null, level: null }; continue; }
+
+      // 3) icono por puuid
+      const s = await getSummonerByPUUID(platform, puuid).catch(() => null);
+      if (s?.profileIconId != null) {
+        await updateSeenSummonerProfile(puuid, s.profileIconId, s.summonerLevel ?? 0, platform).catch(() => {});
+        out[key] = { profileIconId: s.profileIconId, level: s.summonerLevel ?? null };
+      } else {
+        out[key] = { profileIconId: null, level: null };
+      }
+    } catch {
+      out[key] = { profileIconId: null, level: null };
+    }
+  }
+
+  return res.json({ icons: out });
+});
+
+/**
+ * GET /api/stats/suggest?q=kist
+ * Autocompletado del buscador: prefijo sobre los invocadores ya vistos.
+ * Soporta "nombre#tag" parcial. Devuelve { players: [...] }.
+ */
+r.get("/suggest", async (req, res) => {
+  const q = String(req.query.q ?? "").trim();
+  if (q.length < 2) return res.json({ players: [] });
+
+  const [namePart, tagPart] = q.split("#");
+  const esc = (s: string) => s.replace(/[\\%_]/g, (m) => "\\" + m);
+
+  try {
+    const params: any[] = [`${esc(namePart)}%`];
+    let where = "game_name LIKE ?";
+    if (tagPart) {
+      where += " AND tag_line LIKE ?";
+      params.push(`${esc(tagPart)}%`);
+    }
+    const [rows] = await pool.query<any[]>(
+      `SELECT puuid, game_name, tag_line, platform, profile_icon_id, level
+       FROM seen_summoners
+       WHERE ${where}
+       ORDER BY searches DESC, last_seen DESC
+       LIMIT 8`,
+      params,
+    );
+    return res.json({
+      players: rows.map((row) => ({
+        puuid: row.puuid,
+        gameName: row.game_name,
+        tagLine: row.tag_line,
+        platform: row.platform,
+        profileIconId: row.profile_icon_id,
+        level: row.level,
+      })),
+    });
+  } catch (e: any) {
+    console.warn("[suggest]", e?.message);
+    return res.json({ players: [] });
+  }
+});
 
 function getViewerId(req: any): number | null {
   const hdr = req.headers.authorization || '';
