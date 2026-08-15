@@ -5,13 +5,17 @@
 // (127.0.0.1:2999) y empuja snapshots aquí; el frontend los lee en /broadcast.
 //
 // Diseño:
-//  - Solo memoria (sin BD): un snapshot vivo por canal, TTL 60s. Si el
-//    companion muere, el canal simplemente expira.
+//  - Snapshot vivo por canal en MySQL, TTL 60s. Si el companion muere, el
+//    canal simplemente expira. OJO: antes era un Map en memoria — con el
+//    backend corriendo en varias instancias, el push caía en un proceso y el
+//    GET en otro → "esperando transmisión" intermitente. La BD es la única
+//    fuente de verdad compartida entre instancias.
 //  - Escritura protegida por token compartido (env LIVE_FEED_TOKEN). Sin token
 //    configurado el push queda deshabilitado (503) — seguro por defecto.
 //  - Lectura pública con CORS abierto (mismo espíritu que public-api).
 //  - Todo sanitizado con whitelist: nunca se re-publica el body tal cual.
 import { Router } from 'express';
+import { pool } from '../db.js';
 
 const router = Router();
 
@@ -19,8 +23,17 @@ const TOKEN = (process.env.LIVE_FEED_TOKEN || '').trim();
 const CHANNEL_RE = /^[a-z0-9_-]{2,64}$/i;
 const TTL_MS = 60_000;
 
-interface ChannelEntry { at: number; seq: number; snapshot: any }
-const channels = new Map<string, ChannelEntry>();
+async function initLiveFeedTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS live_feed_channels (
+      channel  VARCHAR(64) PRIMARY KEY,
+      seq      INT NOT NULL DEFAULT 1,
+      at       BIGINT NOT NULL,
+      snapshot LONGTEXT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+}
+initLiveFeedTable().catch((e) => console.error('[live-feed] init error:', e.message));
 
 const str = (v: any, max: number) => (typeof v === 'string' ? v.slice(0, max) : '');
 const num = (v: any) => (Number.isFinite(Number(v)) ? Number(v) : 0);
@@ -74,13 +87,15 @@ function sanitizeSnapshot(body: any) {
     team2: str(body?.team2, 40),
     logo1: str(body?.logo1, 300),
     logo2: str(body?.logo2, 300),
+    // Color de acento del overlay (hex #rrggbb) — personalización del caster
+    accent: /^#[0-9a-fA-F]{6}$/.test(String(body?.accent || '')) ? String(body.accent) : '',
     players: Array.isArray(body?.players) ? body.players.slice(0, 10).map(sanitizePlayer) : [],
     events: Array.isArray(body?.events) ? body.events.slice(-80).map(sanitizeEvent) : [],
   };
 }
 
 // ── POST /api/live-feed/:channel/push (companion → backend; requiere token) ──
-router.post('/:channel/push', (req, res) => {
+router.post('/:channel/push', async (req, res) => {
   if (!TOKEN) {
     return res.status(503).json({ error: 'live_feed_disabled', message: 'Configura LIVE_FEED_TOKEN en el backend para habilitar el broadcast en vivo.' });
   }
@@ -91,29 +106,38 @@ router.post('/:channel/push', (req, res) => {
   if (!CHANNEL_RE.test(channel)) return res.status(400).json({ error: 'bad_channel' });
   if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'bad_body' });
 
-  const prev = channels.get(channel);
-  const entry: ChannelEntry = {
-    at: Date.now(),
-    seq: (prev?.seq ?? 0) + 1,
-    snapshot: sanitizeSnapshot(req.body),
-  };
-  channels.set(channel, entry);
-
-  // GC de canales muertos (mantiene el Map chico sin timers)
-  if (channels.size > 50) {
-    for (const [k, v] of channels) {
-      if (Date.now() - v.at > 10 * 60_000) channels.delete(k);
+  try {
+    const snapshot = JSON.stringify(sanitizeSnapshot(req.body));
+    // Truco LAST_INSERT_ID: el seq incrementado queda en result.insertId sin
+    // necesidad de un SELECT extra ni de estado en memoria.
+    const [result] = await pool.query<any>(
+      `INSERT INTO live_feed_channels (channel, seq, at, snapshot)
+       VALUES (?, LAST_INSERT_ID(1), ?, ?)
+       ON DUPLICATE KEY UPDATE
+         seq = LAST_INSERT_ID(seq + 1), at = VALUES(at), snapshot = VALUES(snapshot)`,
+      [channel, Date.now(), snapshot]
+    );
+    // GC ocasional de canales muertos (~1 de cada 50 pushes)
+    if (Math.random() < 0.02) {
+      pool.query('DELETE FROM live_feed_channels WHERE at < ?', [Date.now() - 10 * 60_000]).catch(() => {});
     }
+    return res.json({ ok: true, seq: Number(result.insertId) || 1 });
+  } catch (e: any) {
+    console.error('[live-feed] push error:', e.message);
+    return res.status(500).json({ error: 'push_failed' });
   }
-  return res.json({ ok: true, seq: entry.seq });
 });
 
 // ── DELETE /api/live-feed/:channel (companion al terminar; requiere token) ──
-router.delete('/:channel', (req, res) => {
+router.delete('/:channel', async (req, res) => {
   if (!TOKEN || String(req.headers['x-feed-token'] || '') !== TOKEN) {
     return res.status(401).json({ error: 'bad_token' });
   }
-  channels.delete(String(req.params.channel).toLowerCase());
+  try {
+    await pool.query('DELETE FROM live_feed_channels WHERE channel = ?', [String(req.params.channel).toLowerCase()]);
+  } catch (e: any) {
+    console.error('[live-feed] delete error:', e.message);
+  }
   return res.json({ ok: true });
 });
 
@@ -121,13 +145,22 @@ router.delete('/:channel', (req, res) => {
 // OJO: NO fijar Access-Control-Allow-Origin:* aquí — el frontend manda
 // withCredentials y el navegador rechaza respuestas con wildcard; el
 // middleware global de CORS ya refleja el origin permitido.
-router.get('/:channel', (req, res) => {
+router.get('/:channel', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const channel = String(req.params.channel).toLowerCase();
   if (!CHANNEL_RE.test(channel)) return res.status(400).json({ error: 'bad_channel' });
-  const entry = channels.get(channel);
-  if (!entry || Date.now() - entry.at > TTL_MS) return res.status(204).end();
-  return res.json({ ok: true, seq: entry.seq, ageMs: Date.now() - entry.at, ...entry.snapshot });
+  try {
+    const [[row]] = await pool.query<any[]>(
+      'SELECT seq, at, snapshot FROM live_feed_channels WHERE channel = ?',
+      [channel]
+    );
+    if (!row || Date.now() - Number(row.at) > TTL_MS) return res.status(204).end();
+    const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
+    return res.json({ ok: true, seq: Number(row.seq), ageMs: Date.now() - Number(row.at), ...snapshot });
+  } catch (e: any) {
+    console.error('[live-feed] get error:', e.message);
+    return res.status(204).end();
+  }
 });
 
 export default router;

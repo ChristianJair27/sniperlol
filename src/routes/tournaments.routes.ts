@@ -569,6 +569,20 @@ export async function getStoredMatchStats(tournamentId: string, bracketMatchId: 
   return { ...parsed, isComplete: !!row.game_end_ts };
 }
 
+/** TODOS los juegos guardados de una serie (Bo3/Bo5), en orden de juego. */
+export async function getStoredMatchGames(tournamentId: string, bracketMatchId: string) {
+  const [rows] = await pool.query<any[]>(
+    `SELECT parsed_data, game_end_ts FROM tournament_match_stats
+     WHERE tournament_id=? AND bracket_match_id=? AND game_end_ts IS NOT NULL
+     ORDER BY game_end_ts ASC`,
+    [tournamentId, bracketMatchId]
+  );
+  return rows.map((row, i) => {
+    const parsed = typeof row.parsed_data === 'string' ? JSON.parse(row.parsed_data) : row.parsed_data;
+    return { ...parsed, isComplete: true, gameNumber: i + 1 };
+  });
+}
+
 async function saveMatchStats(
   tournamentId: string, bracketMatchId: string, riotMatchId: string,
   gameId: number, parsedData: object, gameDuration: number, gameEndTs?: number
@@ -2124,9 +2138,19 @@ router.get('/:id/matches/:matchId/stats', async (req, res) => {
     const match = t.bracket[mi];
     if (!match.gameId) return res.status(404).json({ error: 'No hay gameId. La partida aún no ha sido registrada en Riot o el código no fue usado.' });
 
-    // Serve from DB cache if complete (game already finished + saved)
+    // Serve from DB cache if complete (game already finished + saved).
+    // Series Bo3/Bo5: `games` trae TODOS los juegos en orden; el top-level
+    // sigue siendo el último para compatibilidad con clientes viejos.
+    const allGames = await getStoredMatchGames(id, matchId);
+    if (allGames.length) {
+      const seriesDone = match.matchStatus === 'complete';
+      const expected = match.matchStatus === 'complete' || (match.games?.length || 0) <= allGames.length;
+      if (seriesDone || expected) {
+        return res.json({ ...allGames[allGames.length - 1], games: allGames });
+      }
+    }
     const cached = await getStoredMatchStats(id, matchId);
-    if (cached?.isComplete) return res.json(cached);
+    if (cached?.isComplete) return res.json({ ...cached, games: allGames.length ? allGames : undefined });
 
     const primaryPlatform = match.gameRegion || t.region || 'la1';
     const tryPlatforms = primaryPlatform === 'la1' ? ['la1','la2']
