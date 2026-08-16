@@ -8,13 +8,15 @@ import { requireAuth } from '../middlewares/requireAuth.js';
 import { optionalAuth } from '../middlewares/optionalAuth.js';
 import { getMatchById, getMatchIdsByPUUID, getAccountByRiotId, getSummonerByPUUID, getLiveGame, getLiveGameByPuuid } from '../services/riot.js';
 import { startTournamentBackgroundSync, syncTournamentFull, recoverGameFromRoster } from '../services/tournament-sync.service.js';
+// Solo helpers puros (sin ciclo: el scheduler importa estas rutas dinámicamente).
+import { todayStartFor } from '../services/tournament-scheduler.service.js';
 import { sendTournamentInvitationEmail, isDeliverableEmail } from '../services/mail.service.js';
 import { pool } from '../db.js';
 
 const router = Router();
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-type TournamentPhase = 'registration' | 'checkin' | 'active' | 'complete';
+type TournamentPhase = 'registration' | 'checkin' | 'active' | 'complete' | 'cancelled';
 type MatchStatus     = 'pending' | 'ready' | 'active' | 'complete';
 
 interface Standing {
@@ -96,6 +98,28 @@ interface TournamentData {
   // solo y cierra el torneo al terminar la última; la última ronda usa
   // finalSeriesTo. undefined = manual (botón "Siguiente ronda").
   swissRounds?: number;
+  // Formato de juego custom: tamaño de equipo (1-5) y mapa. Los códigos de
+  // Riot soportan SR y ARAM; ARENA no tiene lobbies custom, así que se juega
+  // como LADDER: las duplas juegan Arena normal dentro de la ventana del evento
+  // y el sync puntúa los placements desde el historial (queue 1700/1710).
+  teamSize?: number;
+  gameMap?: 'SR' | 'ARAM' | 'ARENA';
+  pickType?: string;
+  // Fin de la ventana de juego (ladder Arena) — al llegar, el sync cierra.
+  endDate?: string;
+  // Estado del ladder Arena (partidas procesadas + puntos por dupla).
+  ladder?: ArenaLadder;
+  // Si el torneo nació de una plantilla de torneos diarios.
+  scheduleId?: number;
+  // Privado: invisible al público; inscripción solo con invitación (correo).
+  isPrivate?: boolean;
+}
+export interface ArenaLadder {
+  processed: string[]; // riot match ids ya puntuados
+  teams: Record<string, {
+    games: Array<{ matchId: string; placement: number; at: number }>;
+    points: number;
+  }>;
 }
 
 // ─── DB init ──────────────────────────────────────────────────────────────────
@@ -195,6 +219,50 @@ async function initTables() {
     // Suizo: nº de rondas planeadas → habilita avance automático de ronda.
     // NULL = manual (comportamiento clásico con el botón "Siguiente ronda").
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS swiss_rounds INT DEFAULT NULL`,
+    // Torneo privado: no aparece en listas públicas y solo se puede inscribir
+    // quien tenga invitación del organizador (por correo).
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS is_private TINYINT(1) DEFAULT 0`,
+    // Formatos custom: 1v1-5v5, mapa (SR/ARAM/ARENA) y pick type del lobby.
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS team_size INT DEFAULT 5`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS game_map VARCHAR(16) DEFAULT 'SR'`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS pick_type VARCHAR(32) DEFAULT NULL`,
+    // Ladder Arena: ventana de juego + estado de puntuación.
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS end_date VARCHAR(50) DEFAULT NULL`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS ladder JSON DEFAULT NULL`,
+    // Torneos diarios: plantilla que generó este torneo (NULL = manual).
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS schedule_id INT DEFAULT NULL`,
+    // Plantillas de torneos diarios: el scheduler crea una instancia por día
+    // a la hora configurada, abre inscripciones y auto-inicia.
+    `CREATE TABLE IF NOT EXISTS tournament_schedules (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(200) NOT NULL,
+      description TEXT,
+      game_map VARCHAR(16) NOT NULL DEFAULT 'SR',
+      team_size INT NOT NULL DEFAULT 5,
+      pick_type VARCHAR(32) DEFAULT NULL,
+      bracket_type VARCHAR(20) NOT NULL DEFAULT 'single_elim',
+      series_to INT NOT NULL DEFAULT 1,
+      final_series_to INT NOT NULL DEFAULT 1,
+      swiss_rounds INT DEFAULT NULL,
+      max_participants INT NOT NULL DEFAULT 16,
+      prize VARCHAR(500) DEFAULT '',
+      region VARCHAR(10) DEFAULT 'la1',
+      logo_url VARCHAR(1000),
+      banner_url VARCHAR(1000),
+      start_hour INT NOT NULL DEFAULT 20,
+      start_minute INT NOT NULL DEFAULT 0,
+      tz_offset_minutes INT NOT NULL DEFAULT -360,
+      days JSON DEFAULT NULL,
+      open_before_minutes INT NOT NULL DEFAULT 720,
+      min_teams INT NOT NULL DEFAULT 2,
+      duration_hours INT NOT NULL DEFAULT 3,
+      auto_start TINYINT(1) NOT NULL DEFAULT 1,
+      enabled TINYINT(1) NOT NULL DEFAULT 1,
+      create_riot TINYINT(1) NOT NULL DEFAULT 0,
+      created_by INT,
+      last_spawned_date VARCHAR(10) DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     // Series Bo3/Bo5: una fila de stats POR JUEGO (antes: una por enfrentamiento)
     `ALTER TABLE tournament_match_stats DROP INDEX unique_bracket_match`,
     `ALTER TABLE tournament_match_stats ADD UNIQUE KEY unique_bracket_game (tournament_id, bracket_match_id, game_id)`,
@@ -253,7 +321,13 @@ async function initTables() {
   }
 }
 initTables()
-  .then(() => startTournamentBackgroundSync())
+  .then(() => {
+    startTournamentBackgroundSync();
+    // Torneos diarios: import dinámico para no crear ciclo routes ↔ scheduler.
+    import('../services/tournament-scheduler.service.js')
+      .then(m => m.startDailyTournamentScheduler())
+      .catch(err => console.error('[tournaments] scheduler no arrancó:', err.message));
+  })
   .catch(err => console.error('[tournaments] initTables error:', err.message));
 
 // ─── DB helpers ───────────────────────────────────────────────────────────────
@@ -273,7 +347,7 @@ async function setSetting(key: string, value: string) {
 
 // Returns the persisted Riot provider id, creating (and storing) one only the
 // first time. Survives restarts, so we never spawn duplicate providers in Riot.
-async function getOrCreateProviderId(): Promise<number> {
+export async function getOrCreateProviderId(): Promise<number> {
   const stored = await getSetting('riot_provider_id');
   if (stored) return Number(stored);
   const p = await createProvider();
@@ -303,6 +377,13 @@ function rowToTournament(row: any): TournamentData {
     swissRounds:   row.swiss_rounds ? Number(row.swiss_rounds) : undefined,
     registrationUrl: row.registration_url || undefined,
     rulesUrl:        row.rules_url || undefined,
+    teamSize:  Math.min(5, Math.max(1, Number(row.team_size) || 5)),
+    gameMap:   (['SR','ARAM','ARENA'].includes(row.game_map) ? row.game_map : 'SR') as TournamentData['gameMap'],
+    pickType:  row.pick_type || undefined,
+    endDate:   row.end_date || undefined,
+    ladder:    parseJson(row.ladder) || undefined,
+    scheduleId: row.schedule_id ? Number(row.schedule_id) : undefined,
+    isPrivate: !!row.is_private,
   };
 }
 
@@ -317,7 +398,7 @@ async function saveT(t: TournamentData) {
        phase=?, participants=?, max_participants=?, prize=?, start_date=?,
        format=?, description=?, riot_tournament_id=?,
        code_pool=?, bracket=?, standings=?, checkin_deadline=?,
-       region=?, logo_url=?, banner_url=?
+       region=?, logo_url=?, banner_url=?, end_date=?, ladder=?
      WHERE id=?`,
     [
       t.phase, t.participants, t.maxParticipants, t.prize, t.startDate,
@@ -329,6 +410,8 @@ async function saveT(t: TournamentData) {
       t.region ?? 'la1',
       t.logoUrl ?? null,
       t.bannerUrl ?? null,
+      t.endDate ?? null,
+      t.ladder ? JSON.stringify(t.ladder) : null,
       t.id,
     ]
   );
@@ -391,7 +474,8 @@ async function getViewerAccess(
 
 function serialize(t: TournamentData, access: ViewerAccess = 'public') {
   const status = (t.phase==='registration'||t.phase==='checkin') ? 'abiertas'
-               : t.phase==='active' ? 'progreso' : 'finalizado';
+               : t.phase==='active' ? 'progreso'
+               : t.phase==='cancelled' ? 'cancelado' : 'finalizado';
   const isPrivileged = access === 'owner' || access === 'participant';
   return {
     id:t.id, name:t.name, phase:t.phase, status,
@@ -406,9 +490,26 @@ function serialize(t: TournamentData, access: ViewerAccess = 'public') {
     region:t.region||'la1', logoUrl:t.logoUrl, bannerUrl:t.bannerUrl, fearless:!!t.fearless,
     bracketType:t.bracketType||'single_elim',
     registrationUrl:t.registrationUrl, rulesUrl:t.rulesUrl,
+    teamSize: t.teamSize || 5,
+    gameMap: t.gameMap || 'SR',
+    pickType: t.pickType,
+    seriesTo: t.seriesTo || 1,
+    finalSeriesTo: t.finalSeriesTo || t.seriesTo || 1,
+    swissRounds: t.swissRounds,
+    endDate: t.endDate,
+    ladder: t.ladder,
+    scheduleId: t.scheduleId,
+    isPrivate: !!t.isPrivate,
     viewerAccess: access,
   };
 }
+
+// Torneos privados: el público no ve NADA (ni detalle ni bracket ni equipos).
+// Owner y participantes (invitados incluidos, vía getViewerAccess) sí.
+function privateBlocked(t: TournamentData, access: ViewerAccess): boolean {
+  return !!t.isPrivate && access === 'public';
+}
+const PRIVATE_403 = { error: 'Torneo privado — necesitas una invitación del organizador', isPrivate: true };
 
 export async function getRegs(tournamentId: string): Promise<TeamRegistration[]> {
   const [rows] = await pool.query<any[]>(
@@ -887,6 +988,28 @@ async function resolveTeamPuuids(t: TournamentData, teamName: string | null): Pr
   return puuids;
 }
 
+// Tamaño de roster permitido según el formato: teamSize titulares + hasta 2
+// suplentes (0 en 1v1). El hint viaja como mensaje de error al frontend.
+export function rosterSizeBounds(t: TournamentData): { min: number; max: number; hint: string } {
+  const size = Math.min(5, Math.max(1, Number(t.teamSize) || 5));
+  const max = size === 1 ? 1 : Math.min(7, size + 2);
+  const hint = size === 1
+    ? 'Formato 1v1: el roster es exactamente 1 jugador'
+    : `Roster de ${size} a ${max} jugadores (${size} titulares + suplentes)`;
+  return { min: size, max, hint };
+}
+
+// Opciones de lobby para los códigos de Riot según el formato del torneo.
+// TOURNAMENT_DRAFT exige 5v5; formatos chicos caen a BLIND_PICK y ARAM a
+// ALL_RANDOM. ARENA nunca llega aquí (no tiene lobbies custom → ladder).
+export function riotCodeOptions(t: TournamentData): { teamSize: number; mapType: string; pickType: string } {
+  const teamSize = Math.min(5, Math.max(1, Number(t.teamSize) || 5));
+  const mapType = t.gameMap === 'ARAM' ? 'HOWLING_ABYSS' : 'SUMMONERS_RIFT';
+  const pickType = t.pickType
+    || (t.gameMap === 'ARAM' ? 'ALL_RANDOM' : teamSize < 5 ? 'BLIND_PICK' : 'TOURNAMENT_DRAFT');
+  return { teamSize, mapType, pickType };
+}
+
 // Generate (or fall back to a pooled) tournament code for a specific bracket
 // match, restricting it to both teams' registered players (allowlist) and
 // embedding {tId, mId} in the code metadata so the Riot callback can resolve
@@ -912,6 +1035,7 @@ export async function assignCodeToMatch(t: TournamentData, mi: number): Promise<
       try {
         const metadata = JSON.stringify({ tId: t.id, mId: match.id });
         const codes = await generateCodes(t.riotTournamentId, 1, {
+          ...riotCodeOptions(t),
           metadata,
           allowedParticipants: [...team1Puuids, ...team2Puuids],
         });
@@ -994,11 +1118,243 @@ router.get('/', optionalAuth, async (req: any, res) => {
     const out = await Promise.all(rows.map(async (r) => {
       const t = rowToTournament(r);
       const access = await getViewerAccess(t, req.auth);
+      // Privados: solo los ven el organizador y los invitados/participantes.
+      if (privateBlocked(t, access)) return null;
       const s = serialize(t, access);
       const { bracket: _b, ...listItem } = s;
       return listItem;
     }));
+    res.json(out.filter(Boolean));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Torneos diarios (plantillas programadas) ────────────────────────────────
+// El scheduler (tournament-scheduler.service) crea una instancia por día a la
+// hora configurada, abre inscripciones y auto-inicia con el mínimo de equipos.
+
+function serializeSchedule(r: any) {
+  return {
+    id: r.id, name: r.name, description: r.description || '',
+    gameMap: r.game_map, teamSize: Number(r.team_size) || 5,
+    pickType: r.pick_type || null, bracketType: r.bracket_type,
+    seriesTo: Number(r.series_to) || 1, finalSeriesTo: Number(r.final_series_to) || 1,
+    swissRounds: r.swiss_rounds ? Number(r.swiss_rounds) : null,
+    maxParticipants: Number(r.max_participants) || 16,
+    prize: r.prize || '', region: r.region || 'la1',
+    logoUrl: r.logo_url || null, bannerUrl: r.banner_url || null,
+    startHour: Number(r.start_hour), startMinute: Number(r.start_minute),
+    tzOffsetMinutes: Number(r.tz_offset_minutes),
+    days: (typeof r.days === 'string' ? JSON.parse(r.days || 'null') : r.days) || null,
+    openBeforeMinutes: Number(r.open_before_minutes),
+    minTeams: Number(r.min_teams), durationHours: Number(r.duration_hours),
+    autoStart: !!r.auto_start, enabled: !!r.enabled, createRiot: !!r.create_riot,
+    createdBy: r.created_by, lastSpawnedDate: r.last_spawned_date || null,
+  };
+}
+
+// Próxima ocurrencia (ms UTC) de una plantilla a partir de ahora.
+function nextOccurrence(r: any, nowMs: number): number | null {
+  const days: number[] | null = (typeof r.days === 'string' ? JSON.parse(r.days || 'null') : r.days) || null;
+  for (let d = 0; d < 8; d++) {
+    const probe = nowMs + d * 86_400_000;
+    const { weekday, startUtcMs } = todayStartFor(
+      { start_hour: r.start_hour, start_minute: r.start_minute, tz_offset_minutes: r.tz_offset_minutes },
+      probe
+    );
+    if (days && !days.includes(weekday)) continue;
+    if (startUtcMs > nowMs) return startUtcMs;
+  }
+  return null;
+}
+
+// Público: los torneos diarios que vienen (para la sección "Diarios" del frontend).
+router.get('/daily/upcoming', async (_req, res) => {
+  try {
+    const [schedules] = await pool.query<any[]>('SELECT * FROM tournament_schedules WHERE enabled=1');
+    const now = Date.now();
+    const out = await Promise.all(schedules.map(async (r) => {
+      const s = serializeSchedule(r);
+      const next = nextOccurrence(r, now);
+      // Instancia de hoy (si ya se creó): para linkear directo a inscribirse.
+      const [[inst]] = await pool.query<any[]>(
+        `SELECT id, phase, participants, max_participants, start_date FROM tournaments
+          WHERE schedule_id=? AND phase IN ('registration','checkin','active')
+          ORDER BY created_at DESC LIMIT 1`,
+        [r.id]
+      );
+      return {
+        ...s,
+        nextStartAt: next ? new Date(next).toISOString() : null,
+        today: inst ? {
+          tournamentId: inst.id, phase: inst.phase,
+          participants: Number(inst.participants), maxParticipants: Number(inst.max_participants),
+          startDate: inst.start_date,
+        } : null,
+      };
+    }));
+    out.sort((a, b) => (a.nextStartAt || 'z').localeCompare(b.nextStartAt || 'z'));
     res.json(out);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// Organizador/admin: listado completo de plantillas propias (admin ve todas).
+router.get('/schedules', requireAuth, async (req: any, res) => {
+  try {
+    const [rows] = isAdmin(req)
+      ? await pool.query<any[]>('SELECT * FROM tournament_schedules ORDER BY start_hour, start_minute')
+      : await pool.query<any[]>('SELECT * FROM tournament_schedules WHERE created_by=? ORDER BY start_hour, start_minute', [req.auth.userId]);
+    res.json(rows.map(serializeSchedule));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+function validateScheduleBody(body: any, partial: boolean): { ok: true; fields: Record<string, any> } | { ok: false; error: string } {
+  const f: Record<string, any> = {};
+  const has = (k: string) => body[k] !== undefined;
+  if (!partial || has('name')) {
+    const name = String(body.name || '').trim();
+    if (!name || name.length > 120) return { ok: false, error: 'name requerido (máx 120)' };
+    f.name = name;
+  }
+  if (has('description')) f.description = String(body.description || '').slice(0, 2000);
+  if (!partial || has('gameMap')) {
+    if (!['SR', 'ARAM', 'ARENA'].includes(body.gameMap ?? 'SR')) return { ok: false, error: 'gameMap: SR | ARAM | ARENA' };
+    f.game_map = body.gameMap ?? 'SR';
+  }
+  if (!partial || has('teamSize')) {
+    const ts = Number(body.teamSize ?? 5);
+    if (!Number.isInteger(ts) || ts < 1 || ts > 5) return { ok: false, error: 'teamSize: 1-5' };
+    f.team_size = (f.game_map ?? body.gameMap) === 'ARENA' ? 2 : ts;
+  }
+  if (has('pickType')) {
+    if (body.pickType && !['BLIND_PICK', 'DRAFT_MODE', 'ALL_RANDOM', 'TOURNAMENT_DRAFT'].includes(body.pickType))
+      return { ok: false, error: 'pickType inválido' };
+    f.pick_type = body.pickType || null;
+  }
+  if (has('bracketType')) {
+    if (!['single_elim', 'round_robin', 'swiss'].includes(body.bracketType)) return { ok: false, error: 'bracketType inválido' };
+    f.bracket_type = body.bracketType;
+  }
+  if (has('seriesTo')) {
+    if (![1, 2, 3].includes(Number(body.seriesTo))) return { ok: false, error: 'seriesTo: 1|2|3' };
+    f.series_to = Number(body.seriesTo);
+  }
+  if (has('finalSeriesTo')) {
+    if (![1, 2, 3].includes(Number(body.finalSeriesTo))) return { ok: false, error: 'finalSeriesTo: 1|2|3' };
+    f.final_series_to = Number(body.finalSeriesTo);
+  }
+  if (has('swissRounds')) {
+    const sr = body.swissRounds === null ? null : Number(body.swissRounds);
+    if (sr !== null && (!Number.isInteger(sr) || sr < 1 || sr > 12)) return { ok: false, error: 'swissRounds: 1-12 o null' };
+    f.swiss_rounds = sr;
+  }
+  if (has('maxParticipants')) {
+    const mp = Number(body.maxParticipants);
+    if (!Number.isInteger(mp) || mp < 2 || mp > 256) return { ok: false, error: 'maxParticipants: 2-256' };
+    f.max_participants = mp;
+  }
+  if (has('prize')) f.prize = String(body.prize || '').slice(0, 500);
+  if (has('region')) f.region = String(body.region || 'la1').slice(0, 10);
+  if (has('logoUrl')) f.logo_url = body.logoUrl || null;
+  if (has('bannerUrl')) f.banner_url = body.bannerUrl || null;
+  if (!partial || has('startHour')) {
+    const h = Number(body.startHour ?? 20);
+    if (!Number.isInteger(h) || h < 0 || h > 23) return { ok: false, error: 'startHour: 0-23' };
+    f.start_hour = h;
+  }
+  if (has('startMinute')) {
+    const m = Number(body.startMinute);
+    if (!Number.isInteger(m) || m < 0 || m > 59) return { ok: false, error: 'startMinute: 0-59' };
+    f.start_minute = m;
+  }
+  if (has('tzOffsetMinutes')) {
+    const tz = Number(body.tzOffsetMinutes);
+    if (!Number.isInteger(tz) || tz < -720 || tz > 840) return { ok: false, error: 'tzOffsetMinutes inválido' };
+    f.tz_offset_minutes = tz;
+  }
+  if (has('days')) {
+    if (body.days !== null) {
+      if (!Array.isArray(body.days) || body.days.some((d: any) => !Number.isInteger(d) || d < 0 || d > 6))
+        return { ok: false, error: 'days: array de 0(dom)-6(sáb) o null (diario)' };
+    }
+    f.days = body.days === null ? null : JSON.stringify(body.days);
+  }
+  if (has('openBeforeMinutes')) {
+    const ob = Number(body.openBeforeMinutes);
+    if (!Number.isInteger(ob) || ob < 15 || ob > 4320) return { ok: false, error: 'openBeforeMinutes: 15-4320' };
+    f.open_before_minutes = ob;
+  }
+  if (has('minTeams')) {
+    const mt = Number(body.minTeams);
+    if (!Number.isInteger(mt) || mt < 2 || mt > 64) return { ok: false, error: 'minTeams: 2-64' };
+    f.min_teams = mt;
+  }
+  if (has('durationHours')) {
+    const dh = Number(body.durationHours);
+    if (!Number.isInteger(dh) || dh < 1 || dh > 72) return { ok: false, error: 'durationHours: 1-72' };
+    f.duration_hours = dh;
+  }
+  if (has('autoStart')) f.auto_start = body.autoStart ? 1 : 0;
+  if (has('enabled')) f.enabled = body.enabled ? 1 : 0;
+  if (has('createRiot')) f.create_riot = body.createRiot ? 1 : 0;
+  return { ok: true, fields: f };
+}
+
+// Crear plantilla — mismo gate que crear torneos Riot (organizador aprobado/admin):
+// una plantilla genera torneos sola todos los días, no es para cualquier cuenta.
+router.post('/schedules', requireAuth, async (req: any, res) => {
+  try {
+    const cap = await riotCapability(req);
+    if (!cap.ok) {
+      await logDenied(req.auth?.userId, 'POST /schedules', cap.reason);
+      return res.status(cap.status).json({ error: cap.error });
+    }
+    const v = validateScheduleBody(req.body, false);
+    if (!v.ok) return res.status(400).json({ error: v.error });
+    const f = { team_size: 5, game_map: 'SR', ...v.fields, created_by: req.auth.userId };
+    const cols = Object.keys(f);
+    const [result] = await pool.query<any>(
+      `INSERT INTO tournament_schedules (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`,
+      cols.map(c => (f as any)[c])
+    );
+    const [[row]] = await pool.query<any[]>('SELECT * FROM tournament_schedules WHERE id=?', [result.insertId]);
+    res.json({ success: true, schedule: serializeSchedule(row) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+async function loadOwnSchedule(req: any, res: any): Promise<any | null> {
+  const [[row]] = await pool.query<any[]>('SELECT * FROM tournament_schedules WHERE id=?', [req.params.sid]);
+  if (!row) { res.status(404).json({ error: 'Plantilla no encontrada' }); return null; }
+  if (!isAdmin(req) && row.created_by !== req.auth.userId) {
+    res.status(403).json({ error: 'Solo el creador de la plantilla o un admin' });
+    return null;
+  }
+  return row;
+}
+
+router.patch('/schedules/:sid', requireAuth, async (req: any, res) => {
+  try {
+    const row = await loadOwnSchedule(req, res);
+    if (!row) return;
+    const v = validateScheduleBody(req.body, true);
+    if (!v.ok) return res.status(400).json({ error: v.error });
+    const cols = Object.keys(v.fields);
+    if (cols.length) {
+      await pool.query(
+        `UPDATE tournament_schedules SET ${cols.map(c => `${c}=?`).join(', ')} WHERE id=?`,
+        [...cols.map(c => (v.fields as any)[c]), row.id]
+      );
+    }
+    const [[updated]] = await pool.query<any[]>('SELECT * FROM tournament_schedules WHERE id=?', [row.id]);
+    res.json({ success: true, schedule: serializeSchedule(updated) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/schedules/:sid', requireAuth, async (req: any, res) => {
+  try {
+    const row = await loadOwnSchedule(req, res);
+    if (!row) return;
+    await pool.query('DELETE FROM tournament_schedules WHERE id=?', [row.id]);
+    res.json({ success: true });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1007,50 +1363,93 @@ router.post('/', requireAuth, async (req: any, res) => {
   const { name, prize, startDate, format, description, maxParticipants, checkinDeadline, createRiot } = req.body;
   if (!name || !startDate) return res.status(400).json({ error:'name y startDate requeridos' });
 
+  // Formato custom: tamaño de equipo (1-5), mapa y tipo de bracket.
+  const gameMap: TournamentData['gameMap'] =
+    ['SR', 'ARAM', 'ARENA'].includes(req.body.gameMap) ? req.body.gameMap : 'SR';
+  // Arena siempre se juega en duplas; sin lobbies custom → sin códigos Riot.
+  const teamSize = gameMap === 'ARENA' ? 2
+    : Math.min(5, Math.max(1, Number(req.body.teamSize) || 5));
+  const pickType = typeof req.body.pickType === 'string'
+    && ['BLIND_PICK', 'DRAFT_MODE', 'ALL_RANDOM', 'TOURNAMENT_DRAFT'].includes(req.body.pickType)
+    ? req.body.pickType : undefined;
+  const bracketType = ['single_elim', 'round_robin', 'swiss'].includes(req.body.bracketType)
+    ? req.body.bracketType : undefined;
+  const seriesTo = [1, 2, 3].includes(Number(req.body.seriesTo)) ? Number(req.body.seriesTo) : 1;
+  const finalSeriesTo = [1, 2, 3].includes(Number(req.body.finalSeriesTo)) ? Number(req.body.finalSeriesTo) : seriesTo;
+  const swissRounds = Number.isInteger(Number(req.body.swissRounds))
+    && Number(req.body.swissRounds) >= 1 && Number(req.body.swissRounds) <= 12
+    ? Number(req.body.swissRounds) : null;
+  // Ladder Arena: ventana de juego en horas desde el inicio (default 3h).
+  const durationHours = Math.min(72, Math.max(1, Number(req.body.durationHours) || 3));
+  const endDate = gameMap === 'ARENA'
+    ? new Date(new Date(startDate).getTime() + durationHours * 3600_000).toISOString()
+    : undefined;
+  // Privado: fuera de listas públicas; solo se inscribe quien tenga invitación.
+  const isPrivate = !!req.body.isPrivate;
+
+  // Códigos oficiales de Riot SIEMPRE que el mapa lo permita (Arena no tiene
+  // lobbies custom). Sin checkbox: si el usuario no es organizador aprobado o
+  // agotó cuota, el torneo se crea igual pero sin torneo Riot (los partidos
+  // se detectan por roster) — no bloqueamos la creación.
+  const wantsRiot = gameMap !== 'ARENA' && createRiot !== false;
+
   let riotTournamentId: number|undefined;
   let initialCodes: string[] = [];
+  let riotSkippedReason: string | undefined;
 
-  if (createRiot) {
-    // Gate (b): torneo REAL en Riot solo para organizadores aprobados/admin
+  if (wantsRiot) {
     const cap = await riotCapability(req);
     if (!cap.ok) {
       await logDenied(req.auth?.userId, 'POST /tournaments createRiot', cap.reason);
-      return res.status(cap.status).json({ error: cap.error });
-    }
-    if (await monthlyRiotQuotaExceeded(req.auth.userId)) {
+      riotSkippedReason = 'Solo organizadores aprobados generan códigos oficiales de Riot.';
+    } else if (await monthlyRiotQuotaExceeded(req.auth.userId)) {
       await logDenied(req.auth?.userId, 'POST /tournaments createRiot', 'monthly_quota');
-      return res.status(429).json({ error: `Límite de ${RIOT_MAX_TOURNAMENTS_PER_MONTH} torneos Riot por mes alcanzado. Contacta a soporte si necesitas más.` });
+      riotSkippedReason = `Límite de ${RIOT_MAX_TOURNAMENTS_PER_MONTH} torneos Riot por mes alcanzado.`;
+    } else {
+      try {
+        const providerId = await getOrCreateProviderId();
+        const rt = await createTournament(providerId, name);
+        riotTournamentId = rt.id;
+        initialCodes = await generateCodes(
+          riotTournamentId, Math.min((maxParticipants||16)*2, 100),
+          riotCodeOptions({ teamSize, gameMap, pickType } as TournamentData)
+        );
+      } catch (err: any) { return res.status(500).json({ error:'Error Riot: '+err.message }); }
     }
-    try {
-      const providerId = await getOrCreateProviderId();
-      const rt = await createTournament(providerId, name);
-      riotTournamentId = rt.id;
-      initialCodes = await generateCodes(riotTournamentId, Math.min((maxParticipants||16)*2, 100));
-    } catch (err: any) { return res.status(500).json({ error:'Error Riot: '+err.message }); }
   }
 
   const slug = name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
     .replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
   const id = `${slug}-${Date.now()}`;
+  const defaultFormat = gameMap === 'ARENA' ? 'Arena Ladder 2v2'
+    : gameMap === 'ARAM' ? `ARAM ${teamSize}v${teamSize}`
+    : `${teamSize}v${teamSize} ${bracketType === 'swiss' ? 'Suizo' : bracketType === 'round_robin' ? 'Liga' : 'Single Elimination'}`;
   const newT: TournamentData = {
     id, name, phase:'registration', participants:0,
     maxParticipants:maxParticipants||16,
     prize:prize||'Por definir', startDate,
-    format:format||'5v5 Single Elimination', description:description||'',
+    format:format||defaultFormat, description:description||'',
     riotTournamentId, codePool:initialCodes,
     checkinDeadline:checkinDeadline||undefined,
     createdBy:req.auth.userId,
+    teamSize, gameMap, pickType, endDate,
+    bracketType: bracketType || (gameMap === 'ARENA' ? 'round_robin' : 'single_elim'),
+    seriesTo, finalSeriesTo, swissRounds: swissRounds ?? undefined,
+    isPrivate,
   };
 
   try {
     await pool.query(
-      `INSERT INTO tournaments (id,name,phase,participants,max_participants,prize,start_date,format,description,riot_tournament_id,code_pool,created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO tournaments (id,name,phase,participants,max_participants,prize,start_date,format,description,riot_tournament_id,code_pool,created_by,
+        team_size,game_map,pick_type,end_date,bracket_type,series_to,final_series_to,swiss_rounds,is_private)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [id,name,'registration',0,newT.maxParticipants,newT.prize,startDate,newT.format,
-       newT.description,riotTournamentId??null,JSON.stringify(initialCodes),req.auth.userId]
+       newT.description,riotTournamentId??null,JSON.stringify(initialCodes),req.auth.userId,
+       teamSize, gameMap, pickType ?? null, endDate ?? null,
+       newT.bracketType, seriesTo, finalSeriesTo, swissRounds, isPrivate ? 1 : 0]
     );
     if (initialCodes.length) await bumpCodesGenerated(id, initialCodes.length);
-    res.json({ success:true, tournament:serialize(newT) });
+    res.json({ success:true, tournament:serialize(newT, 'owner'), riotSkippedReason });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1200,6 +1599,16 @@ router.post('/invitations/:invId/respond', requireAuth, async (req: any, res) =>
       return res.json({ success: true, status: 'declined' });
     }
 
+    // Invitación de ACCESO a torneo privado (slot -1, sin equipo): aceptar
+    // solo registra el acceso — el invitado luego inscribe su propio equipo.
+    if (Number(inv.slot_index) < 0) {
+      await pool.query(
+        "UPDATE tournament_invitations SET status='accepted', responded_at=? WHERE id=?",
+        [new Date().toISOString(), inv.id]
+      );
+      return res.json({ success: true, status: 'accepted', tournamentId: inv.tournament_id, accessOnly: true });
+    }
+
     const linked = await getLinkedRiotAccount(userId);
     if (!linked) {
       return res.status(400).json({
@@ -1347,20 +1756,87 @@ router.get('/:id', optionalAuth, async (req: any, res) => {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error:'Torneo no encontrado' });
     const access = await getViewerAccess(t, req.auth);
+    if (privateBlocked(t, access)) return res.status(403).json(PRIVATE_403);
     res.json(serialize(t, access));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Invitaciones de torneo privado (organizador → correo) ────────────────────
+// Crea una invitación de ACCESO (slot -1, sin equipo): el invitado la recibe
+// por correo + en su dashboard, y con ella puede ver e inscribirse al torneo.
+router.post('/:id/invite', requireAuth, async (req: any, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email || !email.includes('@')) return res.status(400).json({ error: 'Correo inválido' });
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador puede invitar' });
+
+    const invitedUserId = await findUserByEmail(email);
+    if (!invitedUserId) {
+      return res.status(400).json({
+        error: `No hay cuenta ATAK.GG con el correo ${email}. Pídele que se registre primero en la plataforma.`,
+      });
+    }
+    if (invitedUserId === req.auth.userId) {
+      return res.status(400).json({ error: 'Ese es tu propio correo' });
+    }
+
+    const [[inviter]] = await pool.query<any[]>('SELECT name, email FROM users WHERE id=? LIMIT 1', [req.auth.userId]);
+    await createInvitation(
+      t.id, '', invitedUserId, req.auth.userId, -1,
+      String(req.body?.name || '').trim() || undefined,
+      { tournamentName: t.name, inviterName: inviter?.name || inviter?.email?.split('@')[0] || 'Organizador' }
+    );
+    res.json({ success: true, message: `Invitación enviada a ${email}` });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// Listado de invitados del torneo (organizador) — para gestionar accesos.
+router.get('/:id/invites', requireAuth, async (req: any, res) => {
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador' });
+    const [rows] = await pool.query<any[]>(
+      `SELECT i.id, i.status, i.player_name, i.created_at, u.email, u.name
+         FROM tournament_invitations i LEFT JOIN users u ON u.id = i.invited_user_id
+        WHERE i.tournament_id = ? AND i.slot_index = -1
+        ORDER BY i.created_at DESC`,
+      [t.id]
+    );
+    res.json(rows.map(r => ({
+      id: r.id, status: r.status, email: r.email, name: r.player_name || r.name || null,
+      createdAt: r.created_at,
+    })));
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // Register team — auto-fills captain from linked LoL account; validates Riot IDs; sends invitations
 router.post('/:id/register', requireAuth, async (req: any, res) => {
   const { teamName, captainRiotId, players, contact } = req.body;
-  if (!teamName || !Array.isArray(players) || players.length < 5) {
-    return res.status(400).json({ error: 'Datos incompletos (mínimo 5 jugadores)' });
+  if (!teamName || !Array.isArray(players)) {
+    return res.status(400).json({ error: 'Datos incompletos' });
   }
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    // Roster según el formato: mínimo teamSize titulares; hasta 2 suplentes
+    // (en 1v1 no hay suplentes: el equipo ES el jugador).
+    const rosterBounds = rosterSizeBounds(t);
+    if (players.length < rosterBounds.min || players.length > rosterBounds.max) {
+      return res.status(400).json({ error: rosterBounds.hint });
+    }
     if (t.phase !== 'registration') return res.status(400).json({ error: 'Inscripciones cerradas' });
+    // Torneo privado: solo el organizador o alguien con invitación puede
+    // inscribir equipo (la invitación llega por correo desde /invite).
+    if (t.isPrivate && !isOwner(req, t)) {
+      const [[inv]] = await pool.query<any[]>(
+        "SELECT id FROM tournament_invitations WHERE tournament_id=? AND invited_user_id=? AND status IN ('pending','accepted') LIMIT 1",
+        [t.id, req.auth.userId]
+      );
+      if (!inv) return res.status(403).json(PRIVATE_403);
+    }
     // Registro externo obligatorio (p.ej. formulario de la liga): solo el
     // organizador puede registrar directo (para correcciones manuales).
     if (t.registrationUrl && !isOwner(req, t)) {
@@ -1494,8 +1970,13 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
 });
 
 // GET registrations
-router.get('/:id/registrations', async (req, res) => {
-  try { res.json(await getRegs(req.params.id)); }
+router.get('/:id/registrations', optionalAuth, async (req: any, res) => {
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (privateBlocked(t, await getViewerAccess(t, req.auth))) return res.status(403).json(PRIVATE_403);
+    res.json(await getRegs(req.params.id));
+  }
   catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1530,12 +2011,16 @@ router.delete('/:id/registrations/:regId', requireAuth, async (req: any, res) =>
 // misma forma que /register: { name, riotId } o { name, inviteEmail }.
 router.patch('/:id/registrations/:regId', requireAuth, async (req: any, res) => {
   const { players } = req.body;
-  if (!Array.isArray(players) || players.length < 5) {
-    return res.status(400).json({ error: 'Datos incompletos (mínimo 5 jugadores)' });
+  if (!Array.isArray(players)) {
+    return res.status(400).json({ error: 'Datos incompletos' });
   }
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    const rosterBounds = rosterSizeBounds(t);
+    if (players.length < rosterBounds.min || players.length > rosterBounds.max) {
+      return res.status(400).json({ error: rosterBounds.hint });
+    }
     if (t.phase !== 'registration')
       return res.status(400).json({ error: 'Solo se puede editar el equipo mientras las inscripciones están abiertas' });
 
@@ -1721,39 +2206,59 @@ router.post('/:id/checkin', requireAuth, async (req: any, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
+// Arranque real del torneo — compartido por POST /:id/start y el scheduler de
+// torneos diarios. Muta y persiste t; devuelve error legible si no se puede.
+export async function startTournamentInternal(t: TournamentData): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (t.phase === 'active' || t.phase === 'complete') return { ok: false, error: 'Torneo ya activo o completado' };
+  const allRegs = await getRegs(t.id);
+  const activeRegs = t.phase === 'checkin' ? allRegs.filter(r => r.checkedIn) : allRegs;
+  if (activeRegs.length < 2) return { ok: false, error: 'Mínimo 2 equipos' };
+
+  const teams = activeRegs.map(r => r.teamName);
+
+  if (t.gameMap === 'ARENA') {
+    // Ladder: no hay bracket ni códigos — se abre la ventana de juego y el
+    // sync puntúa los placements de Arena hasta endDate.
+    if (!t.endDate) t.endDate = new Date(Date.now() + 3 * 3600_000).toISOString();
+    t.ladder = { processed: [], teams: Object.fromEntries(teams.map(tm => [tm, { games: [], points: 0 }])) };
+    t.standings = teams.map((team, i) => ({ position: i + 1, team, wins: 0, losses: 0, points: 0 }));
+    t.phase = 'active'; t.participants = teams.length;
+    await saveT(t);
+    return { ok: true };
+  }
+
+  const bracket = t.bracketType === 'round_robin' ? generateRoundRobin(teams)
+                : t.bracketType === 'swiss'       ? generateSwissRound1(teams)
+                : generateBracket(teams);
+  // Series: estampar seriesTo en cada partido; en eliminación la final usa finalSeriesTo
+  const maxR = Math.max(...bracket.map(m => m.round));
+  for (const m of bracket) {
+    m.seriesTo = (t.bracketType !== 'round_robin' && t.bracketType !== 'swiss' && m.round === maxR)
+      ? (t.finalSeriesTo || t.seriesTo || 1)
+      : (t.seriesTo || 1);
+  }
+  t.bracket = bracket;
+  // Assign an allowlisted, metadata-tagged code to each ready round-1 match.
+  for (let i = 0; i < bracket.length; i++) {
+    if (bracket[i].round === 1 && bracket[i].matchStatus === 'ready') {
+      await assignCodeToMatch(t, i);
+    }
+  }
+  t.standings = teams.map((team, i) => ({ position: i + 1, team, wins: 0, losses: 0, points: 0 }));
+  t.phase = 'active'; t.participants = teams.length;
+  await saveT(t);
+  return { ok: true };
+}
+
 // Start tournament
 router.post('/:id/start', requireAuth, async (req: any, res) => {
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error:'Torneo no encontrado' });
     if (!isOwner(req, t)) return res.status(403).json({ error:'Solo el creador puede hacer esto' });
-    if (t.phase==='active'||t.phase==='complete') return res.status(400).json({ error:'Torneo ya activo o completado' });
-    const allRegs = await getRegs(req.params.id);
-    const activeRegs = t.phase==='checkin' ? allRegs.filter(r=>r.checkedIn) : allRegs;
-    if (activeRegs.length<2) return res.status(400).json({ error:'Mínimo 2 equipos' });
-
-    const teams = activeRegs.map(r=>r.teamName);
-    const bracket = t.bracketType === 'round_robin' ? generateRoundRobin(teams)
-                  : t.bracketType === 'swiss'       ? generateSwissRound1(teams)
-                  : generateBracket(teams);
-    // Series: estampar seriesTo en cada partido; en eliminación la final usa finalSeriesTo
-    const maxR = Math.max(...bracket.map(m => m.round));
-    for (const m of bracket) {
-      m.seriesTo = (t.bracketType !== 'round_robin' && t.bracketType !== 'swiss' && m.round === maxR)
-        ? (t.finalSeriesTo || t.seriesTo || 1)
-        : (t.seriesTo || 1);
-    }
-    t.bracket = bracket;
-    // Assign an allowlisted, metadata-tagged code to each ready round-1 match.
-    for (let i = 0; i < bracket.length; i++) {
-      if (bracket[i].round === 1 && bracket[i].matchStatus === 'ready') {
-        await assignCodeToMatch(t, i);
-      }
-    }
-    const standings: Standing[] = teams.map((team,i)=>({position:i+1,team,wins:0,losses:0,points:0}));
-    t.phase='active'; t.standings=standings; t.participants=teams.length;
-    await saveT(t);
-    res.json({ success:true, bracket:t.bracket, standings });
+    const result = await startTournamentInternal(t);
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    res.json({ success:true, bracket:t.bracket, standings:t.standings });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1763,6 +2268,7 @@ router.get('/:id/bracket', optionalAuth, async (req: any, res) => {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error:'Torneo no encontrado' });
     const access = await getViewerAccess(t, req.auth);
+    if (privateBlocked(t, access)) return res.status(403).json(PRIVATE_403);
     res.json({ bracket: sanitizeBracket(t.bracket || [], access), phase: t.phase, viewerAccess: access, bracketType: t.bracketType || 'single_elim' });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
@@ -1790,6 +2296,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
     const access = await getViewerAccess(t, req.auth);
+    if (privateBlocked(t, access)) return res.status(403).json(PRIVATE_403);
     const regs = await getRegs(t.id);
     const version = await ddVersion();
 
@@ -1848,7 +2355,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
       const reg = regs.find(r => (r as any).registeredBy === req.auth.userId);
       if (reg) myTeam = {
         tag: reg.teamName, checkinDeadline: t.checkinDeadline ?? null, checkedIn: !!reg.checkedIn,
-        roster: (reg.players || []).slice(0, 5).map((p: any) => ({ playerName: p.name || p.riotId, role: null, mainChampionId: null, rank: null })),
+        roster: (reg.players || []).slice(0, rosterSizeBounds(t).max).map((p: any) => ({ playerName: p.name || p.riotId, role: null, mainChampionId: null, rank: null })),
       };
     }
 
@@ -1874,6 +2381,8 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         seriesTo: t.seriesTo || 1, finalSeriesTo: t.finalSeriesTo || t.seriesTo || 1,
         swissRounds: t.swissRounds ?? null,
         registrationUrl: t.registrationUrl ?? null, rulesUrl: t.rulesUrl ?? null,
+        teamSize: t.teamSize || 5, gameMap: t.gameMap || 'SR',
+        isPrivate: !!t.isPrivate,
       },
       bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
     });
@@ -2439,7 +2948,7 @@ router.post('/:id/generate-codes', requireAuth, async (req: any, res) => {
       const rt = await createTournament(providerId, t.name);
       riotTournamentId = rt.id; t.riotTournamentId = riotTournamentId;
     }
-    const newCodes = await generateCodes(riotTournamentId!, n);
+    const newCodes = await generateCodes(riotTournamentId!, n, riotCodeOptions(t));
     t.codePool = [...t.codePool, ...newCodes];
     await saveT(t);
     await bumpCodesGenerated(t.id, newCodes.length);
@@ -2528,6 +3037,39 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
         return res.status(400).json({ error: 'seriesTo/finalSeriesTo: 1 (Bo1), 2 (Bo3) o 3 (Bo5)' });
       await pool.query('UPDATE tournaments SET series_to=?, final_series_to=? WHERE id=?', [st, fst, t.id]);
       t.seriesTo = st; t.finalSeriesTo = fst;
+    }
+    // Formato de juego (tamaño/mapa/pick): solo antes de iniciar — los códigos
+    // ya generados quedarían con el teamSize viejo.
+    const { teamSize, gameMap, pickType, endDate } = req.body;
+    if (teamSize !== undefined || gameMap !== undefined || pickType !== undefined) {
+      if (locked) return res.status(400).json({ error: 'No se puede cambiar el formato de juego con el torneo iniciado' });
+      const gm = gameMap !== undefined
+        ? (['SR', 'ARAM', 'ARENA'].includes(gameMap) ? gameMap : null)
+        : (t.gameMap || 'SR');
+      if (!gm) return res.status(400).json({ error: 'gameMap inválido (SR | ARAM | ARENA)' });
+      const ts = gm === 'ARENA' ? 2
+        : teamSize !== undefined ? Number(teamSize) : (t.teamSize || 5);
+      if (!Number.isInteger(ts) || ts < 1 || ts > 5)
+        return res.status(400).json({ error: 'teamSize: entero 1-5' });
+      const pt = pickType !== undefined
+        ? (pickType === null || pickType === '' ? null
+          : ['BLIND_PICK', 'DRAFT_MODE', 'ALL_RANDOM', 'TOURNAMENT_DRAFT'].includes(pickType) ? pickType : undefined)
+        : (t.pickType ?? null);
+      if (pt === undefined) return res.status(400).json({ error: 'pickType inválido' });
+      await pool.query('UPDATE tournaments SET team_size=?, game_map=?, pick_type=? WHERE id=?', [ts, gm, pt, t.id]);
+      t.teamSize = ts; t.gameMap = gm; t.pickType = pt ?? undefined;
+    }
+    if (endDate !== undefined) {
+      const ed = endDate ? new Date(endDate) : null;
+      if (ed && isNaN(ed.getTime())) return res.status(400).json({ error: 'endDate inválido' });
+      await pool.query('UPDATE tournaments SET end_date=? WHERE id=?', [ed ? ed.toISOString() : null, t.id]);
+      t.endDate = ed ? ed.toISOString() : undefined;
+    }
+    // Visibilidad: se puede alternar en cualquier fase (hacer público un
+    // privado no rompe nada; hacer privado uno público oculta el listado).
+    if (req.body.isPrivate !== undefined) {
+      await pool.query('UPDATE tournaments SET is_private=? WHERE id=?', [req.body.isPrivate ? 1 : 0, t.id]);
+      t.isPrivate = !!req.body.isPrivate;
     }
     res.json({ success: true, tournament: serialize(t) });
   } catch (err: any) { res.status(500).json({ error: err.message }); }

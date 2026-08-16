@@ -34,6 +34,16 @@ type TournamentData = {
   finalSeriesTo?: number;
   /** Suizo: rondas planeadas → habilita avance automático + cierre. */
   swissRounds?: number;
+  /** Formato custom: tamaño de equipo (1-5) y mapa (SR/ARAM/ARENA). */
+  teamSize?: number;
+  gameMap?: string;
+  pickType?: string;
+  /** Ladder Arena: fin de ventana + estado de puntuación. */
+  endDate?: string;
+  ladder?: {
+    processed: string[];
+    teams: Record<string, { games: Array<{ matchId: string; placement: number; at: number }>; points: number }>;
+  };
 };
 
 function parseJson(v: unknown) {
@@ -74,6 +84,11 @@ async function getT(id: string): Promise<TournamentData | null> {
     seriesTo: Number(row.series_to) || 1,
     finalSeriesTo: Number(row.final_series_to) || Number(row.series_to) || 1,
     swissRounds: row.swiss_rounds ? Number(row.swiss_rounds) : undefined,
+    teamSize: Math.min(5, Math.max(1, Number(row.team_size) || 5)),
+    gameMap: row.game_map || 'SR',
+    pickType: row.pick_type || undefined,
+    endDate: row.end_date || undefined,
+    ladder: parseJson(row.ladder) || undefined,
   };
 }
 
@@ -83,7 +98,7 @@ async function saveT(t: TournamentData) {
        phase=?, participants=?, max_participants=?, prize=?, start_date=?,
        format=?, description=?, riot_tournament_id=?,
        code_pool=?, bracket=?, standings=?, checkin_deadline=?,
-       region=?, logo_url=?, banner_url=?
+       region=?, logo_url=?, banner_url=?, end_date=?, ladder=?
      WHERE id=?`,
     [
       t.phase, t.participants, t.maxParticipants, t.prize, t.startDate,
@@ -95,6 +110,8 @@ async function saveT(t: TournamentData) {
       t.region ?? 'la1',
       t.logoUrl ?? null,
       t.bannerUrl ?? null,
+      t.endDate ?? null,
+      t.ladder ? JSON.stringify(t.ladder) : null,
       t.id,
     ]
   );
@@ -298,10 +315,13 @@ export async function resolveWinnerFromMatch(
     } catch { /* skip */ }
   }
 
+  // Umbral por mayoría del equipo: 3 en 5v5, 2 en 3v3/4v4, 1 en 1v1/2v2.
+  // Con el fijo de 3 de antes, un 1v1 jamás podría atribuirse solo.
+  const need = Math.max(1, Math.ceil((Number(t.teamSize) || 5) / 2));
   const t1hits = partPuuids.filter(p => t1Puuids.includes(p)).length;
   const t2hits = partPuuids.filter(p => t2Puuids.includes(p)).length;
-  if (t1hits > t2hits && t1hits >= 3) return match.team1;
-  if (t2hits > t1hits && t2hits >= 3) return match.team2;
+  if (t1hits > t2hits && t1hits >= need) return match.team1;
+  if (t2hits > t1hits && t2hits >= need) return match.team2;
 
   // Fallback: winning team side from match data + majority of known PUUIDs on that side
   const winnerSide = (matchData.info?.teams as any[])?.find((tm: any) => tm.win)?.teamId;
@@ -470,9 +490,109 @@ export type SyncDetail = {
   error?: string;
 };
 
+// ── Arena ladder ─────────────────────────────────────────────────────────────
+// Arena no tiene lobbies custom (los códigos de torneo solo soportan SR/ARAM),
+// así que el modo torneo de Arena es un LADDER: las duplas registradas juegan
+// Arena normal/ranked durante la ventana del evento y aquí se puntúan sus
+// placements leyendo el historial de Match-V5. Cuentan las mejores
+// ARENA_BEST_OF partidas de cada dupla — grindear no gana, colocarse sí.
+const ARENA_QUEUES = new Set([1700, 1710, 1720]);
+const ARENA_POINTS = [10, 7, 6, 5, 4, 3, 2, 1]; // 1º..8º
+const ARENA_BEST_OF = 5;
+
+async function syncArenaLadder(t: TournamentData): Promise<{ synced: number; details: SyncDetail[] }> {
+  if (t.phase !== 'active') return { synced: 0, details: [] };
+  const startMs = Date.parse(t.startDate);
+  const endMs = t.endDate ? Date.parse(t.endDate) : startMs + 3 * 3600_000;
+  const platform = t.region || 'la1';
+  const ladder = t.ladder || { processed: [], teams: {} };
+  const processed = new Set(ladder.processed);
+  let changed = false;
+  let scored = 0;
+
+  const [regs] = await pool.query<any[]>(
+    'SELECT team_name, captain_riot_id, players FROM tournament_registrations WHERE tournament_id = ?',
+    [t.id]
+  );
+
+  for (const reg of regs) {
+    const teamName = reg.team_name as string;
+    if (!ladder.teams[teamName]) { ladder.teams[teamName] = { games: [], points: 0 }; changed = true; }
+    const players = parseJson(reg.players) || [];
+    const duoPuuids: string[] = [];
+    for (const rid of [reg.captain_riot_id, ...players.map((p: any) => p.riotId)].filter(Boolean)) {
+      const puuid = await resolveRiotIdToPuuid(rid, players, platform);
+      if (puuid && !duoPuuids.includes(puuid)) duoPuuids.push(puuid);
+      if (duoPuuids.length >= 2) break;
+    }
+    if (!duoPuuids.length) continue;
+
+    // El historial de un solo miembro basta: la dupla juega junta por regla.
+    const ids = await getMatchIdsByPUUID(platform, duoPuuids[0], 15, 0);
+    for (const mid of ids || []) {
+      if (processed.has(mid)) continue;
+      const pf = mid.split('_')[0].toLowerCase();
+      const data = await getMatchById(pf, mid);
+      const info = data?.info;
+      if (!info?.gameEndTimestamp) continue;
+      if (!ARENA_QUEUES.has(Number(info.queueId))) { processed.add(mid); changed = true; continue; }
+      if (!info.gameStartTimestamp || info.gameStartTimestamp < startMs || info.gameStartTimestamp > endMs) {
+        processed.add(mid); changed = true; continue;
+      }
+
+      // Ambos miembros presentes y en el MISMO subteam — si no, no puntúa.
+      const parts = (info.participants || []).filter((p: any) => duoPuuids.includes(p.puuid));
+      const sameSubteam = parts.length >= Math.min(2, duoPuuids.length)
+        && new Set(parts.map((p: any) => p.playerSubteamId ?? p.subteamPlacement)).size >= 1
+        && (duoPuuids.length < 2 || parts[0].playerSubteamId === parts[1].playerSubteamId);
+      const placement = Number(parts[0]?.subteamPlacement ?? parts[0]?.placement) || 0;
+      processed.add(mid); changed = true;
+      if (!sameSubteam || placement < 1 || placement > 8) continue;
+
+      ladder.teams[teamName].games.push({ matchId: mid, placement, at: info.gameEndTimestamp });
+      scored++;
+      console.log(`[arena-ladder] ${t.id}: ${teamName} → ${placement}º en ${mid}`);
+    }
+
+    // Puntos = suma de las mejores ARENA_BEST_OF partidas.
+    const best = [...ladder.teams[teamName].games]
+      .sort((a, b) => a.placement - b.placement)
+      .slice(0, ARENA_BEST_OF);
+    const pts = best.reduce((s, g) => s + (ARENA_POINTS[g.placement - 1] || 0), 0);
+    if (ladder.teams[teamName].points !== pts) { ladder.teams[teamName].points = pts; changed = true; }
+  }
+
+  // Standings desde el ladder: puntos → mejor placement promedio como desempate.
+  const rows = Object.entries(ladder.teams)
+    .map(([team, s]) => ({
+      team, points: s.points,
+      wins: s.games.filter(g => g.placement === 1).length,
+      losses: s.games.filter(g => g.placement > 1).length,
+      avg: s.games.length ? s.games.reduce((a, g) => a + g.placement, 0) / s.games.length : 9,
+    }))
+    .sort((a, b) => b.points - a.points || a.avg - b.avg)
+    .map((r, i) => ({ position: i + 1, team: r.team, wins: r.wins, losses: r.losses, points: r.points }));
+  if (JSON.stringify(rows) !== JSON.stringify(t.standings)) { t.standings = rows; changed = true; }
+
+  if (Date.now() > endMs) {
+    t.phase = 'complete';
+    changed = true;
+    console.log(`[arena-ladder] ${t.id}: ventana cerrada → campeón: ${rows[0]?.team ?? '—'}`);
+  }
+
+  if (changed) {
+    ladder.processed = [...processed].slice(-500);
+    t.ladder = ladder;
+    await saveT(t);
+  }
+  return { synced: scored, details: [] };
+}
+
 export async function syncTournamentFull(tournamentId: string): Promise<{ synced: number; details: SyncDetail[] }> {
   const t = await getT(tournamentId);
-  if (!t?.bracket) return { synced: 0, details: [] };
+  if (!t) return { synced: 0, details: [] };
+  if (t.gameMap === 'ARENA') return syncArenaLadder(t);
+  if (!t.bracket) return { synced: 0, details: [] };
 
   const details: SyncDetail[] = [];
   let changed = false;

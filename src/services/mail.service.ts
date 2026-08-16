@@ -124,9 +124,13 @@ export async function sendTournamentInvitationEmail(params: TournamentInviteEmai
     <p style="margin:0 0 8px;font-size:12px;letter-spacing:0.12em;text-transform:uppercase;color:#e1242e;font-weight:700;">ATAK.GG · Torneos</p>
     <h1 style="margin:0 0 16px;font-size:22px;color:#fff;">Invitación a torneo</h1>
     <p style="margin:0 0 20px;line-height:1.6;color:rgba(255,255,255,0.72);">
-      ${greeting}, <strong>${inviterName}</strong> te invitó a jugar en el equipo
+      ${teamName
+        ? `${greeting}, <strong>${inviterName}</strong> te invitó a jugar en el equipo
       <strong style="color:#ff5a64;">${teamName}</strong> del torneo
-      <strong>${tournamentName}</strong>.
+      <strong>${tournamentName}</strong>.`
+        : `${greeting}, <strong>${inviterName}</strong> te invitó al torneo privado
+      <strong style="color:#ff5a64;">${tournamentName}</strong>.
+      Acepta la invitación e inscribe a tu equipo desde la página del torneo.`}
       ${playerSlotName ? `<br><span style="color:rgba(255,255,255,0.5);font-size:14px;">Rol en roster: ${playerSlotName}</span>` : ''}
     </p>
     <p style="margin:0 0 24px;line-height:1.6;color:rgba(255,255,255,0.55);font-size:14px;">
