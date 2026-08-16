@@ -1621,7 +1621,17 @@ router.post('/invitations/:invId/respond', requireAuth, async (req: any, res) =>
       'SELECT * FROM tournament_registrations WHERE tournament_id=? AND team_name=?',
       [inv.tournament_id, inv.team_name]
     );
-    if (!reg) return res.status(404).json({ error: 'Equipo no encontrado' });
+    if (!reg) {
+      // El equipo ya no existe (lo borraron o el registro nunca se completó):
+      // anular la invitación para que no siga apareciendo como pendiente.
+      await pool.query(
+        "UPDATE tournament_invitations SET status='declined', responded_at=? WHERE id=?",
+        [new Date().toISOString(), inv.id]
+      );
+      return res.status(410).json({
+        error: `El equipo "${inv.team_name}" ya no existe en el torneo. Pide al capitán que te vuelva a invitar.`,
+      });
+    }
 
     const players: RosterPlayer[] = parseJson(reg.players) || [];
     const slot = Number(inv.slot_index);
@@ -1870,6 +1880,11 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
 
     const normalizedPlayers: RosterPlayer[] = [];
     const invitationsSent: string[] = [];
+    // Invitaciones DIFERIDAS: solo se crean cuando el equipo ya quedó insertado.
+    // Antes se creaban dentro del loop y un fallo posterior (slot inválido,
+    // nombre duplicado) dejaba invitaciones huérfanas de un equipo inexistente
+    // → "Equipo no encontrado" al aceptarlas.
+    const inviteOps: Array<() => Promise<void>> = [];
     const [[captainUser]] = await pool.query<any[]>(
       'SELECT name, email FROM users WHERE id = ? LIMIT 1',
       [userId]
@@ -1899,10 +1914,10 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
           continue;
         }
         normalizedPlayers.push({ name, inviteEmail, inviteStatus: 'pending' });
-        await createInvitation(t.id, teamName, invitedUserId, userId, i, name, {
+        inviteOps.push(() => createInvitation(t.id, teamName, invitedUserId, userId, i, name, {
           tournamentName: t.name,
           inviterName,
-        });
+        }));
         invitationsSent.push(inviteEmail);
         continue;
       }
@@ -1930,11 +1945,13 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
 
       // Notify ATAK users when their Riot ID was added manually
       if (matchedUserId && matchedUserId !== userId) {
-        await createInvitation(t.id, teamName, matchedUserId, userId, i, name).catch(() => {});
-        await pool.query(
-          "UPDATE tournament_invitations SET status='accepted', responded_at=? WHERE tournament_id=? AND team_name=? AND invited_user_id=?",
-          [new Date().toISOString(), t.id, teamName, matchedUserId]
-        );
+        inviteOps.push(async () => {
+          await createInvitation(t.id, teamName, matchedUserId, userId, i, name).catch(() => {});
+          await pool.query(
+            "UPDATE tournament_invitations SET status='accepted', responded_at=? WHERE tournament_id=? AND team_name=? AND invited_user_id=?",
+            [new Date().toISOString(), t.id, teamName, matchedUserId]
+          );
+        });
       }
     }
 
@@ -1952,6 +1969,8 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
       ]
     );
     await pool.query('UPDATE tournaments SET participants=participants+1 WHERE id=?', [t.id]);
+    // El equipo ya existe en la BD: ahora sí, crear invitaciones y mandar correos.
+    for (const op of inviteOps) await op().catch(e => console.error('[register invite]', e.message));
 
     res.json({
       success: true,
