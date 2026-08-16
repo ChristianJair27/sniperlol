@@ -664,6 +664,33 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
     details.push(detail);
   }
 
+  // ── Códigos automáticos para la ronda vigente ────────────────────────────
+  // En eliminación directa el ganador avanza por el sync sin código (solo el
+  // callback asignaba), y en liga las jornadas 2+ nacen sin código. Aquí:
+  // ronda vigente = la mínima con partidos pendientes; todo partido 'ready'
+  // con ambos equipos y sin código recibe el suyo → cualquier formato avanza
+  // ronda a ronda sin tocar nada, igual que el suizo con piloto automático.
+  if (t.phase === 'active' && t.gameMap !== 'ARENA' && t.bracket.length) {
+    try {
+      const pending = t.bracket.filter(m => m.matchStatus !== 'complete' && m.team1 !== 'BYE' && m.team2 !== 'BYE');
+      if (pending.length) {
+        const curRound = Math.min(...pending.map(m => m.round));
+        for (let i = 0; i < t.bracket.length; i++) {
+          const m = t.bracket[i];
+          if (m.round === curRound && m.matchStatus === 'ready'
+              && m.team1 && m.team2 && m.team1 !== 'BYE' && m.team2 !== 'BYE' && !m.code) {
+            const routes = await import('../routes/tournaments.routes.js');
+            await routes.assignCodeToMatch(t as any, i);
+            changed = true;
+            console.log(`[tournament-sync] ${t.id}: código automático para ${m.id} (ronda ${curRound})`);
+          }
+        }
+      }
+    } catch (e: any) {
+      console.error(`[tournament-sync] auto-códigos ${t.id} falló:`, e.message);
+    }
+  }
+
   // ── Avance automático suizo (opt-in: solo si el organizador fijó rondas) ──
   // Al completarse todos los partidos de la ronda vigente: genera la siguiente
   // con códigos, o cierra el torneo si era la última planeada. El organizador
