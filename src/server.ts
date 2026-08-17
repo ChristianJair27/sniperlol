@@ -88,6 +88,18 @@ app.use('/api/static', staticRoutes);
 console.log("CORS_ORIGIN allowlist:", allowedOrigins);
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// Identidad de la instancia: tras cada deploy, 6-8 curls aquí deben devolver
+// SIEMPRE el mismo instance/bootedAt. Si alternan valores hay contenedores
+// viejos sirviendo tráfico (incidente 2026-08-15: códigos con mapa incorrecto,
+// partidas mal atribuidas). SOURCE_COMMIT lo inyecta Coolify si está mapeado.
+const INSTANCE_ID = Math.random().toString(36).slice(2, 10);
+const BOOTED_AT = new Date().toISOString();
+app.get("/api/version", (_req, res) => res.json({
+  instance: INSTANCE_ID,
+  bootedAt: BOOTED_AT,
+  commit: process.env.SOURCE_COMMIT || process.env.COOLIFY_CONTAINER_NAME || null,
+}));
 app.use("/api/players", players);
 app.use("/api/live", live);
 

@@ -10,7 +10,7 @@ import { getMatchById, getMatchIdsByPUUID, getAccountByRiotId, getSummonerByPUUI
 import { startTournamentBackgroundSync, syncTournamentFull, recoverGameFromRoster } from '../services/tournament-sync.service.js';
 // Solo helpers puros (sin ciclo: el scheduler importa estas rutas dinámicamente).
 import { todayStartFor } from '../services/tournament-scheduler.service.js';
-import { sendTournamentInvitationEmail, isDeliverableEmail } from '../services/mail.service.js';
+import { sendTournamentInvitationEmail, sendMatchCodeEmail, isDeliverableEmail } from '../services/mail.service.js';
 import { pool } from '../db.js';
 
 const router = Router();
@@ -38,10 +38,19 @@ interface BracketMatch {
   // BEFORE the code existed (e.g. an old scrim/custom in the captain's history).
   codeActivatedAt?: number;
   // Series (Bo3/Bo5): juegos ya jugados de este enfrentamiento. gameId (arriba)
-  // apunta al último juego para compat con la vista de stats.
-  games?: Array<{ gameId: number; gameRegion?: string; winner?: string | null }>;
+  // apunta al último juego para compat con la vista de stats. `ambiguous` =
+  // juego del código cuyo ganador no se pudo atribuir (lados mezclados).
+  games?: Array<{ gameId: number; gameRegion?: string; winner?: string | null; ambiguous?: boolean }>;
+  // Algún juego quedó sin ganador atribuible → la card lo avisa en rojo y el
+  // organizador cierra con reporte manual.
+  needsManualResult?: boolean;
   // Juegos necesarios para ganar la serie (1=Bo1 default, 2=Bo3, 3=Bo5).
   seriesTo?: number;
+  // Horario oficial del enfrentamiento (ISO). Lo fija el organizador; se
+  // muestra con countdown en el calendario y las cards del match.
+  scheduledAt?: string | null;
+  // Serie cerrada por W.O. (no se presentó el rival) — sin juegos de Riot.
+  forfeit?: boolean;
 }
 interface RosterPlayer {
   name: string;
@@ -988,6 +997,63 @@ async function resolveTeamPuuids(t: TournamentData, teamName: string | null): Pr
   return puuids;
 }
 
+// P0-integridad: un mismo jugador (por PUUID, con Riot ID como respaldo) no
+// puede estar inscrito en DOS equipos del mismo torneo. Devuelve la lista de
+// conflictos para armar un error legible; excludeRegId permite editar tu
+// propio roster sin chocar contigo mismo.
+export async function findRosterConflicts(
+  tournamentId: string,
+  candidates: Array<{ riotId?: string; puuid?: string }>,
+  excludeRegId?: number
+): Promise<Array<{ player: string; team: string }>> {
+  const [rows] = await pool.query<any[]>(
+    'SELECT id, team_name, captain_riot_id, players FROM tournament_registrations WHERE tournament_id = ?',
+    [tournamentId]
+  );
+  const byPuuid = new Map<string, string>();
+  const byRiotId = new Map<string, string>();
+  for (const r of rows) {
+    if (excludeRegId && Number(r.id) === Number(excludeRegId)) continue;
+    if (r.captain_riot_id) byRiotId.set(String(r.captain_riot_id).toLowerCase(), r.team_name);
+    for (const p of (parseJson(r.players) || [])) {
+      if (p?.puuid) byPuuid.set(p.puuid, r.team_name);
+      if (p?.riotId) byRiotId.set(String(p.riotId).toLowerCase(), r.team_name);
+    }
+  }
+  const conflicts: Array<{ player: string; team: string }> = [];
+  const seen = new Set<string>();
+  for (const cand of candidates) {
+    const team = (cand.puuid && byPuuid.get(cand.puuid))
+      || (cand.riotId && byRiotId.get(cand.riotId.toLowerCase()))
+      || null;
+    if (!team) continue;
+    const label = cand.riotId || `${(cand.puuid || '').slice(0, 8)}…`;
+    if (!seen.has(label.toLowerCase())) {
+      seen.add(label.toLowerCase());
+      conflicts.push({ player: label, team });
+    }
+  }
+  return conflicts;
+}
+
+export function rosterConflictError(conflicts: Array<{ player: string; team: string }>): string {
+  return conflicts.map(c => `${c.player} ya está inscrito en el equipo "${c.team}"`).join('; ')
+    + '. Un jugador solo puede estar en un equipo por torneo.';
+}
+
+// Duplicados DENTRO del propio roster (misma cuenta dos veces).
+function findInternalDuplicates(players: RosterPlayer[]): string[] {
+  const seen = new Map<string, number>();
+  const dups: string[] = [];
+  for (const p of players) {
+    const key = p.puuid || p.riotId?.toLowerCase();
+    if (!key) continue;
+    seen.set(key, (seen.get(key) || 0) + 1);
+    if (seen.get(key) === 2) dups.push(p.riotId || key);
+  }
+  return dups;
+}
+
 // Tamaño de roster permitido según el formato: teamSize titulares + hasta 2
 // suplentes (0 en 1v1). El hint viaja como mensaje de error al frontend.
 export function rosterSizeBounds(t: TournamentData): { min: number; max: number; hint: string } {
@@ -1051,8 +1117,46 @@ export async function assignCodeToMatch(t: TournamentData, mi: number): Promise<
 
   match.code = code;
   match.matchStatus = code ? 'active' : 'ready';
-  if (code) match.codeActivatedAt = Date.now();
+  if (code) {
+    match.codeActivatedAt = Date.now();
+    // P0: avisar a ambos equipos por correo (best-effort, nunca bloquea).
+    notifyMatchCode(t, match).catch(e => console.error('[assignCode] notify falló:', e.message));
+  }
   return code;
+}
+
+// Correos "tu código está listo" a los dos equipos del enfrentamiento.
+// Destinatarios por equipo: cuenta ATAK del capitán/registrador + correos del
+// roster (los equipos del formulario LQC traen email por jugador). Dedup y
+// tope de 8 por equipo. Fire-and-forget: un SMTP caído no afecta el flujo.
+async function notifyMatchCode(t: TournamentData, match: BracketMatch): Promise<void> {
+  if (!match.code || !match.team1 || !match.team2 || match.team1 === 'BYE' || match.team2 === 'BYE') return;
+  const regs = await getRegs(t.id);
+  for (const [teamName, opponentName] of [[match.team1, match.team2], [match.team2, match.team1]] as const) {
+    const reg = regs.find(r => r.teamName === teamName);
+    if (!reg) continue;
+    const emails = new Map<string, string | undefined>(); // email → nombre
+    const addUserEmail = async (userId?: number) => {
+      if (!userId) return;
+      const [[u]] = await pool.query<any[]>('SELECT email, name FROM users WHERE id=? LIMIT 1', [userId]);
+      if (u?.email) emails.set(String(u.email).toLowerCase(), u.name || undefined);
+    };
+    await addUserEmail((reg as any).captainUserId);
+    await addUserEmail(reg.registeredBy);
+    for (const p of reg.players || []) {
+      const em = (p as any).email || p.inviteEmail;
+      if (em) emails.set(String(em).toLowerCase(), p.name || undefined);
+      if (emails.size >= 8) break;
+    }
+    for (const [email, name] of emails) {
+      sendMatchCodeEmail({
+        toEmail: email, toName: name,
+        teamName, opponentName,
+        tournamentName: t.name, tournamentId: t.id,
+        code: match.code, scheduledAt: match.scheduledAt ?? null,
+      }).catch(() => {});
+    }
+  }
 }
 
 // Mark a match complete for `winner`, advance the winner to the next round
@@ -1955,6 +2059,19 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
       }
     }
 
+    // P0-integridad: sin cuentas repetidas en el roster ni en otros equipos.
+    const internalDups = findInternalDuplicates(normalizedPlayers);
+    if (internalDups.length) {
+      return res.status(400).json({ error: `Cuenta repetida en el roster: ${internalDups.join(', ')}` });
+    }
+    const conflicts = await findRosterConflicts(t.id, [
+      { riotId: `${captainResolved.gameName}#${captainResolved.tagLine}`, puuid: captainResolved.puuid },
+      ...normalizedPlayers.filter(p => p.riotId || p.puuid),
+    ]);
+    if (conflicts.length) {
+      return res.status(409).json({ error: rosterConflictError(conflicts) });
+    }
+
     await pool.query(
       `INSERT INTO tournament_registrations
          (tournament_id, team_name, captain_riot_id, players, contact, registered_by, captain_user_id)
@@ -2134,6 +2251,18 @@ router.patch('/:id/registrations/:regId', requireAuth, async (req: any, res) => 
         inviteStatus: 'accepted',
       });
       if (matchedUserId) keepInvitedUserIds.push(matchedUserId);
+    }
+
+    // P0-integridad: sin repetidos en el roster ni en otros equipos del torneo.
+    const internalDups = findInternalDuplicates(normalizedPlayers);
+    if (internalDups.length) {
+      return res.status(400).json({ error: `Cuenta repetida en el roster: ${internalDups.join(', ')}` });
+    }
+    const conflicts = await findRosterConflicts(
+      t.id, normalizedPlayers.filter(p => p.riotId || p.puuid), Number(reg.id)
+    );
+    if (conflicts.length) {
+      return res.status(409).json({ error: rosterConflictError(conflicts) });
     }
 
     for (const op of inviteOps) await op();
@@ -2377,8 +2506,15 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
 
     const schedule = bracketArr
       .filter(m => m.matchStatus !== 'complete' && m.team1 && m.team2 && m.team1 !== 'BYE' && m.team2 !== 'BYE')
+      .sort((a, b) => {
+        // Con horario primero (ordenados por hora); sin horario al final.
+        if (a.scheduledAt && b.scheduledAt) return String(a.scheduledAt).localeCompare(String(b.scheduledAt));
+        if (a.scheduledAt) return -1;
+        if (b.scheduledAt) return 1;
+        return a.round - b.round || a.matchNumber - b.matchNumber;
+      })
       .slice(0, 6)
-      .map(m => ({ matchId: m.id, scheduledAt: null, teamA: teamMeta(m.team1), teamB: teamMeta(m.team2), roundLabel: rlabel(m.round), reminded: false }));
+      .map(m => ({ matchId: m.id, scheduledAt: m.scheduledAt ?? null, teamA: teamMeta(m.team1), teamB: teamMeta(m.team2), roundLabel: rlabel(m.round), reminded: false }));
 
     let myTeam: any = null;
     if (req.auth?.userId) {
@@ -2469,6 +2605,8 @@ router.post('/:id/matches/:matchId/result', requireAuth, async (req: any, res) =
     if (winner!==match.team1&&winner!==match.team2) return res.status(400).json({ error:'Ganador inválido' });
     if (match.matchStatus==='complete') return res.status(400).json({ error:'Partido ya completado' });
 
+    // El reporte manual resuelve cualquier ambigüedad pendiente (lados mezclados).
+    t.bracket[mi].needsManualResult = false;
     await applyResult(t, mi, winner, score1, score2);
     await saveT(t);
 
@@ -2626,6 +2764,145 @@ router.get('/debug-lobby/:code', requireAuth, async (req: any, res) => {
     res.json(events);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
+
+// ── P0: horario oficial del enfrentamiento ───────────────────────────────────
+// PATCH /:id/matches/:matchId { scheduledAt: ISO | null }
+router.patch('/:id/matches/:matchId', requireAuth, async (req: any, res) => {
+  const { id, matchId } = req.params;
+  try {
+    const t = await getT(id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador puede editar el partido' });
+    if (!t.bracket) return res.status(400).json({ error: 'Sin bracket' });
+    const mi = t.bracket.findIndex(m => m.id === matchId);
+    if (mi === -1) return res.status(404).json({ error: 'Partido no encontrado' });
+
+    if (req.body.scheduledAt !== undefined) {
+      if (req.body.scheduledAt === null || req.body.scheduledAt === '') {
+        t.bracket[mi].scheduledAt = null;
+      } else {
+        const d = new Date(req.body.scheduledAt);
+        if (isNaN(d.getTime())) return res.status(400).json({ error: 'scheduledAt inválido (fecha ISO o null)' });
+        t.bracket[mi].scheduledAt = d.toISOString();
+      }
+    }
+    await saveT(t);
+    res.json({ success: true, matchId, scheduledAt: t.bracket[mi].scheduledAt ?? null });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── P0: W.O. / forfeit — el rival no se presentó ─────────────────────────────
+// POST /:id/matches/:matchId/forfeit { winner } — cierra la serie seriesTo-0
+// sin partidas de Riot y avanza el bracket/standings como un resultado normal.
+router.post('/:id/matches/:matchId/forfeit', requireAuth, async (req: any, res) => {
+  const { id, matchId } = req.params;
+  const { winner } = req.body;
+  try {
+    const t = await getT(id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador puede declarar W.O.' });
+    if (!t.bracket) return res.status(400).json({ error: 'Sin bracket' });
+    if (t.phase !== 'active') return res.status(400).json({ error: 'Torneo no activo' });
+    const mi = t.bracket.findIndex(m => m.id === matchId);
+    if (mi === -1) return res.status(404).json({ error: 'Partido no encontrado' });
+    const match = t.bracket[mi];
+    if (winner !== match.team1 && winner !== match.team2) return res.status(400).json({ error: 'Ganador inválido' });
+    if (match.matchStatus === 'complete') return res.status(400).json({ error: 'Partido ya completado' });
+
+    const sTo = match.seriesTo || t.seriesTo || 1;
+    t.bracket[mi].forfeit = true;
+    t.bracket[mi].needsManualResult = false;
+    await applyResult(t, mi, winner, winner === match.team1 ? sTo : 0, winner === match.team2 ? sTo : 0);
+    await saveT(t);
+    res.json({ success: true, matchId, winner, forfeit: true, standings: t.standings });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── P0: desvincular UN juego de una serie ────────────────────────────────────
+// POST /:id/matches/:matchId/unlink-game { gameId } — quita ese juego (y sus
+// stats), recalcula el marcador y, si la serie estaba cerrada por ese juego,
+// la reabre revirtiendo avance de bracket y standings — solo si la siguiente
+// ronda no se ha jugado (nunca reescribe partidas ya disputadas).
+router.post('/:id/matches/:matchId/unlink-game', requireAuth, async (req: any, res) => {
+  const { id, matchId } = req.params;
+  const targetGameId = Number(req.body?.gameId);
+  if (!Number.isFinite(targetGameId) || targetGameId <= 0) return res.status(400).json({ error: 'gameId requerido' });
+  try {
+    const t = await getT(id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador puede desvincular juegos' });
+    if (!t.bracket) return res.status(400).json({ error: 'Sin bracket' });
+    const mi = t.bracket.findIndex(m => m.id === matchId);
+    if (mi === -1) return res.status(404).json({ error: 'Partido no encontrado' });
+    const match = t.bracket[mi];
+    const games = match.games || [];
+    const hasIt = games.some(g => Number(g.gameId) === targetGameId) || Number(match.gameId) === targetGameId;
+    if (!hasIt) return res.status(404).json({ error: 'Ese juego no está vinculado a este partido' });
+
+    // Si la serie estaba completa, revertir ANTES de recalcular (aborta con
+    // error claro si la siguiente ronda ya se jugó).
+    if (match.matchStatus === 'complete') {
+      const revertErr = revertCompletedMatch(t, mi);
+      if (revertErr) return res.status(409).json({ error: revertErr });
+    }
+
+    match.games = games.filter(g => Number(g.gameId) !== targetGameId);
+    const last = match.games[match.games.length - 1];
+    match.gameId = last ? last.gameId : undefined;
+    match.gameRegion = last ? last.gameRegion : undefined;
+    match.score1 = match.games.filter(g => g.winner === match.team1).length;
+    match.score2 = match.games.filter(g => g.winner === match.team2).length;
+    match.needsManualResult = match.games.some(g => (g as any).ambiguous && !g.winner);
+
+    await pool.query(
+      'DELETE FROM tournament_match_stats WHERE tournament_id = ? AND bracket_match_id = ? AND game_id = ?',
+      [id, matchId, targetGameId]
+    ).catch(() => {});
+    for (const [k] of liveCache) { if (k.includes('live') || k.includes('codegame')) liveCache.delete(k); }
+    await saveT(t);
+    res.json({ success: true, matchId, removedGameId: targetGameId, score: [match.score1, match.score2], games: match.games });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// Reversión segura de una serie completada: deshace standings, quita al ganador
+// de la siguiente ronda (eliminación) y reabre la serie. Devuelve string de
+// error si no es seguro (la siguiente ronda ya tiene juegos), null si ok.
+function revertCompletedMatch(t: TournamentData, mi: number): string | null {
+  const match = t.bracket![mi];
+  const winner = match.winner;
+  if (!winner) { match.matchStatus = match.code ? 'active' : 'ready'; return null; }
+  const loser = winner === match.team1 ? match.team2 : match.team1;
+
+  if ((t.bracketType || 'single_elim') === 'single_elim') {
+    const nextId = `r${match.round + 1}m${Math.ceil(match.matchNumber / 2)}`;
+    const ni = t.bracket!.findIndex(m => m.id === nextId);
+    if (ni !== -1) {
+      const next = t.bracket![ni];
+      if (next.matchStatus === 'complete' || (next.games?.length || 0) > 0) {
+        return 'La siguiente ronda ya se jugó — no se puede reabrir esta serie. Corrige manualmente con el reporte de resultado.';
+      }
+      if (match.matchNumber % 2 === 1) { if (next.team1 === winner) next.team1 = null; }
+      else { if (next.team2 === winner) next.team2 = null; }
+      // El código de la siguiente ronda llevaba allowlist de este equipo → fuera.
+      next.code = null; next.codeActivatedAt = undefined;
+      next.matchStatus = 'pending';
+    }
+  }
+
+  if (t.standings) {
+    t.standings = t.standings
+      .map(s => s.team === winner ? { ...s, wins: Math.max(0, s.wins - 1), points: Math.max(0, s.points - 3) }
+        : s.team === loser ? { ...s, losses: Math.max(0, s.losses - 1) } : s)
+      .sort((a, b) => b.points - a.points)
+      .map((s, i) => ({ ...s, position: i + 1 }));
+  }
+
+  match.winner = null;
+  match.forfeit = false;
+  match.matchStatus = match.code ? 'active' : 'ready';
+  if (t.phase === 'complete') t.phase = 'active';
+  return null;
+}
 
 // Admin: clear a wrong gameId link (e.g. a bad roster-recovery) so the match can
 // re-detect from the tournament code or be linked manually. Optionally clears the code.

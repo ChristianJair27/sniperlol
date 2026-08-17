@@ -180,6 +180,76 @@ export async function sendTournamentInvitationEmail(params: TournamentInviteEmai
     return { sent: false };
   }
 }
+// ── Código de partida listo (P0) ─────────────────────────────────────────────
+// Aviso a los equipos cuando su enfrentamiento recibe código de torneo: qué
+// código es, contra quién y (si el organizador lo fijó) a qué hora se juega.
+export async function sendMatchCodeEmail(params: {
+  toEmail: string; toName?: string;
+  teamName: string; opponentName: string;
+  tournamentName: string; tournamentId: string;
+  code: string; scheduledAt?: string | null;
+}): Promise<{ sent: boolean }> {
+  const { toEmail, toName, teamName, opponentName, tournamentName, tournamentId, code, scheduledAt } = params;
+  if (!isDeliverableEmail(toEmail)) return { sent: false };
+
+  const from = process.env.SMTP_FROM || 'ATAK.GG Torneos <noreply@atak.gg>';
+  const tournamentUrl = `${WEB_ORIGIN}/tournaments/${tournamentId}`;
+  const greeting = toName ? `Hola ${toName}` : 'Hola';
+  const when = scheduledAt
+    ? new Date(scheduledAt).toLocaleString('es-MX', { dateStyle: 'full', timeStyle: 'short', timeZone: 'America/Mexico_City' })
+    : null;
+
+  const html = `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#0a0a0c;font-family:system-ui,sans-serif;color:#e8e8ea;">
+  <div style="max-width:520px;margin:32px auto;padding:32px;border-radius:16px;border:1px solid rgba(255,255,255,0.08);background:#111114;">
+    <p style="margin:0 0 8px;font-size:12px;letter-spacing:0.12em;text-transform:uppercase;color:#e1242e;font-weight:700;">ATAK.GG · Torneos</p>
+    <h1 style="margin:0 0 16px;font-size:22px;color:#fff;">Tu partida está lista</h1>
+    <p style="margin:0 0 16px;line-height:1.6;color:rgba(255,255,255,0.72);">
+      ${greeting}, el enfrentamiento de <strong style="color:#ff5a64;">${teamName}</strong>
+      contra <strong>${opponentName}</strong> en <strong>${tournamentName}</strong> ya tiene código oficial.
+      ${when ? `<br>Horario oficial: <strong style="color:#c8aa6e;">${when}</strong>.` : ''}
+    </p>
+    <div style="margin:0 0 20px;padding:14px 16px;border-radius:12px;border:1px dashed rgba(200,170,110,0.4);background:rgba(200,170,110,0.06);">
+      <p style="margin:0 0 4px;font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.45);">Código de torneo</p>
+      <p style="margin:0;font-family:monospace;font-size:15px;color:#c8aa6e;word-break:break-all;">${code}</p>
+    </div>
+    <p style="margin:0 0 24px;line-height:1.6;color:rgba(255,255,255,0.55);font-size:14px;">
+      En el cliente de LoL: <strong style="color:#fff;">Jugar → Torneos → Buscar por código</strong>.
+      Cada equipo juega junto en su propio lado, tal como se registró — si los lados se mezclan,
+      el resultado no se detecta solo. El sistema registra ganador y estadísticas automáticamente.
+    </p>
+    <a href="${tournamentUrl}" style="display:inline-block;padding:12px 24px;background:#e1242e;color:#fff;text-decoration:none;border-radius:10px;font-weight:700;font-size:14px;">
+      Ver mi partida
+    </a>
+  </div>
+</body>
+</html>`;
+
+  const text = `${greeting}: el enfrentamiento de ${teamName} vs ${opponentName} en ${tournamentName} ya tiene código.\n\nCódigo: ${code}\n${when ? `Horario: ${when}\n` : ''}\nEn LoL: Jugar → Torneos → Buscar por código. Cada equipo juega en su propio lado tal como se registró.\n\n${tournamentUrl}`;
+
+  try {
+    const transport = await ensureTransporter();
+    const info = await transport.sendMail({
+      from, to: toEmail, replyTo: process.env.SMTP_USER || undefined,
+      subject: `Codigo listo - ${teamName} vs ${opponentName} (${tournamentName})`,
+      text, html,
+    });
+    if (!process.env.SMTP_HOST) {
+      const preview = nodemailer.getTestMessageUrl(info) || undefined;
+      if (preview) console.log(`[mail] Match-code preview for ${toEmail}: ${preview}`);
+    } else {
+      console.log(`[mail] Match code sent to ${toEmail} (${teamName} vs ${opponentName})`);
+    }
+    return { sent: true };
+  } catch (err: any) {
+    console.error(`[mail] Failed match-code email to ${toEmail}:`, err.message);
+    return { sent: false };
+  }
+}
+
 // ── Password reset ────────────────────────────────────────────────────────────
 export async function sendPasswordResetEmail(params: { toEmail: string; toName?: string | null; resetUrl: string }): Promise<{ sent: boolean; previewUrl?: string }> {
   const { toEmail, toName, resetUrl } = params;

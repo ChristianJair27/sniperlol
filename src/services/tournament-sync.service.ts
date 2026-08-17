@@ -12,8 +12,12 @@ type BracketMatch = {
   gameId?: number; gameRegion?: string;
   team1Puuids?: string[]; team2Puuids?: string[];
   codeActivatedAt?: number;
-  games?: Array<{ gameId: number; gameRegion?: string; winner?: string | null }>;
+  games?: Array<{ gameId: number; gameRegion?: string; winner?: string | null; ambiguous?: boolean }>;
   seriesTo?: number;
+  scheduledAt?: string | null;
+  forfeit?: boolean;
+  /** Algún juego del código quedó sin ganador atribuible (lados mezclados). */
+  needsManualResult?: boolean;
 };
 
 type TournamentData = {
@@ -643,7 +647,16 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
         changed = true;
 
         const gameWinner = await resolveWinnerFromMatch(t, m, fetched.data);
-        t.bracket[i].games = [...(t.bracket[i].games || []), { gameId: g.gameId, gameRegion: fetched.platform, winner: gameWinner }];
+        t.bracket[i].games = [...(t.bracket[i].games || []), {
+          gameId: g.gameId, gameRegion: fetched.platform, winner: gameWinner,
+          // Juego real del enfrentamiento pero sin ganador atribuible (lados
+          // mezclados vs los rosters) → marcar para reporte manual visible.
+          ...(gameWinner ? {} : { ambiguous: true }),
+        }];
+        if (!gameWinner) {
+          t.bracket[i].needsManualResult = true;
+          console.warn(`[tournament-sync] ${t.id}/${m.id}: juego ${g.gameId} sin ganador atribuible (¿lados mezclados?) — requiere reporte manual`);
+        }
         t.bracket[i].gameId = g.gameId;           // último juego (compat con vista de stats)
         t.bracket[i].gameRegion = fetched.platform;
         detail.gameIdDetected = g.gameId;

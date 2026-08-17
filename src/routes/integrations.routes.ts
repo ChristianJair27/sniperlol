@@ -10,7 +10,7 @@
 //   gamertag; reenviar el mismo registro no duplica nada.
 import { Router } from 'express';
 import { pool } from '../db.js';
-import { getT } from './tournaments.routes.js';
+import { getT, findRosterConflicts, rosterConflictError } from './tournaments.routes.js';
 import { sendTournamentInvitationEmail, isDeliverableEmail, fixCommonEmailTypos } from '../services/mail.service.js';
 
 // Normaliza + auto-corrige typos inequívocos de dominio (.con→.com, gmial→gmail...).
@@ -180,6 +180,10 @@ router.post('/lqc/register', async (req, res) => {
       );
       if (Number(regs[0].c) >= (t.maxParticipants || 32)) return bad(res, 409, 'Torneo lleno');
 
+      // P0-integridad: este jugador no puede estar ya en OTRO equipo del torneo.
+      const newTeamConflicts = await findRosterConflicts(tournamentId, [{ riotId: gamertag, puuid: (player as any).puuid }]);
+      if (newTeamConflicts.length) return bad(res, 409, rosterConflictError(newTeamConflicts));
+
       await pool.query(
         `INSERT INTO tournament_registrations (tournament_id, team_name, captain_riot_id, players, contact)
          VALUES (?, ?, ?, ?, ?)`,
@@ -208,6 +212,9 @@ router.post('/lqc/register', async (req, res) => {
       emailChanged = Boolean(newEmail) && newEmail !== prevEmail;
     } else {
       if (players.length >= 7) return bad(res, 409, `Equipo ${teamName} ya tiene 7 jugadores (5 titulares + 2 suplentes)`);
+      // P0-integridad: alta nueva → verificar que no esté en otro equipo.
+      const conflicts = await findRosterConflicts(tournamentId, [{ riotId: gamertag, puuid: (player as any).puuid }], Number(reg.id));
+      if (conflicts.length) return bad(res, 409, rosterConflictError(conflicts));
       players.push(player);
     }
     await pool.query('UPDATE tournament_registrations SET players=? WHERE id=?', [JSON.stringify(players), reg.id]);
@@ -366,6 +373,19 @@ router.post('/lqc/register-team', async (req, res) => {
     const players = await Promise.all(list.map(buildPlayerFrom));
     const captainRiot = captainName || players[0]?.riotId || players[0]?.name || '';
     const contact = [captainName, captainPhone, players[0]?.email].filter(Boolean).join(' · ');
+
+    // P0-integridad: ningún jugador puede estar ya en OTRO equipo del torneo
+    // (el propio equipo se excluye: este endpoint reemplaza su roster).
+    const [[ownReg]] = await pool.query<any[]>(
+      'SELECT id FROM tournament_registrations WHERE tournament_id=? AND LOWER(team_name)=LOWER(?)',
+      [tournamentId, teamName]
+    );
+    const conflicts = await findRosterConflicts(
+      tournamentId,
+      players.filter((p: any) => p.riotId || p.puuid),
+      ownReg ? Number(ownReg.id) : undefined
+    );
+    if (conflicts.length) return bad(res, 409, rosterConflictError(conflicts));
 
     const conn = await pool.getConnection();
     let action = 'team_updated';
