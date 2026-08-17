@@ -11,6 +11,7 @@ import { startTournamentBackgroundSync, syncTournamentFull, recoverGameFromRoste
 // Solo helpers puros (sin ciclo: el scheduler importa estas rutas dinámicamente).
 import { todayStartFor } from '../services/tournament-scheduler.service.js';
 import { sendTournamentInvitationEmail, sendMatchCodeEmail, isDeliverableEmail } from '../services/mail.service.js';
+import { isValidDiscordWebhook, notifyDiscordCodeReady, notifyDiscordSeriesDone, notifyDiscordChampion } from '../services/discord.service.js';
 import { pool } from '../db.js';
 
 const router = Router();
@@ -122,6 +123,8 @@ interface TournamentData {
   scheduleId?: number;
   // Privado: invisible al público; inscripción solo con invitación (correo).
   isPrivate?: boolean;
+  // Webhook de Discord del organizador (código listo / resultado / campeón).
+  discordWebhookUrl?: string;
 }
 export interface ArenaLadder {
   processed: string[]; // riot match ids ya puntuados
@@ -240,6 +243,8 @@ async function initTables() {
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS ladder JSON DEFAULT NULL`,
     // Torneos diarios: plantilla que generó este torneo (NULL = manual).
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS schedule_id INT DEFAULT NULL`,
+    // Webhook de Discord del torneo (avisos de código/resultado/campeón).
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS discord_webhook_url VARCHAR(300) DEFAULT NULL`,
     // Plantillas de torneos diarios: el scheduler crea una instancia por día
     // a la hora configurada, abre inscripciones y auto-inicia.
     `CREATE TABLE IF NOT EXISTS tournament_schedules (
@@ -393,6 +398,7 @@ function rowToTournament(row: any): TournamentData {
     ladder:    parseJson(row.ladder) || undefined,
     scheduleId: row.schedule_id ? Number(row.schedule_id) : undefined,
     isPrivate: !!row.is_private,
+    discordWebhookUrl: row.discord_webhook_url || undefined,
   };
 }
 
@@ -509,6 +515,8 @@ function serialize(t: TournamentData, access: ViewerAccess = 'public') {
     ladder: t.ladder,
     scheduleId: t.scheduleId,
     isPrivate: !!t.isPrivate,
+    // El webhook es del organizador — no se expone al público.
+    discordWebhookUrl: access === 'owner' ? t.discordWebhookUrl : undefined,
     viewerAccess: access,
   };
 }
@@ -1119,8 +1127,13 @@ export async function assignCodeToMatch(t: TournamentData, mi: number): Promise<
   match.matchStatus = code ? 'active' : 'ready';
   if (code) {
     match.codeActivatedAt = Date.now();
-    // P0: avisar a ambos equipos por correo (best-effort, nunca bloquea).
+    // P0/P1: avisar a ambos equipos (correo) y al Discord del torneo.
     notifyMatchCode(t, match).catch(e => console.error('[assignCode] notify falló:', e.message));
+    notifyDiscordCodeReady(t.discordWebhookUrl, {
+      tournamentId: t.id, tournamentName: t.name,
+      team1: match.team1!, team2: match.team2!,
+      roundLabel: `Ronda ${match.round}`, scheduledAt: match.scheduledAt ?? null,
+    });
   }
   return code;
 }
@@ -1208,6 +1221,21 @@ async function applyResult(
   } else {
     const maxRound = Math.max(...t.bracket!.map(m => m.round));
     if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') t.phase = 'complete';
+  }
+
+  // Discord: serie terminada (+ campeón si el torneo cerró aquí).
+  const done = t.bracket![mi];
+  notifyDiscordSeriesDone(t.discordWebhookUrl, {
+    tournamentId: t.id, tournamentName: t.name,
+    winner, loser: loser || '—',
+    score1: done.score1 ?? 0, score2: done.score2 ?? 0,
+    forfeit: !!done.forfeit,
+  });
+  if (t.phase === 'complete') {
+    notifyDiscordChampion(t.discordWebhookUrl, {
+      tournamentId: t.id, tournamentName: t.name,
+      champion: t.standings?.[0]?.team ?? winner,
+    });
   }
 }
 
@@ -2157,8 +2185,14 @@ router.patch('/:id/registrations/:regId', requireAuth, async (req: any, res) => 
     if (players.length < rosterBounds.min || players.length > rosterBounds.max) {
       return res.status(400).json({ error: rosterBounds.hint });
     }
-    if (t.phase !== 'registration')
-      return res.status(400).json({ error: 'Solo se puede editar el equipo mientras las inscripciones están abiertas' });
+    // P1: sustitución de emergencia — el ORGANIZADOR puede editar el roster
+    // con el torneo activo (capitanes solo durante inscripciones). Más abajo
+    // se regeneran los códigos pendientes del equipo (allowlist nuevo).
+    const emergencyEdit = t.phase !== 'registration';
+    if (emergencyEdit && !isOwner(req, t))
+      return res.status(400).json({ error: 'Solo se puede editar el equipo mientras las inscripciones están abiertas (para cambios de emergencia contacta al organizador)' });
+    if (emergencyEdit && t.phase === 'complete')
+      return res.status(400).json({ error: 'El torneo ya terminó' });
 
     const [[reg]] = await pool.query<any[]>(
       'SELECT * FROM tournament_registrations WHERE tournament_id=? AND id=?',
@@ -2286,10 +2320,34 @@ router.patch('/:id/registrations/:regId', requireAuth, async (req: any, res) => 
       [JSON.stringify(normalizedPlayers), reg.id]
     );
 
+    // P1: sustitución con torneo activo → los códigos pendientes del equipo
+    // llevan el allowlist viejo (el suplente no podría entrar al lobby).
+    // Regenerar código de cada partido no completado del equipo; los equipos
+    // reciben el correo con el código nuevo automáticamente.
+    let codesRegenerated = 0;
+    if (emergencyEdit && t.bracket) {
+      // Refrescar caché de PUUIDs del equipo antes de regenerar
+      for (let i = 0; i < t.bracket.length; i++) {
+        const m = t.bracket[i];
+        if (m.matchStatus === 'complete') continue;
+        if (m.team1 !== reg.team_name && m.team2 !== reg.team_name) continue;
+        if ((m.games?.length || 0) > 0) continue; // serie ya empezó — no tocar su código
+        try {
+          m.code = null; m.codeActivatedAt = undefined;
+          await assignCodeToMatch(t, i);
+          codesRegenerated++;
+        } catch (e: any) {
+          console.error(`[roster-sub] regen código ${m.id} falló:`, e.message);
+        }
+      }
+      if (codesRegenerated) await saveT(t);
+    }
+
     res.json({
       success: true,
       players: normalizedPlayers,
       invitationsSent: invitationsSent.length,
+      ...(emergencyEdit ? { emergencyEdit: true, codesRegenerated } : {}),
       message: invitationsSent.length
         ? `Equipo actualizado. Invitaciones enviadas a ${invitationsSent.length} jugador(es).`
         : 'Equipo actualizado.',
@@ -2563,6 +2621,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         registrationUrl: t.registrationUrl ?? null, rulesUrl: t.rulesUrl ?? null,
         teamSize: t.teamSize || 5, gameMap: t.gameMap || 'SR',
         isPrivate: !!t.isPrivate,
+        discordWebhookUrl: access === 'owner' ? (t.discordWebhookUrl ?? null) : undefined,
       },
       bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
     });
@@ -2762,6 +2821,49 @@ router.get('/debug-lobby/:code', requireAuth, async (req: any, res) => {
   try {
     const events = await getLobbyEvents(req.params.code);
     res.json(events);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── P1: estado del lobby de Riot en vivo ─────────────────────────────────────
+// GET /:id/matches/:matchId/lobby — organizador/participantes: cuántos ya
+// entraron al lobby del código y si el draft/juego arrancó. Sala de espera
+// estilo referee sin preguntar por Discord "¿ya están todos?".
+router.get('/:id/matches/:matchId/lobby', requireAuth, async (req: any, res) => {
+  const { id, matchId } = req.params;
+  try {
+    const t = await getT(id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    const access = await getViewerAccess(t, req.auth);
+    if (access === 'public') return res.status(403).json({ error: 'Solo organizador o participantes' });
+    const match = (t.bracket || []).find(m => m.id === matchId);
+    if (!match) return res.status(404).json({ error: 'Partido no encontrado' });
+    if (!match.code) return res.json({ hasCode: false, joined: 0, expected: (t.teamSize || 5) * 2 });
+
+    const ck = `lobby:${match.code}`;
+    const cached = lcGet(ck);
+    if (cached !== undefined) return res.json(cached);
+
+    const events = await getLobbyEvents(match.code).catch(() => null);
+    const list: any[] = events?.eventList ?? [];
+    const joined = new Set<string>();
+    let draftStarted = false, gameStarted = false;
+    for (const e of list) {
+      const type = String(e.eventType || '');
+      if (type === 'PlayerJoinedGameEvent' && e.summonerId) joined.add(String(e.summonerId));
+      else if (type === 'PlayerQuitGameEvent' && e.summonerId) joined.delete(String(e.summonerId));
+      else if (type === 'ChampSelectStartedEvent') draftStarted = true;
+      else if (type === 'GameAllocationStartedEvent' || type === 'GameAllocatedToLsmEvent') gameStarted = true;
+    }
+    const out = {
+      hasCode: true,
+      joined: joined.size,
+      expected: (t.teamSize || 5) * 2,
+      draftStarted,
+      gameStarted,
+      events: list.length,
+    };
+    lcSet(ck, out, 20_000);
+    res.json(out);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3391,6 +3493,15 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
     if (req.body.isPrivate !== undefined) {
       await pool.query('UPDATE tournaments SET is_private=? WHERE id=?', [req.body.isPrivate ? 1 : 0, t.id]);
       t.isPrivate = !!req.body.isPrivate;
+    }
+    // Webhook de Discord (avisos de código/resultado/campeón). '' o null lo quita.
+    if (req.body.discordWebhookUrl !== undefined) {
+      const url = String(req.body.discordWebhookUrl || '').trim();
+      if (url && !isValidDiscordWebhook(url)) {
+        return res.status(400).json({ error: 'URL de webhook inválida (debe ser https://discord.com/api/webhooks/…)' });
+      }
+      await pool.query('UPDATE tournaments SET discord_webhook_url=? WHERE id=?', [url || null, t.id]);
+      t.discordWebhookUrl = url || undefined;
     }
     res.json({ success: true, tournament: serialize(t) });
   } catch (err: any) { res.status(500).json({ error: err.message }); }

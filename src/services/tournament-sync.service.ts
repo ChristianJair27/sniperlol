@@ -2,6 +2,7 @@
 import { pool } from '../db.js';
 import { getGamesByCode } from './riot-tournament.service.js';
 import { getMatchById, getAccountByRiotId, getMatchIdsByPUUID } from './riot.js';
+import { notifyDiscordSeriesDone, notifyDiscordChampion } from './discord.service.js';
 
 type BracketMatch = {
   id: string; round: number; matchNumber: number;
@@ -48,6 +49,7 @@ type TournamentData = {
     processed: string[];
     teams: Record<string, { games: Array<{ matchId: string; placement: number; at: number }>; points: number }>;
   };
+  discordWebhookUrl?: string;
 };
 
 function parseJson(v: unknown) {
@@ -93,6 +95,7 @@ async function getT(id: string): Promise<TournamentData | null> {
     pickType: row.pick_type || undefined,
     endDate: row.end_date || undefined,
     ladder: parseJson(row.ladder) || undefined,
+    discordWebhookUrl: row.discord_webhook_url || undefined,
   };
 }
 
@@ -588,6 +591,11 @@ async function syncArenaLadder(t: TournamentData): Promise<{ synced: number; det
     t.phase = 'complete';
     changed = true;
     console.log(`[arena-ladder] ${t.id}: ventana cerrada → campeón: ${rows[0]?.team ?? '—'}`);
+    if (rows[0]?.team) {
+      notifyDiscordChampion(t.discordWebhookUrl, {
+        tournamentId: t.id, tournamentName: t.name, champion: rows[0].team,
+      });
+    }
   }
 
   if (changed) {
@@ -729,6 +737,11 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
             `[tournament-sync] ${t.id}: ronda final ${maxRound}/${t.swissRounds} completa → torneo cerrado. ` +
             `Campeón: ${t.standings?.[0]?.team ?? '—'}`
           );
+          if (t.standings?.[0]?.team) {
+            notifyDiscordChampion(t.discordWebhookUrl, {
+              tournamentId: t.id, tournamentName: t.name, champion: t.standings[0].team,
+            });
+          }
         } else {
           // Import dinámico: evita el ciclo routes ↔ service en el top-level.
           const routes = await import('../routes/tournaments.routes.js');
@@ -799,6 +812,21 @@ async function applyResultInPlace(t: TournamentData, mi: number, winner: string)
     if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') {
       t.phase = 'complete';
     }
+  }
+
+  // Discord: serie detectada automáticamente (+ campeón si cerró el torneo).
+  const done = t.bracket![mi];
+  notifyDiscordSeriesDone(t.discordWebhookUrl, {
+    tournamentId: t.id, tournamentName: t.name,
+    winner, loser: loser || '—',
+    score1: done.score1 ?? 0, score2: done.score2 ?? 0,
+    forfeit: !!done.forfeit,
+  });
+  if (t.phase === 'complete') {
+    notifyDiscordChampion(t.discordWebhookUrl, {
+      tournamentId: t.id, tournamentName: t.name,
+      champion: t.standings?.[0]?.team ?? winner,
+    });
   }
 }
 
