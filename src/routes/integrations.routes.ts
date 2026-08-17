@@ -137,7 +137,12 @@ router.post('/lqc/register', async (req, res) => {
     try {
       const { getAccountByRiotId } = await import('../services/riot.js');
       const acc: any = await getAccountByRiotId(ridMatch[1].trim(), ridMatch[2].trim(), { platformHint: 'la1' });
-      if (acc?.puuid) (player as any).puuid = acc.puuid;
+      if (acc?.puuid) {
+        (player as any).puuid = acc.puuid;
+        // Cuenta real confirmada contra Riot → verificado desde el registro.
+        // "pending" queda solo para gamertags que no resolvieron.
+        player.inviteStatus = 'accepted' as any;
+      }
     } catch { /* Riot caído o ID inexistente: el registro entra igual */ }
   }
 
@@ -327,7 +332,11 @@ async function buildPlayerFrom(rec: any) {
     try {
       const { getAccountByRiotId } = await import('../services/riot.js');
       const acc: any = await getAccountByRiotId(m[1].trim(), m[2].trim(), { platformHint: 'la1' });
-      if (acc?.puuid) p.puuid = acc.puuid;
+      if (acc?.puuid) {
+        p.puuid = acc.puuid;
+        // Cuenta confirmada contra Riot → verificado desde el registro.
+        p.inviteStatus = 'accepted';
+      }
     } catch { /* best-effort */ }
   }
   return p;
