@@ -2191,7 +2191,10 @@ router.post('/:id/checkin', requireAuth, async (req: any, res) => {
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error:'Torneo no encontrado' });
-    if (t.phase!=='checkin') return res.status(400).json({ error:'Check-in no activo' });
+    // Check-in disponible desde las inscripciones: los equipos confirman
+    // asistencia en cuanto se registran, sin esperar a que se cierre el cupo.
+    if (t.phase!=='registration' && t.phase!=='checkin')
+      return res.status(400).json({ error:'Check-in no activo (el torneo ya inició o terminó)' });
 
     const [[reg]] = await pool.query<any[]>(
       'SELECT * FROM tournament_registrations WHERE tournament_id=? AND LOWER(team_name)=LOWER(?)',
@@ -2200,12 +2203,20 @@ router.post('/:id/checkin', requireAuth, async (req: any, res) => {
     if (!reg) return res.status(404).json({ error:'Equipo no encontrado' });
     // Autorización por membresía real (no por captainRiotId del body, que el
     // cliente puede omitir): quien registró al equipo, un jugador del roster
-    // (invitación aceptada) o el organizador/admin del torneo.
+    // (por userId O por cuenta de Riot vinculada — los equipos importados del
+    // formulario de la liga no traen registeredBy/userId) o el organizador.
     const uid = req.auth?.userId;
     const rosterPlayers: RosterPlayer[] = typeof reg.players === 'string' ? JSON.parse(reg.players) : (reg.players ?? []);
-    const isMember = reg.registered_by === uid || rosterPlayers.some(p => p.userId === uid);
+    const memberLinked = await getLinkedRiotAccount(uid);
+    const mRiot = memberLinked?.riotId?.toLowerCase();
+    const mPuuid = memberLinked?.puuid;
+    const isMember = reg.registered_by === uid
+      || rosterPlayers.some(p => p.userId === uid
+        || (mPuuid && p.puuid === mPuuid)
+        || (mRiot && p.riotId?.toLowerCase() === mRiot))
+      || (mRiot && String(reg.captain_riot_id || '').toLowerCase() === mRiot);
     if (!isMember && !isOwner(req, t))
-      return res.status(403).json({ error:'Solo un miembro del equipo puede hacer check-in' });
+      return res.status(403).json({ error:'Solo un miembro del equipo puede hacer check-in (vincula tu cuenta de LoL en tu perfil)' });
     if (captainRiotId && reg.captain_riot_id!==captainRiotId)
       return res.status(403).json({ error:'Riot ID del capitán no coincide' });
     if (reg.checked_in) return res.status(400).json({ error:'Ya hizo check-in' });
@@ -2371,7 +2382,21 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
 
     let myTeam: any = null;
     if (req.auth?.userId) {
-      const reg = regs.find(r => (r as any).registeredBy === req.auth.userId);
+      // "Mi equipo" no es solo quien lo registró: también cuenta estar en el
+      // roster por Riot ID/PUUID vinculado o por userId (equipos importados
+      // del formulario de la liga no tienen registeredBy y nadie veía su
+      // tarjeta de check-in).
+      const linked = await getLinkedRiotAccount(req.auth.userId);
+      const linkedRiot = linked?.riotId?.toLowerCase();
+      const linkedPuuid = linked?.puuid;
+      const reg = regs.find(r =>
+        (r as any).registeredBy === req.auth.userId
+        || (linkedRiot && r.captainRiotId?.toLowerCase() === linkedRiot)
+        || (r.players || []).some((p: any) =>
+          p.userId === req.auth.userId
+          || (linkedPuuid && p.puuid === linkedPuuid)
+          || (linkedRiot && p.riotId?.toLowerCase() === linkedRiot))
+      );
       if (reg) myTeam = {
         tag: reg.teamName, checkinDeadline: t.checkinDeadline ?? null, checkedIn: !!reg.checkedIn,
         roster: (reg.players || []).slice(0, rosterSizeBounds(t).max).map((p: any) => ({ playerName: p.name || p.riotId, role: null, mainChampionId: null, rank: null })),
