@@ -52,6 +52,9 @@ interface BracketMatch {
   scheduledAt?: string | null;
   // Serie cerrada por W.O. (no se presentó el rival) — sin juegos de Riot.
   forfeit?: boolean;
+  // Fase del partido: los matches de playoffs avanzan como eliminación aunque
+  // el torneo sea suizo, y la final de playoffs corona al campeón.
+  stage?: 'playoffs';
 }
 interface RosterPlayer {
   name: string;
@@ -125,6 +128,9 @@ interface TournamentData {
   isPrivate?: boolean;
   // Webhook de Discord del organizador (código listo / resultado / campeón).
   discordWebhookUrl?: string;
+  // Suizo → playoffs: top N de la tabla pasa a eliminación directa al cerrar
+  // la fase suiza (0/undefined = suizo puro, el líder es campeón).
+  playoffsSize?: number;
 }
 export interface ArenaLadder {
   processed: string[]; // riot match ids ya puntuados
@@ -245,6 +251,8 @@ async function initTables() {
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS schedule_id INT DEFAULT NULL`,
     // Webhook de Discord del torneo (avisos de código/resultado/campeón).
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS discord_webhook_url VARCHAR(300) DEFAULT NULL`,
+    // Suizo → playoffs: cuántos clasifican al bracket final (0 = suizo puro).
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS playoffs_size INT NOT NULL DEFAULT 0`,
     // Plantillas de torneos diarios: el scheduler crea una instancia por día
     // a la hora configurada, abre inscripciones y auto-inicia.
     `CREATE TABLE IF NOT EXISTS tournament_schedules (
@@ -399,6 +407,7 @@ function rowToTournament(row: any): TournamentData {
     scheduleId: row.schedule_id ? Number(row.schedule_id) : undefined,
     isPrivate: !!row.is_private,
     discordWebhookUrl: row.discord_webhook_url || undefined,
+    playoffsSize: Number(row.playoffs_size) || 0,
   };
 }
 
@@ -517,6 +526,7 @@ function serialize(t: TournamentData, access: ViewerAccess = 'public') {
     isPrivate: !!t.isPrivate,
     // El webhook es del organizador — no se expone al público.
     discordWebhookUrl: access === 'owner' ? t.discordWebhookUrl : undefined,
+    playoffsSize: t.playoffsSize || 0,
     viewerAccess: access,
   };
 }
@@ -894,9 +904,10 @@ export function pairSwissRound(t: TournamentData, round: number): BracketMatch[]
     while (p2.length >= 2) result.push([p2.shift()!, p2.shift()!]);
   }
 
-  // La última ronda planeada es "la final" del suizo → usa finalSeriesTo
-  // (p.ej. todo Bo3 y la ronda de cierre Bo5).
-  const isFinalRound = t.swissRounds != null && round >= t.swissRounds;
+  // La última ronda planeada es "la final" del suizo → usa finalSeriesTo…
+  // SALVO que haya playoffs configurados: entonces la Bo grande es para la
+  // gran final del bracket, no para la última ronda suiza.
+  const isFinalRound = t.swissRounds != null && round >= t.swissRounds && !(t.playoffsSize && t.playoffsSize >= 2);
   const roundSeriesTo = isFinalRound ? (t.finalSeriesTo || t.seriesTo || 1) : (t.seriesTo || 1);
 
   const matches: BracketMatch[] = result.map(([t1, t2], i) => ({
@@ -909,6 +920,53 @@ export function pairSwissRound(t: TournamentData, round: number): BracketMatch[]
     const rest = teams.filter(x => !result.some(([a, b]) => a === x || b === x));
     if (rest.length === 1) {
       matches.push({ id: `r${round}m${matches.length + 1}`, round, matchNumber: matches.length + 1, team1: rest[0], team2: 'BYE', winner: rest[0], code: null, matchStatus: 'complete', seriesTo: roundSeriesTo });
+    }
+  }
+  return matches;
+}
+
+// ── Suizo → playoffs (P1.8) ──────────────────────────────────────────────────
+// Cuántos clasifican realmente: potencia de 2 ≤ min(configurado, equipos).
+export function effectivePlayoffsSize(t: TournamentData): number {
+  const want = Number(t.playoffsSize) || 0;
+  if (want < 2) return 0;
+  const teams = t.standings?.length || 0;
+  const cap = Math.min(want, teams);
+  if (cap < 2) return 0;
+  let p = 2;
+  while (p * 2 <= cap) p *= 2;
+  return p;
+}
+
+// Bracket de playoffs sembrado por la tabla del suizo (seeds[0] = 1º).
+// Pareo clásico: el 1 y el 2 solo pueden cruzarse en la gran final.
+// Las rondas continúan la numeración del suizo (startRound = swissRounds + 1)
+// para que el avance r{round+1}m{ceil(n/2)} funcione igual que en eliminación.
+export function generatePlayoffs(
+  seeds: string[], startRound: number, seriesTo: number, finalSeriesTo: number
+): BracketMatch[] {
+  const pairs: Array<[number, number]> =
+    seeds.length >= 8 ? [[1, 8], [4, 5], [2, 7], [3, 6]]
+    : seeds.length >= 4 ? [[1, 4], [2, 3]]
+    : [[1, 2]];
+  const matches: BracketMatch[] = [];
+  let round = startRound;
+  const firstIsFinal = pairs.length === 1;
+  pairs.forEach(([a, b], i) => matches.push({
+    id: `r${round}m${i + 1}`, round, matchNumber: i + 1,
+    team1: seeds[a - 1], team2: seeds[b - 1],
+    winner: null, code: null, matchStatus: 'ready',
+    stage: 'playoffs', seriesTo: firstIsFinal ? finalSeriesTo : seriesTo,
+  }));
+  let n = pairs.length;
+  while (n > 1) {
+    round++; n = n / 2;
+    for (let i = 1; i <= n; i++) {
+      matches.push({
+        id: `r${round}m${i}`, round, matchNumber: i,
+        team1: null, team2: null, winner: null, code: null, matchStatus: 'pending',
+        stage: 'playoffs', seriesTo: n === 1 ? finalSeriesTo : seriesTo,
+      });
     }
   }
   return matches;
@@ -1187,9 +1245,9 @@ async function applyResult(
     score2: score2 !== undefined ? score2 : match.score2,
   };
 
-  // Advance winner to next round — solo en eliminación directa; en round robin
-  // no hay avance (todos juegan contra todos, standings deciden).
-  if ((t.bracketType || 'single_elim') === 'single_elim') {
+  // Advance winner to next round — eliminación directa Y matches de playoffs
+  // (el suizo con playoffs avanza igual que un bracket normal en esa fase).
+  if ((t.bracketType || 'single_elim') === 'single_elim' || match.stage === 'playoffs') {
     const nextId = `r${match.round + 1}m${Math.ceil(match.matchNumber / 2)}`;
     const ni = t.bracket!.findIndex(m => m.id === nextId);
     if (ni !== -1) {
@@ -1216,8 +1274,12 @@ async function applyResult(
   if (bt === 'round_robin') {
     if (t.bracket!.every(m => m.matchStatus === 'complete')) t.phase = 'complete';
   } else if (bt === 'swiss') {
-    // Suizo no se auto-completa: el organizador decide cuántas rondas
-    // (POST /:id/next-round) y cierra con POST /:id/complete.
+    // Suizo puro no se auto-completa aquí (el piloto/organizador cierran);
+    // pero la GRAN FINAL de playoffs sí corona al campeón.
+    if (match.stage === 'playoffs') {
+      const maxPlayoffRound = Math.max(...t.bracket!.filter(m => m.stage === 'playoffs').map(m => m.round));
+      if (match.round === maxPlayoffRound) t.phase = 'complete';
+    }
   } else {
     const maxRound = Math.max(...t.bracket!.map(m => m.round));
     if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') t.phase = 'complete';
@@ -1232,9 +1294,11 @@ async function applyResult(
     forfeit: !!done.forfeit,
   });
   if (t.phase === 'complete') {
+    // Con playoffs el campeón es el ganador de la gran final, no el líder de tabla.
+    const champion = (done.stage === 'playoffs' || bt === 'single_elim')
+      ? winner : (t.standings?.[0]?.team ?? winner);
     notifyDiscordChampion(t.discordWebhookUrl, {
-      tournamentId: t.id, tournamentName: t.name,
-      champion: t.standings?.[0]?.team ?? winner,
+      tournamentId: t.id, tournamentName: t.name, champion,
     });
   }
 }
@@ -2622,6 +2686,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         teamSize: t.teamSize || 5, gameMap: t.gameMap || 'SR',
         isPrivate: !!t.isPrivate,
         discordWebhookUrl: access === 'owner' ? (t.discordWebhookUrl ?? null) : undefined,
+        playoffsSize: t.playoffsSize || 0,
       },
       bracket: rounds, standings, liveMatch, myTeam, schedule, activityByDay, version, viewerAccess: access,
     });
@@ -2975,7 +3040,7 @@ function revertCompletedMatch(t: TournamentData, mi: number): string | null {
   if (!winner) { match.matchStatus = match.code ? 'active' : 'ready'; return null; }
   const loser = winner === match.team1 ? match.team2 : match.team1;
 
-  if ((t.bracketType || 'single_elim') === 'single_elim') {
+  if ((t.bracketType || 'single_elim') === 'single_elim' || match.stage === 'playoffs') {
     const nextId = `r${match.round + 1}m${Math.ceil(match.matchNumber / 2)}`;
     const ni = t.bracket!.findIndex(m => m.id === nextId);
     if (ni !== -1) {
@@ -3163,6 +3228,9 @@ router.post('/:id/next-round', requireAuth, async (req: any, res) => {
     if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el creador puede hacer esto' });
     if (t.bracketType !== 'swiss') return res.status(400).json({ error: 'Solo para torneos suizos' });
     if (t.phase !== 'active' || !t.bracket?.length) return res.status(400).json({ error: 'Torneo no activo' });
+    if (t.bracket.some(m => m.stage === 'playoffs')) {
+      return res.status(400).json({ error: 'La fase suiza terminó — los playoffs avanzan solos con cada resultado' });
+    }
 
     const maxRound = Math.max(...t.bracket.map(m => m.round));
     const pending = t.bracket.filter(m => m.round === maxRound && m.matchStatus !== 'complete');
@@ -3192,9 +3260,20 @@ router.post('/:id/complete', requireAuth, async (req: any, res) => {
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
     if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el creador puede hacer esto' });
     if (t.phase !== 'active') return res.status(400).json({ error: 'Torneo no activo' });
+    // Con playoffs, el campeón es el ganador de la gran final (si ya se jugó).
+    const playoffMatches = (t.bracket || []).filter(m => m.stage === 'playoffs');
+    let champion: string | null = t.standings?.[0]?.team ?? null;
+    if (playoffMatches.length) {
+      const maxR = Math.max(...playoffMatches.map(m => m.round));
+      const final = playoffMatches.find(m => m.round === maxR);
+      if (final && !final.winner) {
+        return res.status(409).json({ error: 'La gran final de playoffs aún no se juega — ciérrala primero o usa el reporte manual del partido.' });
+      }
+      champion = final?.winner ?? champion;
+    }
     t.phase = 'complete';
     await saveT(t);
-    res.json({ success: true, champion: t.standings?.[0]?.team ?? null });
+    res.json({ success: true, champion });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3437,6 +3516,16 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
     }
     const { bracketType, seriesTo, finalSeriesTo, swissRounds } = req.body;
     const locked = t.phase === 'active' || t.phase === 'complete';
+    // Playoffs del suizo: ajustable incluso activo, MIENTRAS no se hayan
+    // generado ya (después sería reescribir un bracket en juego).
+    if (req.body.playoffsSize !== undefined) {
+      const ps = Number(req.body.playoffsSize);
+      if (![0, 2, 4, 8].includes(ps)) return res.status(400).json({ error: 'playoffsSize: 0 (suizo puro), 2, 4 u 8' });
+      if (t.bracket?.some(m => m.stage === 'playoffs'))
+        return res.status(400).json({ error: 'Los playoffs ya se generaron — no se puede cambiar' });
+      await pool.query('UPDATE tournaments SET playoffs_size=? WHERE id=?', [ps, t.id]);
+      t.playoffsSize = ps;
+    }
     // Rondas suizas planeadas: se puede ajustar incluso con el torneo activo
     // (es el interruptor del avance automático, no cambia partidos ya jugados).
     if (swissRounds !== undefined) {

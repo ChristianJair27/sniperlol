@@ -19,6 +19,8 @@ type BracketMatch = {
   forfeit?: boolean;
   /** Algún juego del código quedó sin ganador atribuible (lados mezclados). */
   needsManualResult?: boolean;
+  /** Matches de playoffs (suizo multi-fase): avanzan como eliminación. */
+  stage?: 'playoffs';
 };
 
 type TournamentData = {
@@ -50,6 +52,8 @@ type TournamentData = {
     teams: Record<string, { games: Array<{ matchId: string; placement: number; at: number }>; points: number }>;
   };
   discordWebhookUrl?: string;
+  /** Suizo → playoffs: top N clasifican (0 = suizo puro). */
+  playoffsSize?: number;
 };
 
 function parseJson(v: unknown) {
@@ -96,6 +100,7 @@ async function getT(id: string): Promise<TournamentData | null> {
     endDate: row.end_date || undefined,
     ladder: parseJson(row.ladder) || undefined,
     discordWebhookUrl: row.discord_webhook_url || undefined,
+    playoffsSize: Number(row.playoffs_size) || 0,
   };
 }
 
@@ -722,7 +727,10 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
   // Al completarse todos los partidos de la ronda vigente: genera la siguiente
   // con códigos, o cierra el torneo si era la última planeada. El organizador
   // conserva el control manual (next-round / complete) en todo momento.
-  if (t.bracketType === 'swiss' && t.phase === 'active' && t.swissRounds && t.bracket.length) {
+  // Con playoffs ya generados, el suizo no parea más: el avance lo llevan
+  // applyResultInPlace (árbol) + el bloque de auto-códigos.
+  const inPlayoffs = t.bracket.some(m => m.stage === 'playoffs');
+  if (t.bracketType === 'swiss' && t.phase === 'active' && t.swissRounds && t.bracket.length && !inPlayoffs) {
     try {
       const maxRound = Math.max(...t.bracket.map(m => m.round));
       const roundDone = t.bracket
@@ -730,21 +738,43 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
         .every(m => m.matchStatus === 'complete');
 
       if (roundDone) {
+        // Import dinámico: evita el ciclo routes ↔ service en el top-level.
+        const routes = await import('../routes/tournaments.routes.js');
         if (maxRound >= t.swissRounds) {
-          t.phase = 'complete';
-          changed = true;
-          console.log(
-            `[tournament-sync] ${t.id}: ronda final ${maxRound}/${t.swissRounds} completa → torneo cerrado. ` +
-            `Campeón: ${t.standings?.[0]?.team ?? '—'}`
-          );
-          if (t.standings?.[0]?.team) {
-            notifyDiscordChampion(t.discordWebhookUrl, {
-              tournamentId: t.id, tournamentName: t.name, champion: t.standings[0].team,
-            });
+          // Fase suiza completa → ¿playoffs o cierre?
+          const psize = routes.effectivePlayoffsSize(t as any);
+          if (psize >= 2 && t.standings?.length) {
+            const seeds = t.standings.slice(0, psize).map(s => s.team);
+            const playoffMatches = routes.generatePlayoffs(
+              seeds, maxRound + 1, t.seriesTo || 1, t.finalSeriesTo || t.seriesTo || 1
+            );
+            t.bracket = [...t.bracket, ...(playoffMatches as any)];
+            for (let i = 0; i < t.bracket.length; i++) {
+              const m = t.bracket[i];
+              if (m.stage === 'playoffs' && m.matchStatus === 'ready' && !m.code) {
+                try { await routes.assignCodeToMatch(t as any, i); }
+                catch (e: any) { console.error(`[tournament-sync] código playoffs ${m.id} falló:`, e.message); }
+              }
+            }
+            changed = true;
+            console.log(
+              `[tournament-sync] ${t.id}: fase suiza completa → PLAYOFFS top ${psize} generados ` +
+              `(seeds: ${seeds.join(' · ')})`
+            );
+          } else {
+            t.phase = 'complete';
+            changed = true;
+            console.log(
+              `[tournament-sync] ${t.id}: ronda final ${maxRound}/${t.swissRounds} completa → torneo cerrado. ` +
+              `Campeón: ${t.standings?.[0]?.team ?? '—'}`
+            );
+            if (t.standings?.[0]?.team) {
+              notifyDiscordChampion(t.discordWebhookUrl, {
+                tournamentId: t.id, tournamentName: t.name, champion: t.standings[0].team,
+              });
+            }
           }
         } else {
-          // Import dinámico: evita el ciclo routes ↔ service en el top-level.
-          const routes = await import('../routes/tournaments.routes.js');
           const newMatches = routes.pairSwissRound(t as any, maxRound + 1);
           if (newMatches.length) {
             t.bracket = [...t.bracket, ...(newMatches as any)];
@@ -782,8 +812,9 @@ async function applyResultInPlace(t: TournamentData, mi: number, winner: string)
   t.bracket![mi] = { ...match, winner, matchStatus: 'complete' };
   const bt = t.bracketType || 'single_elim';
 
-  // Avance de ganador: solo eliminación directa (RR/suizo no tienen árbol)
-  if (bt === 'single_elim') {
+  // Avance de ganador: eliminación directa Y matches de playoffs del suizo
+  // (el bloque de auto-códigos les asigna código al quedar 'ready').
+  if (bt === 'single_elim' || match.stage === 'playoffs') {
     const nextId = `r${match.round + 1}m${Math.ceil(match.matchNumber / 2)}`;
     const ni = t.bracket!.findIndex(m => m.id === nextId);
     if (ni !== -1) {
@@ -806,7 +837,12 @@ async function applyResultInPlace(t: TournamentData, mi: number, winner: string)
   if (bt === 'round_robin') {
     if (t.bracket!.every(m => m.matchStatus === 'complete')) t.phase = 'complete';
   } else if (bt === 'swiss') {
-    // el organizador cierra con /complete tras la última ronda
+    // Suizo puro: cierra el piloto/organizador. La GRAN FINAL de playoffs
+    // sí corona al campeón aquí mismo.
+    if (match.stage === 'playoffs') {
+      const maxPlayoffRound = Math.max(...t.bracket!.filter(m => m.stage === 'playoffs').map(m => m.round));
+      if (match.round === maxPlayoffRound) t.phase = 'complete';
+    }
   } else {
     const maxRound = Math.max(...t.bracket!.map(m => m.round));
     if (t.bracket!.find(m => m.round === maxRound)?.matchStatus === 'complete') {
@@ -823,9 +859,10 @@ async function applyResultInPlace(t: TournamentData, mi: number, winner: string)
     forfeit: !!done.forfeit,
   });
   if (t.phase === 'complete') {
+    const champion = (done.stage === 'playoffs' || bt === 'single_elim')
+      ? winner : (t.standings?.[0]?.team ?? winner);
     notifyDiscordChampion(t.discordWebhookUrl, {
-      tournamentId: t.id, tournamentName: t.name,
-      champion: t.standings?.[0]?.team ?? winner,
+      tournamentId: t.id, tournamentName: t.name, champion,
     });
   }
 }
