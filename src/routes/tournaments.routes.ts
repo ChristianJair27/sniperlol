@@ -3238,14 +3238,15 @@ async function buildLiveData(id: string) {
 
     // A spectator game counts as the tournament match ONLY if:
     //   a) its gameId equals the code's game (or callback-linked gameId), OR
-    //   b) it's a CUSTOM game (queueId 0 — what tournament codes create) that has
-    //      at least one registered player from EACH team (scrim/arena-proof).
-    // Anything else (Arena/CHERRY, ARAM, ranked, normals) is rejected.
+    //   b) it's a CUSTOM game (gameType CUSTOM_GAME; los códigos crean customs
+    //      — queueId 0 en SR, 3220 en ARAM) con al menos un jugador registrado
+    //      de CADA equipo (scrim/arena-proof).
+    // Anything else (Arena/CHERRY, ARAM normal, ranked, normals) is rejected.
     const isTournamentGame = (game: any): boolean => {
       if (!game) return false;
       if (codeGameId && Number(game.gameId) === Number(codeGameId)) return true;
       const q = game.gameQueueConfigId ?? game.gameQueueId;
-      if (q !== 0) return false;
+      if (game.gameType !== 'CUSTOM_GAME' && q !== 0) return false;
       const gp = (game.participants ?? []).map((p: any) => p.puuid).filter(Boolean) as string[];
       const inT1 = gp.some((p) => team1Puuids.has(p));
       const inT2 = gp.some((p) => team2Puuids.has(p));

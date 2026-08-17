@@ -337,11 +337,14 @@ export async function resolveWinnerFromMatch(
   return null;
 }
 
-// Tournament codes create CUSTOM games, which Riot reports as queueId 0. We refuse
-// to attribute anything else (Ranked Flex 440, Arena/CHERRY 1700/1710, ARAM 450,
-// normals 400/430/420, etc.) so a player's scrim or arena game can never be mistaken
-// for the tournament match.
-const TOURNAMENT_CODE_QUEUE_ID = 0;
+// Tournament codes create CUSTOM games. Riot los reporta con gameType
+// 'CUSTOM_GAME' y queueId variable según el mapa (0 en SR clásico, 3220 en
+// customs de ARAM — verificado en vivo 2026-08). Filtramos por gameType para
+// que un ranked/normal/arena de un jugador jamás se confunda con el torneo,
+// sin rechazar customs legítimas de otros mapas.
+function isCustomGame(info: any): boolean {
+  return info?.gameType === 'CUSTOM_GAME' || Number(info?.queueId) === 0;
+}
 
 function normalizeRiotId(riotId: string) {
   return riotId.trim().toLowerCase();
@@ -445,7 +448,10 @@ export async function recoverGameFromRoster(
     if (!info?.gameEndTimestamp) continue;
 
     // 1) Must be a tournament/custom game.
-    if (info.queueId !== TOURNAMENT_CODE_QUEUE_ID) continue;
+    if (!isCustomGame(info)) continue;
+    // 1b) Si Match-V5 trae el tournamentCode y NO es el de este match, es la
+    //     partida de OTRO enfrentamiento — nunca atribuirla aquí.
+    if (info.tournamentCode && match.code && info.tournamentCode !== match.code) continue;
     // 2) Must have started after the code was activated.
     if (lowerBound && info.gameStartTimestamp && info.gameStartTimestamp < lowerBound) continue;
 
