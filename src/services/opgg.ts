@@ -549,6 +549,8 @@ export interface OPGGFullProfile {
   is_fresh_blood: boolean;
   // Historial de temporadas pasadas (elo final por season, de OP.GG)
   previous_seasons: Array<{ season_id: number; display?: string; tier: string | null; division: number | null; lp: number | null; tier_image_url?: string | null }>;
+  // Peak de la temporada actual por cola (elo más alto alcanzado)
+  season_peaks: Array<{ queue: string; tier: string; division: number | null; lp: number | null }>;
 }
 
 export async function getSummonerFullProfile(
@@ -577,6 +579,7 @@ export async function getSummonerFullProfile(
         'data.summoner.ranked_most_champions.my_champion_stats.rank',
         'data.summoner.ranked_most_champions.my_champion_stats.champion_name',
         'data.summoner.previous_seasons',
+        'data.summoner.current_season_high_tiers',
       ],
     });
 
@@ -652,6 +655,15 @@ export async function getSummonerFullProfile(
           tier_image_url: s.tier_info?.tier_image_url ?? null,
         }))
         .filter((s: any) => s.tier),
+      // Peak de la season: elo más alto alcanzado por cola (solo/flex).
+      season_peaks: ((summoner.current_season_high_tiers?.rank_entries as any[]) ?? [])
+        .map((e: any) => ({
+          queue: String(e.game_type || ''),
+          tier: e.high_rank_info?.tier ?? null,
+          division: e.high_rank_info?.division ?? null,
+          lp: e.high_rank_info?.lp ?? null,
+        }))
+        .filter((e: any) => e.tier),
     };
 
     cache.set(cacheKey, { data: profile, exp: Date.now() + CACHE_TTL });
