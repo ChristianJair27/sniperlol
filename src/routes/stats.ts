@@ -639,12 +639,38 @@ setImmediate(() => {
 });
 
 /**
+ * GET /api/stats/champion-ranks/:platform/:puuid
+ * Ranking ATAK por campeón (estilo League of Graphs): posición del jugador
+ * por puntos de maestría dentro de nuestra base — regional y global. La base
+ * se siembra con la comunidad y crece con cada perfil visitado.
+ */
+r.get("/champion-ranks/:platform/:puuid", async (req, res) => {
+  try {
+    const { platform, puuid } = req.params as { platform: string; puuid: string };
+    const ladder = await import('../services/champion-ladder.service.js');
+    // Asegurar que ESTE jugador esté en la base antes de calcular su posición.
+    await ladder.upsertPlayerMastery(platform, puuid).catch(() => {});
+    const ranks = await ladder.getChampionRanks(platform, puuid);
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.json({ ok: true, platform: platform.toLowerCase(), ranks });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, message: e?.message || 'champion-ranks failed' });
+  }
+});
+
+/**
  * GET /api/stats/champion-stats/:platform/:puuid?count=20&queues=420,440
  */
 r.get("/champion-stats/:platform/:puuid", async (req, res) => {
   try {
     const { platform, puuid } = req.params as { platform: string; puuid: string };
     const { count = "20", queues } = req.query as { count?: string; queues?: string };
+
+    // Ladder de campeones: cada visita a un perfil refresca su maestría en la
+    // base (throttle 24h) — así el ranking ATAK crece solo. Best-effort.
+    import('../services/champion-ladder.service.js')
+      .then((m) => m.upsertPlayerMastery(platform, puuid))
+      .catch((e) => console.warn('[champion-ladder] upsert falló:', e?.message));
 
     const regional = platformToRegional(platform);
     if (!RIOT_KEY) return res.status(500).json({ message: "RIOT_API_KEY missing" });
