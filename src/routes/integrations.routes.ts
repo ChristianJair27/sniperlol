@@ -33,6 +33,35 @@ function pickFrom(r: any, ...keys: string[]) {
   return '';
 }
 
+// P0-integridad con auto-corrección: si el "duplicado" es un equipo de UN
+// solo jugador (él mismo se registró solo antes de que el admin lo asignara a
+// su equipo real — pasó con 2Dope y ELVARGAS099), se elimina ese equipo
+// fantasma y se permite el alta. Cualquier otro conflicto sigue siendo 409.
+// Devuelve null si el alta puede continuar; string de error si debe rechazarse.
+async function resolveOrRejectConflict(
+  tournamentId: string, gamertag: string, puuid: string | undefined, excludeRegId?: number
+): Promise<string | null> {
+  const { findRosterConflicts, rosterConflictError } = await import('./tournaments.routes.js');
+  const conflicts = await findRosterConflicts(tournamentId, [{ riotId: gamertag, puuid }], excludeRegId);
+  if (!conflicts.length) return null;
+
+  for (const conf of conflicts) {
+    const [[reg]] = await pool.query<any[]>(
+      'SELECT id, players FROM tournament_registrations WHERE tournament_id=? AND team_name=?',
+      [tournamentId, conf.team]
+    );
+    if (!reg) continue;
+    const players: any[] = typeof reg.players === 'string' ? JSON.parse(reg.players) : (reg.players ?? []);
+    const isSoloSelf = players.length === 1
+      && String(players[0]?.riotId || players[0]?.name || '').toLowerCase() === gamertag.toLowerCase();
+    if (!isSoloSelf) return rosterConflictError(conflicts);
+    await pool.query('DELETE FROM tournament_registrations WHERE id=?', [reg.id]);
+    await pool.query('UPDATE tournaments SET participants=GREATEST(0,participants-1) WHERE id=?', [tournamentId]);
+    console.log(`[lqc] auto-corrección: equipo fantasma "${conf.team}" (solo ${gamertag}) eliminado — el jugador pasa a su equipo real`);
+  }
+  return null;
+}
+
 // LQC_WEBHOOK_SECRET admite varios secretos separados por coma
 // (rotación sin caída: "nuevo,viejo" mientras el otro lado migra al nuevo).
 function checkSecret(req: any): 'ok' | 'bad' | 'unconfigured' {
@@ -180,9 +209,9 @@ router.post('/lqc/register', async (req, res) => {
       );
       if (Number(regs[0].c) >= (t.maxParticipants || 32)) return bad(res, 409, 'Torneo lleno');
 
-      // P0-integridad: este jugador no puede estar ya en OTRO equipo del torneo.
-      const newTeamConflicts = await findRosterConflicts(tournamentId, [{ riotId: gamertag, puuid: (player as any).puuid }]);
-      if (newTeamConflicts.length) return bad(res, 409, rosterConflictError(newTeamConflicts));
+      // P0-integridad (con auto-corrección de equipos fantasma de 1 jugador).
+      const conflictErr = await resolveOrRejectConflict(tournamentId, gamertag, (player as any).puuid);
+      if (conflictErr) return bad(res, 409, conflictErr);
 
       await pool.query(
         `INSERT INTO tournament_registrations (tournament_id, team_name, captain_riot_id, players, contact)
@@ -212,9 +241,9 @@ router.post('/lqc/register', async (req, res) => {
       emailChanged = Boolean(newEmail) && newEmail !== prevEmail;
     } else {
       if (players.length >= 7) return bad(res, 409, `Equipo ${teamName} ya tiene 7 jugadores (5 titulares + 2 suplentes)`);
-      // P0-integridad: alta nueva → verificar que no esté en otro equipo.
-      const conflicts = await findRosterConflicts(tournamentId, [{ riotId: gamertag, puuid: (player as any).puuid }], Number(reg.id));
-      if (conflicts.length) return bad(res, 409, rosterConflictError(conflicts));
+      // P0-integridad (con auto-corrección de equipos fantasma de 1 jugador).
+      const conflictErr = await resolveOrRejectConflict(tournamentId, gamertag, (player as any).puuid, Number(reg.id));
+      if (conflictErr) return bad(res, 409, conflictErr);
       players.push(player);
     }
     await pool.query('UPDATE tournament_registrations SET players=? WHERE id=?', [JSON.stringify(players), reg.id]);
