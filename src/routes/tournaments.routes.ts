@@ -2197,6 +2197,84 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
   }
 });
 
+// ── Ops del organizador: mover un jugador a otro equipo ──────────────────────
+// Caso típico (ya pasó 2 veces en la LQC): un jugador escribe mal el nombre
+// del equipo y crea uno nuevo con 1 integrante. Esto lo mueve al equipo
+// correcto conservando su PUUID/verificación, y si el equipo origen queda
+// vacío lo elimina y ajusta el contador.
+router.post('/:id/registrations/move-player', requireAuth, async (req: any, res) => {
+  const fromTeam = String(req.body?.fromTeam || '').trim();
+  const toTeam = String(req.body?.toTeam || '').trim();
+  const riotId = String(req.body?.riotId || '').trim();
+  if (!fromTeam || !toTeam || !riotId) {
+    return res.status(400).json({ error: 'fromTeam, toTeam y riotId requeridos' });
+  }
+  if (fromTeam.toLowerCase() === toTeam.toLowerCase()) {
+    return res.status(400).json({ error: 'El equipo origen y destino son el mismo' });
+  }
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador puede mover jugadores' });
+    if (t.phase !== 'registration' && t.phase !== 'checkin') {
+      return res.status(400).json({ error: 'Con el torneo iniciado usa la sustitución de emergencia (editar roster), no el traslado de equipos' });
+    }
+
+    const [[src]] = await pool.query<any[]>(
+      'SELECT * FROM tournament_registrations WHERE tournament_id=? AND LOWER(team_name)=LOWER(?)',
+      [t.id, fromTeam]
+    );
+    const [[dst]] = await pool.query<any[]>(
+      'SELECT * FROM tournament_registrations WHERE tournament_id=? AND LOWER(team_name)=LOWER(?)',
+      [t.id, toTeam]
+    );
+    if (!src) return res.status(404).json({ error: `Equipo origen "${fromTeam}" no encontrado` });
+    if (!dst) return res.status(404).json({ error: `Equipo destino "${toTeam}" no encontrado` });
+
+    const srcPlayers: RosterPlayer[] = parseJson(src.players) || [];
+    const dstPlayers: RosterPlayer[] = parseJson(dst.players) || [];
+    const norm = (s?: string) => String(s || '').trim().toLowerCase();
+
+    const pi = srcPlayers.findIndex(p => norm(p.riotId) === norm(riotId) || norm(p.name) === norm(riotId));
+    if (pi === -1) return res.status(404).json({ error: `${riotId} no está en el roster de "${src.team_name}"` });
+    const [player] = srcPlayers.splice(pi, 1);
+
+    // ¿Ya está en el destino? Entonces solo se limpia el origen (dedupe).
+    const already = dstPlayers.some(p =>
+      (player.puuid && p.puuid === player.puuid) || norm(p.riotId) === norm(player.riotId));
+    if (!already) {
+      const bounds = rosterSizeBounds(t);
+      if (dstPlayers.length >= bounds.max) {
+        return res.status(409).json({ error: `"${dst.team_name}" ya tiene el roster lleno (${bounds.max})` });
+      }
+      dstPlayers.push(player);
+    }
+
+    if (srcPlayers.length === 0) {
+      // Equipo origen vacío → eliminarlo y ajustar contador.
+      await pool.query('DELETE FROM tournament_registrations WHERE id=?', [src.id]);
+      await pool.query('UPDATE tournaments SET participants=GREATEST(0,participants-1) WHERE id=?', [t.id]);
+    } else {
+      // Si movimos al capitán, hereda el primero que quede.
+      const wasCaptain = norm(src.captain_riot_id) === norm(player.riotId);
+      await pool.query(
+        'UPDATE tournament_registrations SET players=?, captain_riot_id=? WHERE id=?',
+        [JSON.stringify(srcPlayers), wasCaptain ? (srcPlayers[0].riotId || src.captain_riot_id) : src.captain_riot_id, src.id]
+      );
+    }
+    await pool.query('UPDATE tournament_registrations SET players=? WHERE id=?', [JSON.stringify(dstPlayers), dst.id]);
+
+    res.json({
+      success: true,
+      moved: player.riotId || player.name,
+      from: src.team_name, to: dst.team_name,
+      sourceDeleted: srcPlayers.length === 0,
+      targetRosterSize: dstPlayers.length,
+      deduped: already,
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 // GET registrations
 router.get('/:id/registrations', optionalAuth, async (req: any, res) => {
   try {
