@@ -926,49 +926,60 @@ export function pairSwissRound(t: TournamentData, round: number): BracketMatch[]
 }
 
 // ── Suizo → playoffs (P1.8) ──────────────────────────────────────────────────
-// Cuántos clasifican realmente: potencia de 2 ≤ min(configurado, equipos).
+// Cuántos clasifican realmente: min(configurado, equipos). Ya no se recorta a
+// potencia de 2 — tamaños como Top 12 se resuelven con BYEs para los seeds
+// altos (bracket de 16 donde el 1-4 descansa la primera ronda, estilo LCS).
 export function effectivePlayoffsSize(t: TournamentData): number {
   const want = Number(t.playoffsSize) || 0;
   if (want < 2) return 0;
   const teams = t.standings?.length || 0;
   const cap = Math.min(want, teams);
-  if (cap < 2) return 0;
-  let p = 2;
-  while (p * 2 <= cap) p *= 2;
-  return p;
+  return cap >= 2 ? cap : 0;
 }
 
 // Bracket de playoffs sembrado por la tabla del suizo (seeds[0] = 1º).
 // Pareo clásico: el 1 y el 2 solo pueden cruzarse en la gran final.
+// Si los clasificados no son potencia de 2 (p.ej. Top 12), el bracket se
+// completa con BYEs: los mejores seeds pasan directo a la siguiente ronda.
 // Las rondas continúan la numeración del suizo (startRound = swissRounds + 1)
 // para que el avance r{round+1}m{ceil(n/2)} funcione igual que en eliminación.
 export function generatePlayoffs(
   seeds: string[], startRound: number, seriesTo: number, finalSeriesTo: number
 ): BracketMatch[] {
-  const pairs: Array<[number, number]> =
-    seeds.length >= 8 ? [[1, 8], [4, 5], [2, 7], [3, 6]]
-    : seeds.length >= 4 ? [[1, 4], [2, 3]]
-    : [[1, 2]];
+  const n = Math.pow(2, Math.ceil(Math.log2(Math.max(seeds.length, 2))));
+  // Orden de siembra clásico: [1,2] → [1,4,2,3] → [1,8,4,5,2,7,3,6] → …
+  let order = [1, 2];
+  while (order.length < n) {
+    const next: number[] = [];
+    for (const s of order) next.push(s, order.length * 2 + 1 - s);
+    order = next;
+  }
+  const teamAt = (seed: number) => seeds[seed - 1] ?? 'BYE';
+  const totalRounds = Math.log2(n);
   const matches: BracketMatch[] = [];
-  let round = startRound;
-  const firstIsFinal = pairs.length === 1;
-  pairs.forEach(([a, b], i) => matches.push({
-    id: `r${round}m${i + 1}`, round, matchNumber: i + 1,
-    team1: seeds[a - 1], team2: seeds[b - 1],
-    winner: null, code: null, matchStatus: 'ready',
-    stage: 'playoffs', seriesTo: firstIsFinal ? finalSeriesTo : seriesTo,
-  }));
-  let n = pairs.length;
-  while (n > 1) {
-    round++; n = n / 2;
-    for (let i = 1; i <= n; i++) {
+  for (let r = 0; r < totalRounds; r++) {
+    const cnt = n / Math.pow(2, r + 1);
+    for (let m = 1; m <= cnt; m++) {
       matches.push({
-        id: `r${round}m${i}`, round, matchNumber: i,
-        team1: null, team2: null, winner: null, code: null, matchStatus: 'pending',
-        stage: 'playoffs', seriesTo: n === 1 ? finalSeriesTo : seriesTo,
+        id: `r${startRound + r}m${m}`, round: startRound + r, matchNumber: m,
+        team1: r === 0 ? teamAt(order[(m - 1) * 2]) : null,
+        team2: r === 0 ? teamAt(order[(m - 1) * 2 + 1]) : null,
+        winner: null, code: null,
+        matchStatus: r === 0 ? 'ready' : 'pending',
+        stage: 'playoffs', seriesTo: cnt === 1 ? finalSeriesTo : seriesTo,
       });
     }
   }
+  // BYEs de la primera ronda: pase directo del seed alto, como en eliminación.
+  matches.filter(m => m.round === startRound && (m.team1 === 'BYE' || m.team2 === 'BYE')).forEach(match => {
+    const winner = match.team1 !== 'BYE' ? match.team1 : match.team2;
+    match.winner = winner; match.matchStatus = 'complete';
+    const next = matches.find(x => x.id === `r${startRound + 1}m${Math.ceil(match.matchNumber / 2)}`);
+    if (next) {
+      if (match.matchNumber % 2 === 1) next.team1 = winner; else next.team2 = winner;
+      if (next.team1 && next.team2 && next.team1 !== 'BYE' && next.team2 !== 'BYE') next.matchStatus = 'ready';
+    }
+  });
   return matches;
 }
 
@@ -3598,7 +3609,7 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
     // generado ya (después sería reescribir un bracket en juego).
     if (req.body.playoffsSize !== undefined) {
       const ps = Number(req.body.playoffsSize);
-      if (![0, 2, 4, 8].includes(ps)) return res.status(400).json({ error: 'playoffsSize: 0 (suizo puro), 2, 4 u 8' });
+      if (![0, 2, 4, 8, 12, 16].includes(ps)) return res.status(400).json({ error: 'playoffsSize: 0 (suizo puro), 2, 4, 8, 12 o 16' });
       if (t.bracket?.some(m => m.stage === 'playoffs'))
         return res.status(400).json({ error: 'Los playoffs ya se generaron — no se puede cambiar' });
       await pool.query('UPDATE tournaments SET playoffs_size=? WHERE id=?', [ps, t.id]);
