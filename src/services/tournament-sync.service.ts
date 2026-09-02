@@ -143,16 +143,33 @@ export async function tryDetectGameId(
   }
 }
 
-/** Series Bo3/Bo5: TODOS los juegos registrados con el código del enfrentamiento. */
+type CodeGame = {
+  gameId: number; platform: string;
+  /** PUUIDs de ganadores/perdedores según Riot (games/by-code). El callback
+   *  HTTP solo trae summonerName, pero este endpoint sí trae puuid. */
+  winPuuids?: string[]; losePuuids?: string[];
+  startTime?: number;
+};
+
+/** Series Bo3/Bo5: TODOS los juegos registrados con el código del enfrentamiento,
+ *  en orden cronológico. */
 export async function detectAllGamesByCode(
   code: string, fallbackRegion: string
-): Promise<Array<{ gameId: number; platform: string }>> {
+): Promise<CodeGame[]> {
   try {
     const games = await getGamesByCode(code);
+    const puuidsOf = (arr: any) => (Array.isArray(arr) ? arr : [])
+      .map((p: any) => (typeof p === 'string' ? p : p?.puuid))
+      .filter(Boolean) as string[];
     return (games || []).map((g: any) => ({
       gameId: Number(g.gameId),
       platform: riotRegionToPlatform(g.region || fallbackRegion),
-    })).filter(g => Number.isFinite(g.gameId) && g.gameId > 0);
+      winPuuids: puuidsOf(g.winningTeam),
+      losePuuids: puuidsOf(g.losingTeam),
+      startTime: Number(g.startTime) || undefined,
+    }))
+      .filter(g => Number.isFinite(g.gameId) && g.gameId > 0)
+      .sort((a, b) => (a.startTime ?? a.gameId) - (b.startTime ?? b.gameId) || a.gameId - b.gameId);
   } catch {
     return [];
   }
@@ -228,7 +245,7 @@ function parseTeamObjectives(team: any) {
   };
 }
 
-function buildMatchStatsResponse(data: any, riotMatchIdStr: string, isComplete: boolean) {
+export function buildMatchStatsResponse(data: any, riotMatchIdStr: string, isComplete: boolean) {
   const info = data.info;
   const dur = info.gameDuration as number;
   const participants: any[] = info.participants.map((p: any) => parseParticipant(p, dur));
@@ -250,7 +267,7 @@ function buildMatchStatsResponse(data: any, riotMatchIdStr: string, isComplete: 
   };
 }
 
-async function saveMatchStats(
+export async function saveMatchStats(
   tournamentId: string, bracketMatchId: string, riotMatchIdStr: string,
   gameId: number, parsedData: object, gameDuration: number, gameEndTs?: number
 ) {
@@ -264,7 +281,7 @@ async function saveMatchStats(
   );
 }
 
-async function fetchMatchData(gameId: number, primaryPlatform: string) {
+export async function fetchMatchData(gameId: number, primaryPlatform: string) {
   const tryPlatforms = primaryPlatform === 'la1' ? ['la1', 'la2', primaryPlatform]
     : primaryPlatform === 'la2' ? ['la2', 'la1']
     : [primaryPlatform];
@@ -277,76 +294,58 @@ async function fetchMatchData(gameId: number, primaryPlatform: string) {
   return null;
 }
 
-/** Resolve winner from Match-V5 participants when callback PUUID matching failed. */
+/**
+ * Atribuye el GANADOR de un juego a team1/team2 comparando los PUUIDs del lado
+ * ganador y del lado perdedor contra los rosters (registro + allowlist del
+ * código). Solo cuenta jugadores conocidos: suplentes fuera del roster se
+ * ignoran. Si hay jugadores de AMBOS equipos en un mismo lado (lados
+ * mezclados) devuelve null a propósito → reporte manual.
+ *
+ * Bug histórico (LQC r1 01-sep-2026): la versión anterior contaba jugadores
+ * conocidos de los DIEZ participantes sin mirar quién ganó, así que "ganaba"
+ * el equipo con más cuentas bien registradas.
+ */
+export function attributeGameWinner(
+  match: Pick<BracketMatch, 'team1' | 'team2'>,
+  winPuuids: string[], losePuuids: string[],
+  team1Puuids: Set<string>, team2Puuids: Set<string>
+): string | null {
+  if (!match.team1 || !match.team2) return null;
+  const count = (arr: string[], set: Set<string>) => arr.filter(p => set.has(p)).length;
+  const w1 = count(winPuuids, team1Puuids), w2 = count(winPuuids, team2Puuids);
+  const l1 = count(losePuuids, team1Puuids), l2 = count(losePuuids, team2Puuids);
+  if ((w1 > 0 && w2 > 0) || (l1 > 0 && l2 > 0)) return null; // lados mezclados
+  const ev1 = w1 + l2; // evidencia de que ganó team1
+  const ev2 = w2 + l1; // evidencia de que ganó team2
+  if (ev1 > ev2 && ev1 >= 1) return match.team1;
+  if (ev2 > ev1 && ev2 >= 1) return match.team2;
+  return null;
+}
+
+/** Ganador de un juego a partir de Match-V5 (+ PUUIDs de games/by-code si los hay). */
 export async function resolveWinnerFromMatch(
   t: TournamentData,
   match: BracketMatch,
-  matchData: any
+  matchData: any,
+  hint?: { winPuuids?: string[]; losePuuids?: string[] }
 ): Promise<string | null> {
   if (!match.team1 || !match.team2) return null;
-
   const platform = match.gameRegion || t.region || 'la1';
-  let t1Puuids = match.team1Puuids ?? [];
-  let t2Puuids = match.team2Puuids ?? [];
+  const { team1Puuids, team2Puuids } = await collectTeamPuuids(t.id, match, platform);
+  if (!team1Puuids.size && !team2Puuids.size) return null;
 
-  // Re-resolve from roster if allowlists were empty at code-gen time
-  if (!t1Puuids.length || !t2Puuids.length) {
-    const [regRows] = await pool.query<any[]>(
-      'SELECT team_name, captain_riot_id, players FROM tournament_registrations WHERE tournament_id = ?',
-      [t.id]
-    );
-    for (const row of regRows) {
-      const players = parseJson(row.players) || [];
-      const ids = [row.captain_riot_id, ...players.map((p: any) => p.riotId)].filter(Boolean);
-      const puuids: string[] = [];
-      for (const rid of ids) {
-        const stored = players.find((p: any) => p.riotId === rid);
-        if (stored?.puuid) { puuids.push(stored.puuid); continue; }
-        const [gn, tl] = String(rid).split('#');
-        if (!gn || !tl) continue;
-        try {
-          const acc = await getAccountByRiotId(gn.trim(), tl.trim(), { platformHint: platform });
-          if (acc?.puuid) puuids.push(acc.puuid);
-        } catch { /* skip */ }
-      }
-      if (row.team_name === match.team1) t1Puuids = [...new Set([...t1Puuids, ...puuids])];
-      if (row.team_name === match.team2) t2Puuids = [...new Set([...t2Puuids, ...puuids])];
-    }
-  }
-
-  const participants: any[] = matchData.info?.participants ?? [];
-  const partPuuids: string[] = [];
+  const winnerSide = (matchData?.info?.teams as any[])?.find((tm: any) => tm.win)?.teamId;
+  const participants: any[] = matchData?.info?.participants ?? [];
+  const winPuuids = new Set<string>(hint?.winPuuids ?? []);
+  const losePuuids = new Set<string>(hint?.losePuuids ?? []);
   for (const p of participants) {
-    if (p.puuid) { partPuuids.push(p.puuid); continue; }
-    const gn = p.riotIdGameName || p.summonerName;
-    const tl = p.riotIdTagline || p.riotIdTagLine || '';
-    if (!gn) continue;
-    try {
-      const acc = await getAccountByRiotId(gn.trim(), tl.trim(), { platformHint: platform });
-      if (acc?.puuid) partPuuids.push(acc.puuid);
-    } catch { /* skip */ }
+    if (!p?.puuid) continue;
+    const won = typeof p.win === 'boolean' ? p.win : (winnerSide ? p.teamId === winnerSide : null);
+    if (won === true) winPuuids.add(p.puuid);
+    else if (won === false) losePuuids.add(p.puuid);
   }
-
-  // Umbral por mayoría del equipo: 3 en 5v5, 2 en 3v3/4v4, 1 en 1v1/2v2.
-  // Con el fijo de 3 de antes, un 1v1 jamás podría atribuirse solo.
-  const need = Math.max(1, Math.ceil((Number(t.teamSize) || 5) / 2));
-  const t1hits = partPuuids.filter(p => t1Puuids.includes(p)).length;
-  const t2hits = partPuuids.filter(p => t2Puuids.includes(p)).length;
-  if (t1hits > t2hits && t1hits >= need) return match.team1;
-  if (t2hits > t1hits && t2hits >= need) return match.team2;
-
-  // Fallback: winning team side from match data + majority of known PUUIDs on that side
-  const winnerSide = (matchData.info?.teams as any[])?.find((tm: any) => tm.win)?.teamId;
-  if (!winnerSide) return null;
-  const winningPartPuuids = participants
-    .filter((p: any) => p.teamId === winnerSide)
-    .map((p: any) => p.puuid)
-    .filter(Boolean) as string[];
-  const w1 = winningPartPuuids.filter(p => t1Puuids.includes(p)).length;
-  const w2 = winningPartPuuids.filter(p => t2Puuids.includes(p)).length;
-  if (w1 > w2) return match.team1;
-  if (w2 > w1) return match.team2;
-  return null;
+  if (!winPuuids.size) return null;
+  return attributeGameWinner(match, [...winPuuids], [...losePuuids], team1Puuids, team2Puuids);
 }
 
 // Tournament codes create CUSTOM games. Riot los reporta con gameType
@@ -611,7 +610,20 @@ async function syncArenaLadder(t: TournamentData): Promise<{ synced: number; det
   return { synced: scored, details: [] };
 }
 
-export async function syncTournamentFull(tournamentId: string): Promise<{ synced: number; details: SyncDetail[] }> {
+// Un solo sync por torneo a la vez. saveT escribe la fila completa, así que dos
+// syncs concurrentes (tick de fondo + callback de Riot + auto-sync del front)
+// se pisaban con copias viejas del bracket. Se encadenan: el que llega espera.
+const syncChains = new Map<string, Promise<unknown>>();
+
+export function syncTournamentFull(tournamentId: string): Promise<{ synced: number; details: SyncDetail[] }> {
+  const prev = syncChains.get(tournamentId) ?? Promise.resolve();
+  const run = prev.catch(() => undefined).then(() => syncTournamentFullInner(tournamentId));
+  syncChains.set(tournamentId, run);
+  run.finally(() => { if (syncChains.get(tournamentId) === run) syncChains.delete(tournamentId); }).catch(() => undefined);
+  return run;
+}
+
+async function syncTournamentFullInner(tournamentId: string): Promise<{ synced: number; details: SyncDetail[] }> {
   const t = await getT(tournamentId);
   if (!t) return { synced: 0, details: [] };
   if (t.gameMap === 'ARENA') return syncArenaLadder(t);
@@ -627,11 +639,20 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
     try {
       const seriesTo = m.seriesTo || 1;
       const known = new Set<number>((m.games || []).map(g => g.gameId));
-      if (m.gameId) known.add(m.gameId); // compat Bo1 previo a series
+      // Compat Bo1 previo a series: partido YA cerrado con gameId y sin games[].
+      // OJO: en partidos abiertos NO tratar m.gameId como conocido — el callback
+      // de Riot lo escribe antes de que este sync vea el juego, y con la versión
+      // anterior ese juego quedaba bloqueado para siempre (LQC r1: GO vs Nephyx
+      // juego 2, RAKU vs 2 DOPE juego 2, CT&S vs Breakers juego 3).
+      if (m.gameId && m.matchStatus === 'complete' && !m.games?.length) known.add(m.gameId);
 
       // 1. Detectar TODOS los juegos del código (series pueden tener varios)
-      const found: Array<{ gameId: number; platform: string }> = [];
+      const found: CodeGame[] = [];
       if (m.code) found.push(...await detectAllGamesByCode(m.code, t.region || 'la1'));
+      // 1a. gameId enlazado por callback/admin que el código aún no reporta.
+      if (m.gameId && !known.has(m.gameId) && !found.some(g => g.gameId === m.gameId)) {
+        found.push({ gameId: m.gameId, platform: m.gameRegion || t.region || 'la1' });
+      }
 
       // 1b. Recovery por historial del roster si el código no arrojó nada nuevo
       const newFromCode = found.filter(g => !known.has(g.gameId));
@@ -659,7 +680,7 @@ export async function syncTournamentFull(tournamentId: string): Promise<{ synced
         detail.statsCached = true;
         changed = true;
 
-        const gameWinner = await resolveWinnerFromMatch(t, m, fetched.data);
+        const gameWinner = await resolveWinnerFromMatch(t, m, fetched.data, g);
         t.bracket[i].games = [...(t.bracket[i].games || []), {
           gameId: g.gameId, gameRegion: fetched.platform, winner: gameWinner,
           // Juego real del enfrentamiento pero sin ganador atribuible (lados

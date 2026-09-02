@@ -1730,26 +1730,17 @@ router.post('/tournament-callback', async (req, res) => {
       match.gameRegion = riotRegionToPlatform(region || t.region || 'LAN');
     }
 
-    // 3. Auto-resolve the winner from the winningTeam PUUIDs.
-    if (match.matchStatus !== 'complete' && t.phase === 'active') {
-      const winPuuids = (Array.isArray(winningTeam) ? winningTeam : [])
-        .map((p: any) => (typeof p === 'string' ? p : p?.puuid))
-        .filter(Boolean) as string[];
-      const t1 = match.team1Puuids ?? [];
-      const t2 = match.team2Puuids ?? [];
-      const t1hits = winPuuids.filter(p => t1.includes(p)).length;
-      const t2hits = winPuuids.filter(p => t2.includes(p)).length;
-      const winner = t1hits > t2hits ? match.team1 : t2hits > t1hits ? match.team2 : null;
-      if (winner) {
-        await applyResult(t, mi, winner);
-        console.log(`[Callback] auto-resultado: "${winner}" gana ${match.id}`);
-      } else {
-        console.warn('[Callback] no se pudo atribuir ganador para %s (sin coincidencia de PUUIDs)', match.id);
-      }
-    }
+    // 3. El resultado NO se aplica aquí. Riot manda en winningTeam solo
+    //    summonerName (sin puuid) — verificado en callback_log LQC 01-sep-2026 —
+    //    y además una serie Bo3/Bo5 no puede cerrarse con un solo juego. El sync
+    //    (games/by-code trae PUUIDs + Match-V5) atribuye juego por juego y
+    //    cierra la serie al llegar a seriesTo.
+    console.log(`[Callback] ${t.id}/${match.id}: juego ${gameId} terminado (ganadores: ${
+      (Array.isArray(winningTeam) ? winningTeam : []).map((p: any) => p?.summonerName || p?.puuid || p).join(', ')
+    }) → lo procesa el sync`);
 
     await saveT(t);
-    // Async: detect stats + auto-result if callback winner attribution failed
+    // Async: el sync ingesta el juego (stats + ganador + marcador de serie).
     syncTournamentFull(t.id).catch(e => console.error('[Callback] sync error:', e.message));
   } catch (err) { console.error('[Callback] error:', err); }
   res.status(200).send('OK');
