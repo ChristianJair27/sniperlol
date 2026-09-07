@@ -55,6 +55,14 @@ for (const m of bracket) {
     console.log(`${m.id} ${m.team1} vs ${m.team2} · juego ${g.gameId} → ${winner ?? 'AMBIGUO'} [${tag}]`);
     newGames.push({ gameId: g.gameId, gameRegion: platform, winner, ...(winner ? {} : { ambiguous: true }) });
   }
+  // Filas de stats que NO son juegos del código (flex enlazadas por "auto-detectar").
+  const [stale] = await pool.query<any[]>('SELECT game_id FROM tournament_match_stats WHERE tournament_id=? AND bracket_match_id=?', [TID, m.id]);
+  const codeIds = new Set(codeGames.map(g => g.gameId));
+  const staleIds = stale.map((r: any) => Number(r.game_id)).filter(gid => !codeIds.has(gid));
+  if (staleIds.length && codeGames.length) {
+    console.log(`  stats ajenas al código en ${m.id}: ${staleIds.join(', ')} → ${APPLY ? 'ELIMINADAS' : 'se eliminarían'}`);
+    if (APPLY) await pool.query('DELETE FROM tournament_match_stats WHERE tournament_id=? AND bracket_match_id=? AND game_id IN (?)', [TID, m.id, staleIds]);
+  }
   const s1 = newGames.filter(g => g.winner === m.team1).length;
   const s2 = newGames.filter(g => g.winner === m.team2).length;
   const to = m.seriesTo || 1;

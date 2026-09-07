@@ -650,7 +650,10 @@ async function syncTournamentFullInner(tournamentId: string): Promise<{ synced: 
       const found: CodeGame[] = [];
       if (m.code) found.push(...await detectAllGamesByCode(m.code, t.region || 'la1'));
       // 1a. gameId enlazado por callback/admin que el código aún no reporta.
-      if (m.gameId && !known.has(m.gameId) && !found.some(g => g.gameId === m.gameId)) {
+      //     NO viene del código → se valida abajo (custom + tournamentCode) antes
+      //     de ingerirlo: el botón "auto-detectar" llegó a enlazar flex rankeds.
+      const fromCode = new Set<number>(found.map(g => g.gameId));
+      if (m.gameId && !known.has(m.gameId) && !fromCode.has(m.gameId)) {
         found.push({ gameId: m.gameId, platform: m.gameRegion || t.region || 'la1' });
       }
 
@@ -672,6 +675,20 @@ async function syncTournamentFullInner(tournamentId: string): Promise<{ synced: 
         if (!fetched) continue;
         const info = fetched.data.info;
         if (!info.gameEndTimestamp) continue; // juego aún en curso
+        if (!fromCode.has(g.gameId)) {
+          // Enlace manual/callback sin respaldo del código: solo customs y, si
+          // Match-V5 trae tournamentCode, tiene que ser ESTE código.
+          const codeOk = !info.tournamentCode || !m.code || info.tournamentCode === m.code;
+          if (!isCustomGame(info) || !codeOk) {
+            console.warn(`[tournament-sync] ${t.id}/${m.id}: gameId ${g.gameId} enlazado no es custom de este código (${info.gameType} q=${info.queueId}) — se ignora y se desenlaza`);
+            if (t.bracket[i].gameId === g.gameId) {
+              const last = t.bracket[i].games?.[t.bracket[i].games!.length - 1];
+              t.bracket[i].gameId = last?.gameId; t.bracket[i].gameRegion = last?.gameRegion; changed = true;
+            }
+            await pool.query('DELETE FROM tournament_match_stats WHERE tournament_id=? AND bracket_match_id=? AND game_id=?', [t.id, m.id, g.gameId]).catch(() => {});
+            continue;
+          }
+        }
         known.add(g.gameId);
 
         const riotMid = riotMatchId(g.gameId, fetched.platform);

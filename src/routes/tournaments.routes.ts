@@ -2905,19 +2905,23 @@ router.post('/:id/matches/:matchId/auto-detect-game', requireAuth, async (req: a
     const account = await getAccountByRiotId(gameName.trim(), tagLine.trim(), { platformHint: platform });
     if (!account?.puuid) return res.status(404).json({ error: `No se encontró cuenta para ${captainRiotId}` });
 
-    // Try each platform's match history to find the most recent custom/tournament game
+    // Historial reciente del capitán → SOLO customs de torneo y, si Match-V5
+    // trae tournamentCode, el de ESTE partido. Antes tomaba la partida más
+    // reciente sin filtrar y enlazó flex rankeds (LQC r1m6/r1m8/r1m9, sep-2026).
     let foundMatchId: string | null = null;
     let foundPlatform = platform;
-    for (const pf of probePlatforms) {
-      const ids = await getMatchIdsByPUUID(pf, account.puuid, 5, 0);
-      if (ids && ids.length > 0) {
-        foundMatchId = ids[0];
-        foundPlatform = pf;
-        break;
+    outer: for (const pf of probePlatforms) {
+      const ids = await getMatchIdsByPUUID(pf, account.puuid, 10, 0);
+      for (const mid of ids || []) {
+        const info = (await getMatchById(pf, mid))?.info;
+        if (!info) continue;
+        const custom = info.gameType === 'CUSTOM_GAME' || Number(info.queueId) === 0;
+        const codeOk = !info.tournamentCode || !match.code || info.tournamentCode === match.code;
+        if (custom && codeOk) { foundMatchId = mid; foundPlatform = pf; break outer; }
       }
     }
 
-    if (!foundMatchId) return res.status(404).json({ error: 'No se encontraron partidas recientes. Espera unos minutos y reintenta.' });
+    if (!foundMatchId) return res.status(404).json({ error: 'No se encontró una custom de torneo reciente del capitán (las rankeds/normales no cuentan). Espera unos minutos y reintenta.' });
 
     // Extract numeric gameId from matchId (e.g. "LA1_1234567890" → 1234567890)
     const parts = foundMatchId.split('_');
@@ -3218,7 +3222,11 @@ router.get('/:id/matches/:matchId/stats', async (req, res) => {
     // Serve from DB cache if complete (game already finished + saved).
     // Series Bo3/Bo5: `games` trae TODOS los juegos en orden; el top-level
     // sigue siendo el último para compatibilidad con clientes viejos.
-    const allGames = await getStoredMatchGames(id, matchId);
+    // Si la serie ya tiene juegos atribuidos, solo esos cuentan: filas viejas
+    // (p.ej. una flex enlazada por error) no deben aparecer como "juego 1".
+    const seriesIds = new Set((match.games || []).map(g => Number(g.gameId)));
+    const allGames = (await getStoredMatchGames(id, matchId))
+      .filter((g: any) => !seriesIds.size || seriesIds.has(Number(String(g.matchId).split('_').pop())));
     if (allGames.length) {
       const seriesDone = match.matchStatus === 'complete';
       const expected = match.matchStatus === 'complete' || (match.games?.length || 0) <= allGames.length;
