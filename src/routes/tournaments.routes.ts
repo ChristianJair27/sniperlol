@@ -920,6 +920,14 @@ export function pairSwissRound(t: TournamentData, round: number): BracketMatch[]
     const rest = teams.filter(x => !result.some(([a, b]) => a === x || b === x));
     if (rest.length === 1) {
       matches.push({ id: `r${round}m${matches.length + 1}`, round, matchNumber: matches.length + 1, team1: rest[0], team2: 'BYE', winner: rest[0], code: null, matchStatus: 'complete', seriesTo: roundSeriesTo });
+      // BYE = victoria acreditada en la tabla (antes había que sumarla a mano:
+      // REV505 r1 y RAKU r2 del LQC 2026).
+      if (t.standings) {
+        t.standings = t.standings
+          .map(s => s.team === rest[0] ? { ...s, wins: s.wins + 1, points: s.points + 3 } : s)
+          .sort((a, b) => b.points - a.points)
+          .map((s, i) => ({ ...s, position: i + 1 }));
+      }
     }
   }
   return matches;
