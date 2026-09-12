@@ -27,6 +27,8 @@ interface BracketMatch {
   id: string; round: number; matchNumber: number;
   team1: string | null; team2: string | null;
   winner: string | null; code: string | null;
+  /** Códigos anteriores del partido (regenerados por cambio de roster). */
+  prevCodes?: string[];
   matchStatus: MatchStatus;
   score1?: number; score2?: number;
   gameId?: number; gameRegion?: string;
@@ -449,6 +451,7 @@ function sanitizeBracketMatch(m: BracketMatch, access: ViewerAccess): BracketMat
   return {
     ...m,
     code: null,
+    prevCodes: undefined,
     team1Puuids: undefined,
     team2Puuids: undefined,
   };
