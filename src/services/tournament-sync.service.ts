@@ -648,7 +648,13 @@ async function syncTournamentFullInner(tournamentId: string): Promise<{ synced: 
 
       // 1. Detectar TODOS los juegos del código (series pueden tener varios)
       const found: CodeGame[] = [];
-      if (m.code) found.push(...await detectAllGamesByCode(m.code, t.region || 'la1'));
+      // Códigos regenerados (cambio de roster ⇒ nueva allowlist): los viejos
+      // siguen siendo válidos en Riot, así que también se consultan.
+      for (const c of [m.code, ...((m as any).prevCodes || [])].filter(Boolean) as string[]) {
+        for (const g of await detectAllGamesByCode(c, t.region || 'la1')) {
+          if (!found.some(f => f.gameId === g.gameId)) found.push(g);
+        }
+      }
       // 1a. gameId enlazado por callback/admin que el código aún no reporta.
       //     NO viene del código → se valida abajo (custom + tournamentCode) antes
       //     de ingerirlo: el botón "auto-detectar" llegó a enlazar flex rankeds.
