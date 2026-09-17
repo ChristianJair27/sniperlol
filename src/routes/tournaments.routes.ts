@@ -3504,9 +3504,123 @@ export async function computeGlobalStats(id: string) {
       };
     });
 
+    // ── Puntuación y posición en el torneo ──────────────────────────────────
+    // score 0-100 = promedio de los 8 ejes del radar del dashboard, cada uno
+    // winsorizado a [p05, p95] de la cohorte (≥3 partidas) y llevado a 0-100.
+    // Mismo método que PlayerRadarCard en el frontend, para que "#1" y la
+    // silueta del radar cuenten la misma historia. Sin el recorte al p95 un
+    // solo KDA de 54 aplastaría a los demás. rank solo para ≥3 partidas: con
+    // 1-2 juegos un 100% de WR no significa nada; los demás llevan rank null.
+    attachScoreAndRank(players);
+    await attachSoloRanks(players);
+
     return { tournamentId: id, matchesCompleted: rows.length, players, lastUpdated: Date.now() };
   }
 }
+
+const RANK_MIN_GAMES = 3;
+type Axis = { raw: (p: any) => number; invert?: boolean };
+const SCORE_AXES: Axis[] = [
+  { raw: (p) => p.avgKda },
+  { raw: (p) => p.winrate },
+  { raw: (p) => p.avgDamagePerMin },
+  { raw: (p) => p.avgGoldPerMin },
+  { raw: (p) => p.avgCsPerMin },
+  { raw: (p) => p.avgVisionPerMin },
+  { raw: (p) => (p.totalKills + p.totalAssists) / Math.max(1, p.gamesPlayed) },
+  { raw: (p) => p.totalDeaths / Math.max(1, p.gamesPlayed), invert: true },
+];
+function quantile(sorted: number[], q: number): number {
+  if (!sorted.length) return 0;
+  const i = (sorted.length - 1) * q, lo = Math.floor(i), hi = Math.ceil(i);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+export function attachScoreAndRank(players: any[]) {
+  const cohort = players.filter((p) => p.gamesPlayed >= RANK_MIN_GAMES);
+  const ref = cohort.length >= 5 ? cohort : players;
+  const scales = SCORE_AXES.map((ax) => {
+    const v = ref.map(ax.raw).filter(Number.isFinite).sort((a, b) => a - b);
+    const lo = quantile(v, 0.05), hi = quantile(v, 0.95);
+    return { lo, hi: hi > lo ? hi : lo + 1 };
+  });
+  for (const p of players) {
+    const parts = SCORE_AXES.map((ax, i) => {
+      const { lo, hi } = scales[i];
+      const c = Math.min(hi, Math.max(lo, ax.raw(p)));
+      const pct = ((c - lo) / (hi - lo)) * 100;
+      return ax.invert ? 100 - pct : pct;
+    });
+    p.score = Math.round(parts.reduce((a, b) => a + b, 0) / parts.length);
+    p.rank = null;
+  }
+  players
+    .filter((p) => p.gamesPlayed >= RANK_MIN_GAMES)
+    .sort((a, b) => b.score - a.score || b.gamesPlayed - a.gamesPlayed || b.avgKda - a.avgKda)
+    .forEach((p, i) => { p.rank = i + 1; });
+}
+
+// Rango solo/duo desde seen_summoners (lo refresca el sync de fondo; aquí solo
+// se lee). Cruce por nombre#tag; si la columna aún no existe, todo queda null.
+async function attachSoloRanks(players: any[]) {
+  if (!players.length) return;
+  try {
+    const [rows] = await pool.query<any[]>(
+      `SELECT game_name, tag_line, solo_tier, solo_rank, solo_lp FROM seen_summoners
+       WHERE solo_tier IS NOT NULL AND game_name IN (${players.map(() => '?').join(',')})`,
+      players.map((p) => p.summonerName),
+    );
+    const norm = (x: string) => String(x || '').toLowerCase().replace(/\s+/g, '');
+    const byKey = new Map<string, any>();
+    for (const r of rows) byKey.set(`${norm(r.game_name)}#${norm(r.tag_line)}`, r);
+    for (const p of players) {
+      const r = byKey.get(`${norm(p.summonerName)}#${norm(p.tagLine)}`);
+      p.soloTier = r?.solo_tier ?? null;
+      p.soloDivision = r?.solo_rank ?? null;
+      p.soloLp = r?.solo_lp ?? null;
+    }
+  } catch { for (const p of players) { p.soloTier = null; p.soloDivision = null; p.soloLp = null; } }
+}
+
+// ── Torneos de un jugador (para su perfil de invocador) ─────────────────────
+// Busca al Riot ID en los rosters inscritos de torneos activos o cerrados y
+// devuelve, por torneo, su equipo, región y posición/puntuación/rango.
+export async function tournamentsOfPlayer(riotId: string) {
+  const norm = (x: string) => String(x || '').toLowerCase().replace(/\s+/g, '');
+  const [gnRaw, tlRaw] = riotId.split('#');
+  const gn = norm(gnRaw), tl = norm(tlRaw || '');
+  if (!gn) return [];
+  const [regs] = await pool.query<any[]>(
+    `SELECT r.tournament_id, r.team_name, r.players, r.captain_riot_id,
+            t.name, t.region, t.phase, t.start_date
+     FROM tournament_registrations r JOIN tournaments t ON t.id = r.tournament_id
+     WHERE t.phase IN ('active','complete') AND (LOWER(r.players) LIKE ? OR LOWER(r.captain_riot_id) LIKE ?)
+     ORDER BY t.start_date DESC LIMIT 12`,
+    [`%${gnRaw.toLowerCase()}%`, `%${gnRaw.toLowerCase()}%`],
+  );
+  const out: any[] = [];
+  for (const r of regs) {
+    const ids = [r.captain_riot_id, ...(parseJson(r.players) || []).map((p: any) => p?.riotId)].filter(Boolean) as string[];
+    const hit = ids.some((id) => { const [g, t] = String(id).split('#'); return norm(g) === gn && (!tl || norm(t || '') === tl); });
+    if (!hit) continue;
+    const gs = await computeGlobalStats(r.tournament_id);
+    const me = gs.players.find((p: any) => norm(p.summonerName) === gn && (!tl || norm(p.tagLine) === tl))
+      ?? gs.players.find((p: any) => norm(p.summonerName) === gn) ?? null;
+    out.push({
+      tournamentId: r.tournament_id, name: r.name, region: r.region || 'la1', phase: r.phase,
+      team: r.team_name,
+      rank: me?.rank ?? null, score: me?.score ?? null, rankedPlayers: gs.players.filter((p: any) => p.rank).length,
+      gamesPlayed: me?.gamesPlayed ?? 0, winrate: me?.winrate ?? null, avgKda: me?.avgKda ?? null,
+      soloTier: me?.soloTier ?? null, soloDivision: me?.soloDivision ?? null,
+    });
+  }
+  return out;
+}
+
+// GET /player/:riotId — torneos en los que está inscrito un jugador.
+router.get('/player/:riotId', async (req, res) => {
+  try { res.json({ tournaments: await tournamentsOfPlayer(String(req.params.riotId)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
 
 router.get('/:id/global-stats', async (req, res) => {
   const { id } = req.params;

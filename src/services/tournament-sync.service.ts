@@ -1,7 +1,7 @@
 // Background + on-demand sync: gameIds from tournament codes, Match-V5 stats, auto-results.
 import { pool } from '../db.js';
 import { getGamesByCode } from './riot-tournament.service.js';
-import { getMatchById, getAccountByRiotId, getMatchIdsByPUUID } from './riot.js';
+import { getMatchById, getAccountByRiotId, getMatchIdsByPUUID, getLeagueEntriesByPuuid } from './riot.js';
 import { notifyDiscordSeriesDone, notifyDiscordChampion } from './discord.service.js';
 
 type BracketMatch = {
@@ -911,6 +911,92 @@ async function applyResultInPlace(t: TournamentData, mi: number, winner: string)
   }
 }
 
+// ── Rango de LoL (solo/duo) de los jugadores del torneo ──────────────────────
+// Se guarda en seen_summoners (mismo índice que usan los iconos de perfil) con
+// un sello de tiempo, y se refresca como mucho cada RANK_TTL_MS por torneo
+// desde el tick de fondo. Así ni /global-stats ni la API pública llaman a
+// Riot: leen columnas. Secuencial con pausa para respetar el rate limit.
+const RANK_TTL_MS = 6 * 60 * 60_000;
+const RANK_REFRESH_EVERY_MS = 30 * 60_000;
+const lastRankRefresh = new Map<string, number>();
+
+let rankColumnsReady: Promise<void> | null = null;
+function ensureRankColumns(): Promise<void> {
+  if (rankColumnsReady) return rankColumnsReady;
+  rankColumnsReady = (async () => {
+    for (const ddl of [
+      'ALTER TABLE seen_summoners ADD COLUMN IF NOT EXISTS solo_tier VARCHAR(16) NULL',
+      'ALTER TABLE seen_summoners ADD COLUMN IF NOT EXISTS solo_rank VARCHAR(4) NULL',
+      'ALTER TABLE seen_summoners ADD COLUMN IF NOT EXISTS solo_lp INT NULL',
+      'ALTER TABLE seen_summoners ADD COLUMN IF NOT EXISTS rank_at TIMESTAMP NULL',
+    ]) {
+      try { await pool.query(ddl); } catch (e: any) { console.warn('[ranks] DDL:', e.message); }
+    }
+  })();
+  return rankColumnsReady;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Refresca el rango solo/duo de todos los inscritos de un torneo cuya entrada
+ * falte o tenga más de RANK_TTL_MS. Usa el puuid del roster (ya resuelto en
+ * la inscripción); si falta, resuelve el Riot ID una vez.
+ */
+export async function refreshTournamentRanks(t: TournamentData): Promise<number> {
+  await ensureRankColumns();
+  const platform = t.region || 'la1';
+  const [regs] = await pool.query<any[]>(
+    'SELECT team_name, players FROM tournament_registrations WHERE tournament_id = ?', [t.id],
+  );
+  const roster: Array<{ riotId: string; puuid?: string }> = [];
+  for (const r of regs) {
+    for (const p of parseJson(r.players) || []) if (p?.riotId) roster.push({ riotId: String(p.riotId), puuid: p.puuid });
+  }
+  if (!roster.length) return 0;
+
+  const [rows] = await pool.query<any[]>(
+    `SELECT puuid, game_name, tag_line, rank_at FROM seen_summoners
+     WHERE puuid IN (${roster.map(() => '?').join(',')})`,
+    roster.map((r) => r.puuid || ''),
+  );
+  const fresh = new Set(
+    rows.filter((r) => r.rank_at && Date.now() - new Date(r.rank_at).getTime() < RANK_TTL_MS).map((r) => r.puuid),
+  );
+
+  let updated = 0;
+  for (const p of roster) {
+    try {
+      let puuid = p.puuid;
+      const [gn, tl] = p.riotId.split('#');
+      if (!puuid && gn && tl) {
+        const acc = await getAccountByRiotId(gn.trim(), tl.trim(), { platformHint: platform });
+        puuid = acc?.puuid;
+      }
+      if (!puuid || fresh.has(puuid)) continue;
+      const entries = await getLeagueEntriesByPuuid(platform, puuid);
+      const solo = entries.find((e) => e.queueType === 'RANKED_SOLO_5x5') ?? null;
+      await pool.query(
+        `INSERT INTO seen_summoners (puuid, game_name, tag_line, platform, solo_tier, solo_rank, solo_lp, rank_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE solo_tier = VALUES(solo_tier), solo_rank = VALUES(solo_rank),
+           solo_lp = VALUES(solo_lp), rank_at = NOW()`,
+        [puuid, (gn || '').slice(0, 64), (tl || '').slice(0, 16), platform.slice(0, 8),
+         solo?.tier ?? null, solo?.rank ?? null, solo?.leaguePoints ?? null],
+      );
+      updated++;
+      await sleep(120);
+    } catch (e: any) {
+      if (e?.response?.status === 429 || /429|rate/i.test(String(e?.message))) {
+        console.warn(`[ranks] ${t.id}: 429 de Riot — se reintenta en el siguiente ciclo`);
+        break;
+      }
+    }
+  }
+  if (updated) console.log(`[ranks] ${t.id}: ${updated} rango(s) actualizados`);
+  return updated;
+}
+
 const SYNC_INTERVAL_MS = 60_000;
 let syncRunning = false;
 
@@ -927,6 +1013,12 @@ export function startTournamentBackgroundSync() {
           const result = await syncTournamentFull(row.id);
           if (result.synced > 0) {
             console.log(`[tournament-sync] ${row.id}: synced ${result.synced} match(es)`);
+          }
+          // Rangos de LoL: como mucho cada 30 min por torneo, nunca en el request.
+          if (Date.now() - (lastRankRefresh.get(row.id) ?? 0) > RANK_REFRESH_EVERY_MS) {
+            lastRankRefresh.set(row.id, Date.now());
+            const t = await getT(row.id);
+            if (t) refreshTournamentRanks(t).catch((e) => console.error(`[ranks] ${row.id}:`, e.message));
           }
         } catch (e: any) {
           console.error(`[tournament-sync] ${row.id} error:`, e.message);

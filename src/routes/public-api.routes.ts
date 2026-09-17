@@ -22,6 +22,7 @@ import cors from 'cors';
 import { pool } from '../db.js';
 import {
   getT, getRegs, sanitizeBracket, getStoredMatchStats, getStoredMatchGames, computeGlobalStats,
+  tournamentsOfPlayer,
 } from './tournaments.routes.js';
 
 const router = Router();
@@ -250,6 +251,16 @@ router.get('/tournaments/:id/stats', async (req, res) => {
     if (!t) return res.status(404).json({ ok: false, error: 'Torneo no encontrado' });
     const data = await cached(`gs:${req.params.id}`, async () =>
       attachTeams(req.params.id, await computeGlobalStats(req.params.id)));
+    res.json({ ok: true, data });
+  } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// Torneos de un jugador: equipo, región y posición/puntuación/rango por torneo.
+router.get('/players/:riotId/tournaments', async (req, res) => {
+  try {
+    const riotId = String(req.params.riotId || '');
+    if (!riotId.includes('#')) return res.status(400).json({ ok: false, error: 'riotId debe ser nombre#tag' });
+    const data = await cached(`pt:${riotId.toLowerCase()}`, () => tournamentsOfPlayer(riotId));
     res.json({ ok: true, data });
   } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
 });

@@ -73,6 +73,31 @@ Incluye todo lo de la lista más:
 }
 ```
 
+### 2b. Torneos de un jugador
+
+```
+GET /players/{riotId}/tournaments        (riotId = nombre#tag, URL-encoded: Kister%23NGC)
+```
+
+Para la página de un jugador: en qué torneos está inscrito y cómo va en cada uno.
+
+```json
+{
+  "ok": true,
+  "data": [
+    {
+      "tournamentId": "lqc-2026", "name": "LQC 2026", "region": "la1", "phase": "active",
+      "team": "Requiem",
+      "rank": 14, "score": 64, "rankedPlayers": 87,
+      "gamesPlayed": 4, "winrate": 100, "avgKda": 5.25,
+      "soloTier": "EMERALD", "soloDivision": "I"
+    }
+  ]
+}
+```
+
+`rankedPlayers` es cuántos jugadores tienen posición (≥3 partidas), para mostrar "14 de 87". Solo torneos activos o finalizados; array vacío si no está en ninguno.
+
 ### 3. Solo standings
 
 ```
@@ -210,6 +235,8 @@ GET /tournaments/:id/stats
       {
         "summonerName": "Kister", "tagLine": "NGC",
         "team": "REV505",
+        "rank": 1, "score": 90,
+        "soloTier": "EMERALD", "soloDivision": "I", "soloLp": 42,
         "mostPlayedChamp": "Katarina", "championPool": ["Katarina"],
         "gamesPlayed": 1, "wins": 1, "losses": 0, "winrate": 100,
         "totalKills": 9, "totalDeaths": 1, "totalAssists": 0, "avgKda": 9,
@@ -227,6 +254,9 @@ GET /tournaments/:id/stats
 Notas de `/stats`:
 
 - `matchesCompleted` cuenta **juegos** individuales terminados, no series (un Bo3 2-1 son 3).
+- `score` (0–100) es la **puntuación del torneo**: promedio de 8 ejes (KDA, WR, daño/min, oro/min, CS/min, visión/min, kills+asistencias por partida, muertes por partida invertidas), cada uno recortado al percentil 5–95 de los jugadores con ≥3 partidas y llevado a 0–100. El recorte es lo que evita que un KDA de 54 aplaste al resto.
+- `rank` es la **posición en el torneo** ordenando por `score` (desempate: partidas, luego KDA). Es `null` para quien tiene menos de 3 partidas. Es el mismo "#1" que muestra el dashboard de ATAK: úsenlo tal cual para el bloque de líderes.
+- `soloTier` / `soloDivision` / `soloLp` son el rango **solo/dúo actual** de la cuenta (Riot League v4), refrescado por el backend como mucho cada 6 h. `null` si la cuenta no tiene ranked o aún no se ha resuelto. Tiers: IRON, BRONZE, SILVER, GOLD, PLATINUM, EMERALD, DIAMOND, MASTER, GRANDMASTER, CHALLENGER; división I–IV (sin división de MASTER en adelante).
 - `team` es el equipo inscrito con el que cruza el Riot ID del jugador (`nombre#tag`, y como respaldo solo el nombre). Es `null` cuando la persona jugó con una cuenta distinta a la registrada; no lo descartes, muéstralo como "Sin equipo".
 - `avgKda` = (kills + asistencias) / muertes; con 0 muertes es kills + asistencias. Puede dar valores extremos reales (p.ej. 54 con 9/2/99): conviene un tope visual.
 - Las métricas `avg…PerMin` son total del torneo / minutos jugados en el torneo, no promedio de promedios. `avgDamagePerMin` es daño **a campeones**.
