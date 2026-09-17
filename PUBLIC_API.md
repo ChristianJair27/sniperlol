@@ -111,7 +111,22 @@ GET /tournaments/:id/bracket
 }
 ```
 
-`status` por partido: `pending` (esperando equipos) → `ready` (equipos definidos) → `active` (en juego) → `complete`.
+`status` por partido: `pending` (esperando equipos) → `ready` (equipos definidos) → `active` (**emparejada con código de lobby asignado**, no necesariamente jugando) → `complete`.
+
+> ⚠ `active` NO significa "en juego ahora mismo": se pone en cuanto la serie recibe su código, que puede ser horas antes del primer juego. Para saber si la serie empezó usa `gamesPlayed`:
+> - `active` + `gamesPlayed: 0` → emparejada, sin empezar.
+> - `active` + `gamesPlayed: 1` (de `seriesTo: 2`) → serie en curso, entre juegos.
+> No hay hoy una señal fiable de "partida en curso ahora mismo" en esta API.
+
+Campos por partido además de los del ejemplo:
+
+| Campo | Tipo | Significado |
+|---|---|---|
+| `gamesPlayed` | number | Juegos de la serie ya terminados (0 hasta que acabe el primero). |
+| `seriesTo` | number | Victorias necesarias para ganar la serie (2 = Bo3, 3 = Bo5, 1 = Bo1). |
+| `scheduledAt` | string \| null | Horario oficial fijado por el organizador, ISO 8601 con zona. `null` si no lo ha cargado. |
+
+Las series con descanso vienen con `team2: "BYE"` y `status: "complete"`: fíltralas antes de contar.
 Las rondas van de 1 a N; la ronda máxima es la final. `id` del partido tiene forma `r{ronda}m{número}`.
 
 ### 5. Partidos (lista plana, filtrable)
@@ -133,7 +148,7 @@ GET /tournaments/:id/matches/:matchId/stats
 curl https://atakback.revolution505.com/api/public/v1/tournaments/hola-1782358778133/matches/r1m1/stats
 ```
 
-- **200** — partida terminada, stats completas:
+- **200** — partida terminada, stats completas. Los campos de primer nivel son el **último juego** de la serie; `games` trae **todos los juegos en orden de juego** (en un Bo3 2-1, tres entradas), cada uno con el mismo shape:
 
 ```json
 {
@@ -194,6 +209,7 @@ GET /tournaments/:id/stats
     "players": [
       {
         "summonerName": "Kister", "tagLine": "NGC",
+        "team": "REV505",
         "mostPlayedChamp": "Katarina", "championPool": ["Katarina"],
         "gamesPlayed": 1, "wins": 1, "losses": 0, "winrate": 100,
         "totalKills": 9, "totalDeaths": 1, "totalAssists": 0, "avgKda": 9,
@@ -207,6 +223,14 @@ GET /tournaments/:id/stats
   }
 }
 ```
+
+Notas de `/stats`:
+
+- `matchesCompleted` cuenta **juegos** individuales terminados, no series (un Bo3 2-1 son 3).
+- `team` es el equipo inscrito con el que cruza el Riot ID del jugador (`nombre#tag`, y como respaldo solo el nombre). Es `null` cuando la persona jugó con una cuenta distinta a la registrada; no lo descartes, muéstralo como "Sin equipo".
+- `avgKda` = (kills + asistencias) / muertes; con 0 muertes es kills + asistencias. Puede dar valores extremos reales (p.ej. 54 con 9/2/99): conviene un tope visual.
+- Las métricas `avg…PerMin` son total del torneo / minutos jugados en el torneo, no promedio de promedios. `avgDamagePerMin` es daño **a campeones**.
+- `winrate` es entero 0–100. Para rankings de WR usa un piso de partidas (≥3): con 1 juego hay 100 % que no significan nada.
 
 ## Recetas rápidas
 

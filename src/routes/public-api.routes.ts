@@ -21,7 +21,7 @@ import { Router } from 'express';
 import cors from 'cors';
 import { pool } from '../db.js';
 import {
-  getT, getRegs, sanitizeBracket, getStoredMatchStats, computeGlobalStats,
+  getT, getRegs, sanitizeBracket, getStoredMatchStats, getStoredMatchGames, computeGlobalStats,
 } from './tournaments.routes.js';
 
 const router = Router();
@@ -69,11 +69,48 @@ function publicMatch(m: any) {
     team1: m.team1,
     team2: m.team2,
     winner: m.winner || null,
-    status: m.matchStatus,              // pending | ready | active | complete
+    // pending | ready | active | complete. OJO: 'active' = la serie ya tiene
+    // código de lobby asignado (emparejada), NO "jugando ahora". Para saber si
+    // empezó, mirar gamesPlayed > 0. Ver PUBLIC_API.md.
+    status: m.matchStatus,
     score1: m.score1 ?? null,
     score2: m.score2 ?? null,
+    // Serie Bo3/Bo5: juegos ya terminados y a cuántas victorias se juega.
+    gamesPlayed: Array.isArray(m.games) ? m.games.length : (m.gameId ? 1 : 0),
+    seriesTo: Number(m.seriesTo) || 1,
+    // Horario oficial fijado por el organizador (ISO 8601) o null.
+    scheduledAt: m.scheduledAt ?? null,
     gameId: m.gameId ?? null,
     gameRegion: m.gameRegion ?? null,
+  };
+}
+
+// Equipo de cada jugador de /stats, cruzando su Riot ID con los rosters
+// inscritos. Misma regla que usa el dashboard: "nombre#tag" normalizado
+// (minúsculas, sin espacios) y, como respaldo, solo el nombre. Quien juega con
+// una cuenta distinta a la inscrita queda en null — nunca se inventa.
+const normKey = (s: string) => (s || '').toLowerCase().replace(/\s+/g, '');
+async function attachTeams(tournamentId: string, stats: any) {
+  const regs = await getRegs(tournamentId);
+  const byFull = new Map<string, string>();
+  const byName = new Map<string, string>();
+  for (const r of regs) {
+    const ids = [r.captainRiotId, ...(r.players ?? []).map((p: any) => p?.riotId)].filter(Boolean) as string[];
+    for (const rid of ids) {
+      const [gn, tl] = String(rid).split('#');
+      if (!gn) continue;
+      byFull.set(`${normKey(gn)}#${normKey(tl || '')}`, r.teamName);
+      if (!byName.has(normKey(gn))) byName.set(normKey(gn), r.teamName);
+    }
+  }
+  return {
+    ...stats,
+    players: (stats.players ?? []).map((p: any) => ({
+      ...p,
+      team: byFull.get(`${normKey(p.summonerName)}#${normKey(p.tagLine)}`)
+        ?? byName.get(normKey(p.summonerName))
+        ?? null,
+    })),
   };
 }
 
@@ -186,7 +223,15 @@ router.get('/tournaments/:id/matches/:matchId/stats', async (req, res) => {
     const match = (t.bracket ?? []).find(m => m.id === matchId);
     if (!match) return res.status(404).json({ ok: false, error: 'Partido no encontrado' });
 
-    const stored = await cached(`ms:${id}:${matchId}`, () => getStoredMatchStats(id, matchId));
+    // Series Bo3/Bo5: `games` trae TODOS los juegos en orden de juego. Los
+    // campos de primer nivel siguen siendo el último juego (compatibilidad
+    // con quien ya consumía este endpoint).
+    const stored = await cached(`ms:${id}:${matchId}`, async () => {
+      const last = await getStoredMatchStats(id, matchId);
+      if (!last) return null;
+      const games = await getStoredMatchGames(id, matchId);
+      return { ...last, games };
+    });
     if (stored) return res.json({ ok: true, data: stored });
 
     return res.status(202).json({
@@ -203,7 +248,8 @@ router.get('/tournaments/:id/stats', async (req, res) => {
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ ok: false, error: 'Torneo no encontrado' });
-    const data = await cached(`gs:${req.params.id}`, () => computeGlobalStats(req.params.id));
+    const data = await cached(`gs:${req.params.id}`, async () =>
+      attachTeams(req.params.id, await computeGlobalStats(req.params.id)));
     res.json({ ok: true, data });
   } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
 });
