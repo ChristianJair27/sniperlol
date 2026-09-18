@@ -3616,6 +3616,48 @@ export async function tournamentsOfPlayer(riotId: string) {
   return out;
 }
 
+// ── Cambio de roster con el torneo ya en marcha ─────────────────────────────
+// Los códigos de Riot llevan una lista blanca de PUUIDs y son inmutables: si
+// entra alguien nuevo al equipo, su código actual NO le deja entrar al lobby.
+// Esto regenera el código de las series pendientes de ese equipo (las que aún
+// no tienen ningún juego) y guarda el anterior en `prevCodes`, que el sync
+// también consulta. Se hizo dos veces a mano (REV505 12-sep, DinoRatas 17-sep);
+// aquí queda automatizado.
+export async function refreshCodesForTeam(
+  tournamentId: string, teamName: string,
+): Promise<Array<{ matchId: string; code: string | null; previous: string | null }>> {
+  const t = await getT(tournamentId);
+  if (!t?.bracket) return [];
+  const out: Array<{ matchId: string; code: string | null; previous: string | null }> = [];
+  let changed = false;
+
+  for (let i = 0; i < t.bracket.length; i++) {
+    const m = t.bracket[i];
+    if (m.team1 !== teamName && m.team2 !== teamName) continue;
+    if (m.team1 === 'BYE' || m.team2 === 'BYE') continue;
+    // Serie ya empezada o cerrada: NO se toca. Regenerar a mitad de una serie
+    // dejaría fuera a quien ya está jugando con el código viejo.
+    if (m.matchStatus === 'complete' || (m.games?.length ?? 0) > 0) continue;
+    if (!m.team1 || !m.team2) continue;
+
+    const previous = m.code ?? null;
+    try {
+      const code = await assignCodeToMatch(t, i);
+      if (code && previous && code !== previous) {
+        (t.bracket[i] as any).prevCodes = [...(((t.bracket[i] as any).prevCodes) ?? []), previous];
+      }
+      out.push({ matchId: m.id, code: code ?? null, previous });
+      changed = true;
+    } catch (e: any) {
+      console.error(`[roster] no se pudo regenerar el código de ${m.id}:`, e.message);
+      out.push({ matchId: m.id, code: null, previous });
+    }
+  }
+
+  if (changed) await saveT(t);
+  return out;
+}
+
 // ── Historial de un jugador DENTRO de un torneo ─────────────────────────────
 // Feedback de usuario: "falta de qué equipo es" y "un historial de sus partidas
 // dentro de ese torneo" — para ver su recorrido, para scoutear a un rival antes

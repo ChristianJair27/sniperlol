@@ -8,6 +8,16 @@
 //   Auth: header `X-LQC-Secret` debe coincidir con env LQC_WEBHOOK_SECRET.
 //   Idempotente: si el equipo ya existe se agrega/actualiza el jugador por
 //   gamertag; reenviar el mismo registro no duplica nada.
+//
+//   Por fase del torneo:
+//     registration          → todo: crear equipo, alta y actualización.
+//     checkin / active      → solo roster de equipos YA inscritos: actualizar
+//                             nombre o correo, y dar de alta a un refuerzo.
+//                             Crear equipos nuevos responde 409 explicándolo.
+//                             Un alta en `active` regenera el código de las
+//                             series pendientes de ese equipo (las que aún no
+//                             tienen juegos) y lo devuelve en `codesRefreshed`.
+//     complete / cancelled  → 409, no se toca nada.
 import { Router } from 'express';
 import { pool } from '../db.js';
 import { getT, findRosterConflicts, rosterConflictError } from './tournaments.routes.js';
@@ -195,7 +205,13 @@ router.post('/lqc/register', async (req, res) => {
   try {
     const t = await getT(tournamentId);
     if (!t) return bad(res, 404, `Torneo ${tournamentId} no existe`);
-    if (t.phase !== 'registration') return bad(res, 409, `El torneo ya no está en fase de registro (${t.phase})`);
+    // Con el torneo en marcha ya no se crean equipos (el bracket está hecho),
+    // pero SÍ se admiten cambios de roster: corregir el nombre o el correo de
+    // alguien, y dar de alta a un refuerzo en un equipo que ya existe. Eso
+    // pasa de verdad —dos altas a mano en el LQC— y antes obligaba a tocar la
+    // base a mano. Cerrado el torneo, no se toca nada.
+    const rosterEditable = t.phase === 'registration' || t.phase === 'checkin' || t.phase === 'active';
+    if (!rosterEditable) return bad(res, 409, `El torneo está ${t.phase}: ya no admite cambios de roster`);
 
     const [[reg]] = await pool.query<any[]>(
       'SELECT * FROM tournament_registrations WHERE tournament_id=? AND LOWER(team_name)=LOWER(?)',
@@ -204,6 +220,9 @@ router.post('/lqc/register', async (req, res) => {
 
     if (!reg) {
       // Equipo nuevo — el primer registro lo crea; capitán = dato del form
+      if (t.phase !== 'registration') {
+        return bad(res, 409, `El equipo "${teamName}" no existe y el torneo ya empezó (${t.phase}): no se pueden crear equipos nuevos. Si es un cambio de nombre, manda el alta con el nombre de equipo que ya está inscrito.`);
+      }
       const [regs] = await pool.query<any[]>(
         'SELECT COUNT(*) AS c FROM tournament_registrations WHERE tournament_id=?', [tournamentId]
       );
@@ -249,11 +268,25 @@ router.post('/lqc/register', async (req, res) => {
     await pool.query('UPDATE tournament_registrations SET players=? WHERE id=?', [JSON.stringify(players), reg.id]);
     if (idx < 0) inviteByEmail(t); // alta nueva → invitación
     else if (emailChanged && players[idx].inviteStatus === 'pending') inviteByEmail(t); // correo corregido → re-invitación
+
+    // Alta con el torneo en marcha: el código de las series pendientes lleva
+    // una lista blanca sin el nuevo jugador y Riot no deja editarla, así que
+    // hay que regenerarlo o no podrá entrar al lobby.
+    let codesRefreshed: Array<{ matchId: string; code: string | null; previous: string | null }> = [];
+    if (idx < 0 && t.phase === 'active') {
+      const { refreshCodesForTeam } = await import('./tournaments.routes.js');
+      codesRefreshed = await refreshCodesForTeam(tournamentId, reg.team_name);
+      if (codesRefreshed.length) {
+        console.log(`[lqc/register] ${gamertag} entra a ${reg.team_name} con el torneo activo — códigos regenerados: ${codesRefreshed.map(c => c.matchId).join(', ')}`);
+      }
+    }
+
     return res.json({
       ok: true,
       action: idx >= 0 ? 'player_updated' : 'player_added',
       team: teamName, player: gamertag, teamSize: players.length,
       ...(idx >= 0 ? { emailChanged, invitationResent: emailChanged && players[idx].inviteStatus === 'pending' } : {}),
+      ...(codesRefreshed.length ? { codesRefreshed } : {}),
     });
   } catch (err: any) {
     console.error('[lqc/register]', err.message);
