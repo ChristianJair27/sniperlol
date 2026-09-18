@@ -22,7 +22,7 @@ import cors from 'cors';
 import { pool } from '../db.js';
 import {
   getT, getRegs, sanitizeBracket, getStoredMatchStats, getStoredMatchGames, computeGlobalStats,
-  tournamentsOfPlayer,
+  tournamentsOfPlayer, playerTournamentGames,
 } from './tournaments.routes.js';
 
 const router = Router();
@@ -261,6 +261,18 @@ router.get('/players/:riotId/tournaments', async (req, res) => {
     const riotId = String(req.params.riotId || '');
     if (!riotId.includes('#')) return res.status(400).json({ ok: false, error: 'riotId debe ser nombre#tag' });
     const data = await cached(`pt:${riotId.toLowerCase()}`, () => tournamentsOfPlayer(riotId));
+    res.json({ ok: true, data });
+  } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// Historial de un jugador DENTRO de un torneo: cada partida con campeón,
+// resultado, KDA, rol y rival. Para fichas de jugador y scouting.
+router.get('/tournaments/:id/players/:riotId/games', async (req, res) => {
+  try {
+    const riotId = String(req.params.riotId || '');
+    if (!riotId.includes('#')) return res.status(400).json({ ok: false, error: 'riotId debe ser nombre#tag' });
+    const data = await cached(`pg:${req.params.id}:${riotId.toLowerCase()}`,
+      () => playerTournamentGames(String(req.params.id), riotId));
     res.json({ ok: true, data });
   } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
 });

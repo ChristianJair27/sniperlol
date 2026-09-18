@@ -3616,6 +3616,104 @@ export async function tournamentsOfPlayer(riotId: string) {
   return out;
 }
 
+// ── Historial de un jugador DENTRO de un torneo ─────────────────────────────
+// Feedback de usuario: "falta de qué equipo es" y "un historial de sus partidas
+// dentro de ese torneo" — para ver su recorrido, para scoutear a un rival antes
+// de jugarlo, o simplemente por curiosidad. Todo sale de tournament_match_stats
+// (ya guardado por el sync); cero llamadas a Riot.
+export async function playerTournamentGames(tournamentId: string, riotId: string) {
+  const norm = (x: string) => String(x || '').toLowerCase().replace(/\s+/g, '');
+  const [gnRaw, tlRaw] = riotId.split('#');
+  const gn = norm(gnRaw), tl = norm(tlRaw || '');
+  if (!gn) return { team: null, games: [] as any[] };
+
+  const t = await getT(tournamentId);
+  if (!t) return { team: null, games: [] as any[] };
+
+  // Equipo inscrito (mismo cruce que /stats): nombre#tag y, de respaldo, nombre.
+  let team: string | null = null;
+  for (const r of await getRegs(tournamentId)) {
+    const ids = [r.captainRiotId, ...(r.players ?? []).map((p: any) => p?.riotId)].filter(Boolean) as string[];
+    if (ids.some((id) => { const [g, x] = String(id).split('#'); return norm(g) === gn && (!tl || norm(x || '') === tl); })) { team = r.teamName; break; }
+  }
+
+  const byMatch = new Map<string, any>();
+  for (const m of t.bracket ?? []) byMatch.set(m.id, m);
+  const maxRound = Math.max(1, ...(t.bracket ?? []).map((m) => m.round));
+  const roundLabel = (r: number) => {
+    if (t.bracketType === 'round_robin') return `Jornada ${r}`;
+    if (t.bracketType === 'swiss') return `Ronda ${r}`;
+    const d = maxRound - r;
+    return d === 0 ? 'Final' : d === 1 ? 'Semifinales' : d === 2 ? 'Cuartos' : `Ronda ${r}`;
+  };
+
+  const [rows] = await pool.query<any[]>(
+    `SELECT bracket_match_id, game_id, parsed_data, game_duration, game_end_ts
+     FROM tournament_match_stats
+     WHERE tournament_id = ? AND game_end_ts IS NOT NULL
+     ORDER BY game_end_ts ASC`,
+    [tournamentId],
+  );
+
+  const games: any[] = [];
+  for (const row of rows) {
+    const data: any = typeof row.parsed_data === 'string' ? JSON.parse(row.parsed_data) : row.parsed_data;
+    const blue: any[] = data.blueTeam ?? [], red: any[] = data.redTeam ?? [];
+    const side = blue.some((p) => norm(p.summonerName) === gn && (!tl || norm(p.tagLine || '') === tl)) ? 'blue'
+      : red.some((p) => norm(p.summonerName) === gn && (!tl || norm(p.tagLine || '') === tl)) ? 'red'
+      : blue.some((p) => norm(p.summonerName) === gn) ? 'blue'
+      : red.some((p) => norm(p.summonerName) === gn) ? 'red' : null;
+    if (!side) continue;
+    const me = (side === 'blue' ? blue : red).find((p) => norm(p.summonerName) === gn);
+    if (!me) continue;
+
+    const m = byMatch.get(row.bracket_match_id);
+    const mins = Math.max(1, (row.game_duration || data.gameDuration || 0) / 60);
+    // Rival = el OTRO equipo de la serie del bracket (los lados de la partida no
+    // siempre coinciden con team1/team2, así que se deduce del equipo propio).
+    const opponent = m ? (team && m.team1 === team ? m.team2 : team && m.team2 === team ? m.team1 : (m.team1 === team ? m.team2 : m.team1)) : null;
+
+    games.push({
+      matchId: row.bracket_match_id,
+      round: m?.round ?? null,
+      roundLabel: m?.round ? roundLabel(m.round) : null,
+      opponent: opponent ?? null,
+      gameId: Number(row.game_id),
+      riotMatchId: data.matchId ?? null,
+      at: row.game_end_ts ? Number(row.game_end_ts) : null,
+      duration: row.game_duration || data.gameDuration || 0,
+      side,
+      champion: me.championName ?? '',
+      win: !!me.win,
+      kills: me.kills ?? 0, deaths: me.deaths ?? 0, assists: me.assists ?? 0,
+      kda: me.deaths === 0 ? (me.kills ?? 0) + (me.assists ?? 0) : Math.round(((me.kills + me.assists) / me.deaths) * 100) / 100,
+      cs: me.cs ?? 0,
+      csPerMin: Math.round(((me.cs ?? 0) / mins) * 10) / 10,
+      damage: me.totalDamageDealt ?? 0,
+      damagePerMin: Math.round(((me.totalDamageDealt ?? 0) / mins) * 10) / 10,
+      gold: me.goldEarned ?? 0,
+      vision: me.visionScore ?? 0,
+      teamPosition: me.teamPosition || null,
+      killParticipation: me.challenges?.killParticipation ?? null,
+      multiKills: {
+        penta: me.pentaKills ?? 0, quadra: me.quadraKills ?? 0,
+        triple: me.tripleKills ?? 0, double: me.doubleKills ?? 0,
+      },
+    });
+  }
+
+  games.sort((a, b) => (b.at ?? 0) - (a.at ?? 0)); // más reciente primero
+  return { team, games };
+}
+
+// GET /:id/player/:riotId/games — historial del jugador en ESTE torneo.
+router.get('/:id/player/:riotId/games', async (req, res) => {
+  try {
+    const riotId = String(req.params.riotId || '');
+    res.json(await playerTournamentGames(String(req.params.id), riotId));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /player/:riotId — torneos en los que está inscrito un jugador.
 router.get('/player/:riotId', async (req, res) => {
   try { res.json({ tournaments: await tournamentsOfPlayer(String(req.params.riotId)) }); }
