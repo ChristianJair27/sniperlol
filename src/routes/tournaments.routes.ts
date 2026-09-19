@@ -3407,8 +3407,39 @@ router.post('/:id/auto-sync', async (req, res) => {
 
 // Global stats — aggregated from all completed bracket matches in this tournament.
 // Extraída a función para reutilizarla desde la API pública (/api/public/v1).
+// Renombrados de cuenta Riot: el nombre visible NO es identidad. Un jugador
+// que se cambia el nombre a mitad de torneo aparecería dos veces en las stats
+// (las partidas guardan el nombre del momento). Este mapa manda cada alias
+// conocido a su Riot ID actual, leyendo `aliases` del roster, para que las dos
+// mitades se sumen en una. Las partidas nuevas ya traen `puuid` y se unen por
+// ahí; esto cubre las viejas, que no lo tienen.
+const normId = (x: string) => String(x || '').toLowerCase().replace(/\s+/g, '');
+async function buildAliasMap(tournamentId: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  try {
+    const [rows] = await pool.query<any[]>(
+      'SELECT players FROM tournament_registrations WHERE tournament_id = ?', [tournamentId],
+    );
+    for (const r of rows) {
+      const players = typeof r.players === 'string' ? JSON.parse(r.players) : (r.players ?? []);
+      for (const pl of players) {
+        const current = String(pl?.riotId || '');
+        if (!current) continue;
+        for (const alias of (pl?.aliases ?? []) as string[]) {
+          if (alias && normId(alias) !== normId(current)) out.set(normId(alias), current);
+        }
+      }
+    }
+  } catch { /* sin roster legible, sin alias: cada nombre va por su cuenta */ }
+  return out;
+}
+
 export async function computeGlobalStats(id: string) {
   {
+    const aliasMap = await buildAliasMap(id);
+    // puuid → clave elegida, para unir partidas del mismo jugador aunque el
+    // nombre cambiara entre una y otra.
+    const keyByPuuid = new Map<string, string>();
     const [rows] = await pool.query<any[]>(
       `SELECT parsed_data, game_duration FROM tournament_match_stats
        WHERE tournament_id = ? AND game_end_ts IS NOT NULL
@@ -3439,10 +3470,19 @@ export async function computeGlobalStats(id: string) {
       const all: any[] = [...(data.blueTeam ?? []), ...(data.redTeam ?? [])];
 
       for (const p of all) {
-        const key = `${p.summonerName}#${p.tagLine || ''}`;
+        // Identidad: puuid si la partida lo trae; si no, el nombre resuelto
+        // contra los alias del roster.
+        const raw = `${p.summonerName}#${p.tagLine || ''}`;
+        const canonical = aliasMap.get(normId(raw)) ?? raw;
+        let key = canonical;
+        if (p.puuid) {
+          const seen = keyByPuuid.get(p.puuid);
+          if (seen) key = seen; else keyByPuuid.set(p.puuid, key);
+        }
         if (!playerMap.has(key)) {
+          const [cName, cTag] = key.split('#');
           playerMap.set(key, {
-            summonerName: p.summonerName, tagLine: p.tagLine || '',
+            summonerName: cName || p.summonerName, tagLine: cTag ?? (p.tagLine || ''),
             gamesPlayed: 0, wins: 0,
             totalKills: 0, totalDeaths: 0, totalAssists: 0,
             totalGold: 0, totalDamage: 0, totalVisionScore: 0, totalCs: 0,

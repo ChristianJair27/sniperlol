@@ -1,7 +1,7 @@
 // Background + on-demand sync: gameIds from tournament codes, Match-V5 stats, auto-results.
 import { pool } from '../db.js';
 import { getGamesByCode } from './riot-tournament.service.js';
-import { getMatchById, getAccountByRiotId, getMatchIdsByPUUID, getLeagueEntriesByPuuid } from './riot.js';
+import { getMatchById, getAccountByRiotId, getMatchIdsByPUUID, getLeagueEntriesByPuuid, getAccountByPUUID } from './riot.js';
 import { notifyDiscordSeriesDone, notifyDiscordChampion } from './discord.service.js';
 
 type BracketMatch = {
@@ -179,6 +179,10 @@ function parseParticipant(p: any, gameDuration: number) {
   const cs = (p.totalMinionsKilled ?? 0) + (p.neutralMinionsKilled ?? 0);
   const mins = Math.max(1, gameDuration / 60);
   return {
+    // El PUUID es la ÚNICA identidad estable: Riot deja cambiar el nombre
+    // visible cuando quieras, y sin esto un renombrado parte las estadísticas
+    // del jugador en dos (pasó con midelmorales → Resolve en el LQC).
+    puuid: p.puuid || '',
     summonerName: p.riotIdGameName || p.summonerName || 'Invocador',
     tagLine: p.riotIdTagline || p.riotIdTagLine || '',
     championName: p.championName,
@@ -997,6 +1001,64 @@ export async function refreshTournamentRanks(t: TournamentData): Promise<number>
   return updated;
 }
 
+/**
+ * Renombrados de cuenta Riot. El nombre visible se puede cambiar cuando uno
+ * quiera y el roster se queda con el viejo: el equipo muestra un nombre que ya
+ * no existe y las partidas nuevas no cruzan con el inscrito. Esto compara el
+ * Riot ID guardado con el que Riot da HOY para ese PUUID y, si cambió,
+ * actualiza el roster guardando el anterior en `aliases` — que es lo que usa
+ * computeGlobalStats para sumar las dos mitades en un solo jugador.
+ * Corre en el mismo ciclo que los rangos (TTL de 6 h), sin peticiones extra
+ * fuera de esa ventana.
+ */
+export async function detectRenames(t: TournamentData): Promise<number> {
+  const platform = t.region || 'la1';
+  const [regs] = await pool.query<any[]>(
+    'SELECT id, team_name, captain_riot_id, players FROM tournament_registrations WHERE tournament_id = ?',
+    [t.id],
+  );
+  let renamed = 0;
+
+  for (const r of regs) {
+    const players: any[] = parseJson(r.players) || [];
+    let touched = false;
+
+    for (const pl of players) {
+      if (!pl?.puuid || !pl?.riotId) continue;
+      try {
+        const acc = await getAccountByPUUID(pl.puuid, { platformHint: platform });
+        if (!acc?.gameName) continue;
+        const now = `${acc.gameName}#${acc.tagLine}`;
+        if (now.toLowerCase() === String(pl.riotId).toLowerCase()) continue;
+
+        const previous = String(pl.riotId);
+        pl.aliases = [...new Set([...(pl.aliases ?? []), previous])];
+        pl.riotId = now;
+        if (pl.name === previous) pl.name = now;
+        touched = true;
+        renamed++;
+        console.log(`[rename] ${t.id}/${r.team_name}: "${previous}" → "${now}" (alias guardado)`);
+        await sleep(120);
+      } catch { /* una cuenta que no resuelve no debe parar al resto */ }
+    }
+
+    if (touched) {
+      // El capitán también se renombra si era él.
+      let captain = r.captain_riot_id;
+      for (const pl of players) {
+        if ((pl.aliases ?? []).some((a: string) => a.toLowerCase() === String(captain || '').toLowerCase())) {
+          captain = pl.riotId;
+        }
+      }
+      await pool.query(
+        'UPDATE tournament_registrations SET players = ?, captain_riot_id = ? WHERE id = ?',
+        [JSON.stringify(players), captain, r.id],
+      );
+    }
+  }
+  return renamed;
+}
+
 const SYNC_INTERVAL_MS = 60_000;
 let syncRunning = false;
 
@@ -1018,7 +1080,11 @@ export function startTournamentBackgroundSync() {
           if (Date.now() - (lastRankRefresh.get(row.id) ?? 0) > RANK_REFRESH_EVERY_MS) {
             lastRankRefresh.set(row.id, Date.now());
             const t = await getT(row.id);
-            if (t) refreshTournamentRanks(t).catch((e) => console.error(`[ranks] ${row.id}:`, e.message));
+            if (t) {
+              refreshTournamentRanks(t).catch((e) => console.error(`[ranks] ${row.id}:`, e.message));
+              // Renombrados de cuenta: mismo ciclo, sin peticiones fuera de él.
+              detectRenames(t).catch((e) => console.error(`[rename] ${row.id}:`, e.message));
+            }
           }
         } catch (e: any) {
           console.error(`[tournament-sync] ${row.id} error:`, e.message);
