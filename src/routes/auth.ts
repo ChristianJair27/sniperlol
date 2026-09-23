@@ -20,7 +20,16 @@ type DbUser = {
 };
 
 const WEB_ORIGIN = process.env.WEB_ORIGIN || process.env.CLIENT_URL || "http://localhost:8080";
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+// Sin valor por defecto: este secreto FIRMA los tokens de sesión y los de
+// recuperación de contraseña. Un fallback conocido y escrito en el repo es,
+// en cuanto alguien lo copie a un verificador, suplantación de admin directa.
+// Mejor no arrancar que arrancar inseguro.
+function requiredEnv(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Falta ${name}. Configúralo en el entorno antes de arrancar.`);
+  return v;
+}
+const JWT_SECRET = requiredEnv('JWT_SECRET');
 
 // Helpers
 function signToken(u: { id: number; email: string; role: string }) {

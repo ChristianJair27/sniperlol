@@ -28,6 +28,7 @@ import champSelectRouter from './routes/champ-select.routes.js';
 import lcuProxyRouter from './routes/lcu-proxy.routes.js';
 import opggRouter from './routes/opgg.routes.js';
 import liveFeedRouter from './routes/live-feed.routes.js';
+import { authLimiter, publicApiLimiter } from './middlewares/rateLimit.js';
 
 // ===== CORS =====
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
@@ -57,8 +58,17 @@ const corsOptions: cors.CorsOptions = {
 };
 
 const app = express();
+
+// Detrás del proxy de Coolify/Traefik, sin esto req.ip es SIEMPRE la IP del
+// proxy: los límites de tasa contarían a todo el mundo en un solo cubo y el
+// primer abusador bloquearía a los demás. El 1 es el número de proxies que hay
+// delante; si algún día se agrega un CDN, súbelo.
+app.set('trust proxy', 1);
+
 app.use(cors(corsOptions));
-app.use(express.json());
+// Límite explícito: el default de express.json son 100 KB, pero conviene que
+// esté escrito y no dependa de la versión de la librería.
+app.use(express.json({ limit: '200kb' }));
 // cookieParser DEBE ir antes de cualquier router que lea req.cookies (p.ej. el
 // callback RSO valida la cookie `rso_state`). Antes estaba montado tarde (después
 // de /auth), así que el state llegaba vacío y el login de Riot fallaba con rso_state.
@@ -77,7 +87,9 @@ app.use("/api/players", playersOverview);
 app.use("/api/debug", masteryDebug); // (quizá quieras /api/mastery)
 app.use("/api/players", recent);
 
-app.use("/auth", auth);
+// Registro/login/recuperación: scryptSync es síncrono y bloquea el hilo, así
+// que una avalancha aqui es fuerza bruta Y caída del servidor a la vez.
+app.use("/auth", authLimiter, auth);
 app.use("/api/stats", stats);
 
 app.use("/api/players", playersLink);
@@ -114,7 +126,7 @@ app.use('/api/ai', aiPublicRouter);
 
 app.use('/api/tournaments', tournamentsRouter);
 // API pública v1 (solo lectura, CORS abierto) — documentada en PUBLIC_API.md
-app.use('/api/public/v1', publicApiRouter);
+app.use('/api/public/v1', publicApiLimiter, publicApiRouter);
 app.use('/api/integrations', integrationsRouter);
 app.use('/api/social', socialRouter);
 app.use('/api/champ-select', champSelectRouter);

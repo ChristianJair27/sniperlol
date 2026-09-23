@@ -58,7 +58,11 @@ const qSchema = z.object({
   regional: z.enum(["americas", "europe", "asia"]).optional(), // fuerza región de Account-V1
 });
 
-r.get("/riot", async (req, res, next) => {
+// Admin-only: cada llamada dispara ~22 peticiones a Riot sin caché, así que
+// abierta era la vía más rápida para que Riot nos suspenda la llave. También
+// devuelve puuid y summoner id de cualquier Riot ID, que no es público.
+r.get("/riot", requireAuth, async (req: any, res, next) => {
+  if (req.auth?.role !== "admin") return res.status(403).json({ error: "Solo admin" });
   try {
     const { riotId, probe, name, hint, regional } = qSchema.parse(req.query);
 

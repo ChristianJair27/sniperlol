@@ -41,6 +41,24 @@ async function cached<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return data;
 }
 
+/**
+ * Carga un torneo SOLO si es público.
+ *
+ * La API autenticada filtraba los privados con `privateBlocked`, pero esta no
+ * los filtraba en absoluto: `hidden` e `is_private` son columnas distintas, y
+ * la consulta de la lista solo miraba `hidden`. Resultado: cualquiera podía
+ * leer nombre, premio, standings y ROSTER COMPLETO de un torneo privado con un
+ * simple curl, rompiendo la promesa de "privado = el público no ve nada".
+ *
+ * Devuelve null para inexistente y para privado a propósito: distinguirlos
+ * confirmaría que ese id existe.
+ */
+async function publicT(id: string) {
+  const t = await getT(id);
+  if (!t || (t as any).isPrivate) return null;
+  return t;
+}
+
 // ── Shapes públicos ──────────────────────────────────────────────────────────
 function publicTournament(t: any, teamsRegistered?: number) {
   return {
@@ -148,7 +166,9 @@ router.get('/tournaments', async (_req, res) => {
   try {
     const data = await cached('list', async () => {
       const [rows] = await pool.query<any[]>(
-        'SELECT * FROM tournaments WHERE COALESCE(hidden,0)=0 ORDER BY created_at DESC'
+        // hidden = retirado por nosotros; is_private = invitación del organizador.
+        // Son cosas distintas y las dos deben quedar fuera de la API pública.
+        'SELECT * FROM tournaments WHERE COALESCE(hidden,0)=0 AND COALESCE(is_private,0)=0 ORDER BY created_at DESC'
       );
       const out = [];
       for (const row of rows) {
@@ -165,7 +185,7 @@ router.get('/tournaments', async (_req, res) => {
 router.get('/tournaments/:id', async (req, res) => {
   try {
     const data = await cached(`t:${req.params.id}`, async () => {
-      const t = await getT(req.params.id);
+      const t = await publicT(req.params.id);
       if (!t) return null;
       const regs = await getRegs(t.id);
       return {
@@ -182,7 +202,7 @@ router.get('/tournaments/:id', async (req, res) => {
 // Solo standings
 router.get('/tournaments/:id/standings', async (req, res) => {
   try {
-    const t = await getT(req.params.id);
+    const t = await publicT(req.params.id);
     if (!t) return res.status(404).json({ ok: false, error: 'Torneo no encontrado' });
     res.json({ ok: true, data: t.standings ?? [] });
   } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
@@ -192,7 +212,7 @@ router.get('/tournaments/:id/standings', async (req, res) => {
 router.get('/tournaments/:id/bracket', async (req, res) => {
   try {
     const data = await cached(`b:${req.params.id}`, async () => {
-      const t = await getT(req.params.id);
+      const t = await publicT(req.params.id);
       if (!t) return null;
       const rounds = sanitizeBracket(t.bracket ?? [], 'public') ?? [];
       return { phase: t.phase, matches: rounds.map(publicMatch) };
@@ -205,7 +225,7 @@ router.get('/tournaments/:id/bracket', async (req, res) => {
 // Partidos (alias plano del bracket, cómodo para tablas/calendarios)
 router.get('/tournaments/:id/matches', async (req, res) => {
   try {
-    const t = await getT(req.params.id);
+    const t = await publicT(req.params.id);
     if (!t) return res.status(404).json({ ok: false, error: 'Torneo no encontrado' });
     const matches = (sanitizeBracket(t.bracket ?? [], 'public') ?? []).map(publicMatch);
     const { status } = req.query;
@@ -219,7 +239,7 @@ router.get('/tournaments/:id/matches', async (req, res) => {
 router.get('/tournaments/:id/matches/:matchId/stats', async (req, res) => {
   const { id, matchId } = req.params;
   try {
-    const t = await getT(id);
+    const t = await publicT(id);
     if (!t) return res.status(404).json({ ok: false, error: 'Torneo no encontrado' });
     const match = (t.bracket ?? []).find(m => m.id === matchId);
     if (!match) return res.status(404).json({ ok: false, error: 'Partido no encontrado' });
@@ -247,7 +267,7 @@ router.get('/tournaments/:id/matches/:matchId/stats', async (req, res) => {
 // Stats agregadas del torneo (por jugador)
 router.get('/tournaments/:id/stats', async (req, res) => {
   try {
-    const t = await getT(req.params.id);
+    const t = await publicT(req.params.id);
     if (!t) return res.status(404).json({ ok: false, error: 'Torneo no encontrado' });
     const data = await cached(`gs:${req.params.id}`, async () =>
       attachTeams(req.params.id, await computeGlobalStats(req.params.id)));

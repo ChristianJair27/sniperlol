@@ -13,6 +13,12 @@ import { todayStartFor } from '../services/tournament-scheduler.service.js';
 import { sendTournamentInvitationEmail, sendMatchCodeEmail, isDeliverableEmail } from '../services/mail.service.js';
 import { isValidDiscordWebhook, notifyDiscordCodeReady, notifyDiscordSeriesDone, notifyDiscordChampion } from '../services/discord.service.js';
 import { pool } from '../db.js';
+import {
+  callbackLimiter, createTournamentLimiter, emailLimiter, riotLimiter,
+} from '../middlewares/rateLimit.js';
+import {
+  createTournamentSchema, patchTournamentTextSchema, firstIssue, httpUrl,
+} from '../validation/tournament.schema.js';
 
 const router = Router();
 
@@ -674,6 +680,35 @@ async function monthlyRiotQuotaExceeded(userId: number): Promise<boolean> {
      WHERE created_by=? AND riot_tournament_id IS NOT NULL
        AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)`, [userId]);
   return Number(c) >= RIOT_MAX_TOURNAMENTS_PER_MONTH;
+}
+
+/**
+ * Cuota de CREACIÓN por usuario, independiente de si el torneo usa Riot.
+ *
+ * La cuota mensual de arriba solo cuenta torneos con `riot_tournament_id`, así
+ * que no frenaba nada: una cuenta podía crear filas sin límite y, de paso,
+ * saltarse el tope de 300 códigos por torneo simplemente creando más torneos.
+ * Los admins quedan exentos.
+ */
+const MAX_TOURNAMENTS_PER_DAY = Number(process.env.MAX_TOURNAMENTS_PER_DAY || 10);
+const MAX_TOURNAMENTS_PER_MONTH = Number(process.env.MAX_TOURNAMENTS_PER_MONTH || 40);
+
+async function creationQuotaError(req: any): Promise<string | null> {
+  if (req.auth?.role === 'admin') return null;
+  const uid = req.auth?.userId;
+  if (!uid) return null;
+  const [[row]] = await pool.query<any[]>(
+    `SELECT
+       SUM(created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY))  AS d,
+       SUM(created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)) AS m
+     FROM tournaments WHERE created_by=?`, [uid]);
+  if (Number(row?.d || 0) >= MAX_TOURNAMENTS_PER_DAY) {
+    return `Llegaste al límite de ${MAX_TOURNAMENTS_PER_DAY} torneos por día. Intenta mañana.`;
+  }
+  if (Number(row?.m || 0) >= MAX_TOURNAMENTS_PER_MONTH) {
+    return `Llegaste al límite de ${MAX_TOURNAMENTS_PER_MONTH} torneos por mes. Escríbenos a kister@revolution505.com si necesitas más.`;
+  }
+  return null;
 }
 
 /** Cuota por torneo: códigos ya generados + los que se piden. */
@@ -1577,9 +1612,21 @@ router.delete('/schedules/:sid', requireAuth, async (req: any, res) => {
 });
 
 // POST / — create
-router.post('/', requireAuth, async (req: any, res) => {
+router.post('/', requireAuth, createTournamentLimiter, async (req: any, res) => {
+  // Validación estricta antes de tocar nada: topes de longitud, fechas reales,
+  // enums cerrados. zod además descarta las claves que no están en el esquema,
+  // así que nadie mete columnas por la puerta de atrás.
+  const parsed = createTournamentSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: firstIssue(parsed.error) });
+  req.body = parsed.data;
+
+  const quotaError = await creationQuotaError(req);
+  if (quotaError) {
+    await logDenied(req.auth?.userId, 'POST /tournaments', 'creation_quota');
+    return res.status(429).json({ error: quotaError, code: 'QUOTA_EXCEEDED' });
+  }
+
   const { name, prize, startDate, format, description, maxParticipants, checkinDeadline, createRiot } = req.body;
-  if (!name || !startDate) return res.status(400).json({ error:'name y startDate requeridos' });
 
   // Formato custom: tamaño de equipo (1-5), mapa y tipo de bracket.
   const gameMap: TournamentData['gameMap'] =
@@ -1636,8 +1683,11 @@ router.post('/', requireAuth, async (req: any, res) => {
     }
   }
 
+  // Un nombre hecho solo de símbolos dejaba el slug vacío y el id quedaba en
+  // `-<timestamp>`: dos creaciones en el mismo milisegundo chocaban en la clave
+  // primaria. Con el prefijo de respaldo eso ya no puede pasar.
   const slug = name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
-    .replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
+    .replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'') || 'torneo';
   const id = `${slug}-${Date.now()}`;
   const defaultFormat = gameMap === 'ARENA' ? 'Arena Ladder 2v2'
     : gameMap === 'ARAM' ? `ARAM ${teamSize}v${teamSize}`
@@ -1675,7 +1725,7 @@ router.post('/', requireAuth, async (req: any, res) => {
 // Resolves the match via the code metadata ({tId, mId}) — falling back to a
 // shortCode scan — then records the gameId and auto-advances the bracket using
 // the winningTeam PUUIDs, so no manual result report is needed.
-router.post('/tournament-callback', async (req, res) => {
+router.post('/tournament-callback', callbackLimiter, async (req, res) => {
   // Shared-secret gate — Riot doesn't sign callbacks, so the provider URL carries
   // a ?key= that only we know. Without this, anyone could POST a forged result and
   // advance a bracket. If the secret isn't configured we allow it (back-compat) but warn.
@@ -1983,7 +2033,7 @@ router.get('/:id', optionalAuth, async (req: any, res) => {
 // ── Invitaciones de torneo privado (organizador → correo) ────────────────────
 // Crea una invitación de ACCESO (slot -1, sin equipo): el invitado la recibe
 // por correo + en su dashboard, y con ella puede ver e inscribirse al torneo.
-router.post('/:id/invite', requireAuth, async (req: any, res) => {
+router.post('/:id/invite', requireAuth, emailLimiter, async (req: any, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   if (!email || !email.includes('@')) return res.status(400).json({ error: 'Correo inválido' });
   try {
@@ -1993,8 +2043,11 @@ router.post('/:id/invite', requireAuth, async (req: any, res) => {
 
     const invitedUserId = await findUserByEmail(email);
     if (!invitedUserId) {
+      // A propósito NO decimos si el correo existe o no: con este endpoint
+      // abierto, la diferencia entre "no existe" y "invitación enviada" es un
+      // oráculo para averiguar quién tiene cuenta en ATAK.GG.
       return res.status(400).json({
-        error: `No hay cuenta ATAK.GG con el correo ${email}. Pídele que se registre primero en la plataforma.`,
+        error: 'No se pudo invitar a ese correo. Revisa que la persona ya tenga cuenta en ATAK.GG.',
       });
     }
     if (invitedUserId === req.auth.userId) {
@@ -2032,7 +2085,7 @@ router.get('/:id/invites', requireAuth, async (req: any, res) => {
 });
 
 // Register team — auto-fills captain from linked LoL account; validates Riot IDs; sends invitations
-router.post('/:id/register', requireAuth, async (req: any, res) => {
+router.post('/:id/register', requireAuth, emailLimiter, async (req: any, res) => {
   const { teamName, captainRiotId, players, contact } = req.body;
   if (!teamName || !Array.isArray(players)) {
     return res.status(400).json({ error: 'Datos incompletos' });
@@ -2110,7 +2163,7 @@ router.post('/:id/register', requireAuth, async (req: any, res) => {
         const invitedUserId = await findUserByEmail(inviteEmail);
         if (!invitedUserId) {
           return res.status(400).json({
-            error: `No hay cuenta ATAK.GG con el correo ${inviteEmail}. El jugador debe registrarse primero.`,
+            error: 'No se pudo invitar a ese correo. El jugador debe tener cuenta en ATAK.GG.',
             slot: i,
           });
         }
@@ -3391,7 +3444,10 @@ router.post('/:id/sync-games', requireAuth, async (req: any, res) => {
 });
 
 // POST /:id/auto-sync — público para torneos activos (rate-limited por caché); fuerza sync ligero
-router.post('/:id/auto-sync', async (req, res) => {
+// Sin autenticación por diseño (lo llama el navegador de cualquier espectador),
+// pero cada llamada dispara una sincronización completa contra la API de Riot.
+// El limitador es lo único que impide usarla para agotar la llave.
+router.post('/:id/auto-sync', riotLimiter, async (req: any, res) => {
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
@@ -3814,7 +3870,7 @@ router.get('/:id/global-stats', async (req, res) => {
 });
 
 // Generate codes
-router.post('/:id/generate-codes', requireAuth, async (req: any, res) => {
+router.post('/:id/generate-codes', requireAuth, riotLimiter, async (req: any, res) => {
   const { count=10 } = req.body;
   try {
     const t = await getT(req.params.id);
@@ -3883,6 +3939,12 @@ router.get('/:id/code-info/:code', requireAuth, async (req: any, res) => {
 
 // ─── PATCH /:id — update logo/banner/region (owner only) ─────────────────────
 router.patch('/:id', requireAuth, async (req: any, res) => {
+  // Los campos numéricos y de enum de este handler ya se validaban más abajo;
+  // los de texto y los de URL no. Un logoUrl con esquema `javascript:` acaba
+  // servido por la API pública y convertido en XSS en quien lo pinte.
+  const text = patchTournamentTextSchema.safeParse(req.body ?? {});
+  if (!text.success) return res.status(400).json({ error: firstIssue(text.error) });
+
   const { logoUrl, bannerUrl, region, name, prize, description, fearless } = req.body;
   try {
     const t = await getT(req.params.id);
