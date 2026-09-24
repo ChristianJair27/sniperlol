@@ -1349,13 +1349,25 @@ r.get("/match-replay/:regional/:matchId", async (req, res) => {
       for (const ev of (f.events || [])) {
         const t = Math.round((ev.timestamp ?? 0) / 1000);
         if (ev.type === "CHAMPION_KILL") {
-          events.push({ t, type: "kill", x: ev.position?.x, y: ev.position?.y, k: ev.killerId ?? 0, v: ev.victimId ?? 0 });
+          // `a` = asistentes. La repetición los usa como puntos de paso: en una
+          // pelea sabemos dónde estaba cada participante en ese segundo exacto,
+          // no solo en el snapshot del minuto, así que se mueven hacia la pelea
+          // en vez de atravesarla en línea recta.
+          const a = Array.isArray(ev.assistingParticipantIds) ? ev.assistingParticipantIds : [];
+          events.push({ t, type: "kill", x: ev.position?.x, y: ev.position?.y, k: ev.killerId ?? 0, v: ev.victimId ?? 0, ...(a.length ? { a } : {}) });
         } else if (ev.type === "BUILDING_KILL") {
           events.push({ t, type: ev.buildingType === "INHIBITOR_BUILDING" ? "inhib" : "tower", x: ev.position?.x, y: ev.position?.y, teamId: ev.teamId });
         } else if (ev.type === "ELITE_MONSTER_KILL") {
           const mt = String(ev.monsterType || "");
           const type = mt.includes("DRAGON") ? "dragon" : mt.includes("BARON") ? "baron" : mt.includes("HERALD") ? "herald" : mt.includes("HORDE") ? "grubs" : "monster";
-          events.push({ t, type, x: ev.position?.x, y: ev.position?.y, k: ev.killerId ?? 0 });
+          // `kt` = equipo que lo tomó. Sin él, un objetivo rematado por un
+          // súbdito (killerId 0) se pintaba siempre del color rojo.
+          // `sub` = tipo de dragón (FIRE_DRAGON, ELDER_DRAGON…) o de monstruo.
+          events.push({
+            t, type, x: ev.position?.x, y: ev.position?.y, k: ev.killerId ?? 0,
+            ...(ev.killerTeamId ? { kt: ev.killerTeamId } : {}),
+            ...(ev.monsterSubType ? { sub: String(ev.monsterSubType) } : mt && type === "monster" ? { sub: mt } : {}),
+          });
         }
       }
     }
