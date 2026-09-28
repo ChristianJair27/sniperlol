@@ -1254,9 +1254,14 @@ export async function assignCodeToMatch(t: TournamentData, mi: number): Promise<
 }
 
 // Correos "tu código está listo" a los dos equipos del enfrentamiento.
-// Destinatarios por equipo: cuenta ATAK del capitán/registrador + correos del
-// roster (los equipos del formulario LQC traen email por jugador). Dedup y
-// tope de 8 por equipo. Fire-and-forget: un SMTP caído no afecta el flujo.
+//
+// Destinatarios: SOLO el capitán de cada equipo (su cuenta ATAK si la tiene, y
+// el jugador del roster cuyo Riot ID coincide con el capitán registrado). Antes
+// iba a hasta 8 jugadores por equipo: una ronda del LQC eran hasta 144 correos
+// y el 27-sep chocamos con el tope de 100/día de Hostinger. Quien crea el lobby
+// es el capitán; el resto del equipo ve el código en el panel del torneo y en
+// Discord. Si no hay capitán identificable, se usan los 2 primeros correos del
+// roster. Fire-and-forget: un SMTP caído no afecta el flujo.
 async function notifyMatchCode(t: TournamentData, match: BracketMatch): Promise<void> {
   if (!match.code || !match.team1 || !match.team2 || match.team1 === 'BYE' || match.team2 === 'BYE') return;
   const regs = await getRegs(t.id);
@@ -1271,10 +1276,16 @@ async function notifyMatchCode(t: TournamentData, match: BracketMatch): Promise<
     };
     await addUserEmail((reg as any).captainUserId);
     await addUserEmail(reg.registeredBy);
-    for (const p of reg.players || []) {
-      const em = (p as any).email || p.inviteEmail;
-      if (em) emails.set(String(em).toLowerCase(), p.name || undefined);
-      if (emails.size >= 8) break;
+    const norm = (v?: string) => String(v || '').replace(/\s+/g, '').toLowerCase();
+    const captain = (reg.players || []).find((p) => reg.captainRiotId && norm(p.riotId) === norm(reg.captainRiotId));
+    const capEmail = captain && ((captain as any).email || captain.inviteEmail);
+    if (capEmail) emails.set(String(capEmail).toLowerCase(), captain!.name || undefined);
+    if (!emails.size) {
+      for (const p of reg.players || []) {
+        const em = (p as any).email || p.inviteEmail;
+        if (em) emails.set(String(em).toLowerCase(), p.name || undefined);
+        if (emails.size >= 2) break;
+      }
     }
     for (const [email, name] of emails) {
       sendMatchCodeEmail({

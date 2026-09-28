@@ -61,38 +61,172 @@ export function fixCommonEmailTypos(raw: string): { email: string; fixed: boolea
   return { email: `${local}@${domain}`, fixed, original: fixed ? raw.trim() : undefined };
 }
 
-let transporter: Transporter | null = null;
+// ── Envío con presupuesto diario y proveedor de respaldo ─────────────────────
+//
+// Hostinger corta en 100 correos al día por buzón. La generación de una ronda
+// mandaba el código a hasta 8 jugadores por equipo: 9 series = hasta 144
+// correos de golpe, y el 27-sep chocamos con el límite. Tres defensas, sin
+// pagar nada:
+//   1. Menos volumen: el código de lobby va solo al capitán (ver
+//      notifyMatchCode). El resto lo ve en el panel del torneo y en Discord.
+//   2. Presupuesto propio por proveedor en una ventana móvil de 24 h. Lo
+//      masivo (códigos) se detiene antes del tope y deja margen a lo urgente
+//      (recuperar contraseña, invitaciones). Lo que no cabe se reintenta cada
+//      30 min en vez de perderse o de chocar con el proveedor.
+//   3. Segundo proveedor opcional (SMTP2_*), por ejemplo el plan gratis de
+//      Brevo con 300/día. Si el primero se agota o rechaza por cuota, entra el
+//      segundo automáticamente.
+// Los contadores viven en memoria: tras un reinicio empiezan en cero. Con el
+// volumen reducido del punto 1 eso ya no basta para desbordar el tope.
 
-async function ensureTransporter(): Promise<Transporter> {
-  if (transporter) return transporter;
+type Priority = 'high' | 'bulk';
 
-  if (process.env.SMTP_HOST) {
-    const port = Number(process.env.SMTP_PORT || 587);
-    const secure = process.env.SMTP_SECURE === 'true';
-    transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port,
-      secure,
-      auth: process.env.SMTP_USER ? {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-      } : undefined,
-      tls: { minVersion: 'TLSv1.2' },
-    });
-    console.log('[mail] SMTP configured:', process.env.SMTP_HOST);
-    return transporter;
+interface MailTransport {
+  name: string;
+  t: Transporter;
+  from?: string;
+  limit: number;
+  sent: number[];            // marcas de tiempo de la ventana de 24 h
+  blockedUntil: number;      // tras un rechazo por cuota
+}
+
+const DAY = 24 * 3600_000;
+/** Margen que lo masivo NO puede usar: queda para lo urgente. */
+const BULK_RESERVE = Number(process.env.MAIL_BULK_RESERVE || 15);
+
+let transports: MailTransport[] | null = null;
+let devTransport: Transporter | null = null;
+
+function makeSmtp(prefix: 'SMTP' | 'SMTP2'): Transporter | null {
+  const host = process.env[`${prefix}_HOST`];
+  if (!host) return null;
+  const user = process.env[`${prefix}_USER`];
+  return nodemailer.createTransport({
+    host,
+    port: Number(process.env[`${prefix}_PORT`] || 587),
+    secure: process.env[`${prefix}_SECURE`] === 'true',
+    auth: user ? { user, pass: process.env[`${prefix}_PASS`] } : undefined,
+    tls: { minVersion: 'TLSv1.2' },
+  });
+}
+
+function getTransports(): MailTransport[] {
+  if (transports) return transports;
+  transports = [];
+  const primary = makeSmtp('SMTP');
+  if (primary) {
+    transports.push({ name: process.env.SMTP_HOST!, t: primary, from: process.env.SMTP_FROM,
+      limit: Number(process.env.SMTP_DAILY_LIMIT || 95), sent: [], blockedUntil: 0 });
   }
+  const secondary = makeSmtp('SMTP2');
+  if (secondary) {
+    transports.push({ name: process.env.SMTP2_HOST!, t: secondary, from: process.env.SMTP2_FROM || process.env.SMTP_FROM,
+      limit: Number(process.env.SMTP2_DAILY_LIMIT || 290), sent: [], blockedUntil: 0 });
+  }
+  console.log('[mail] proveedores:', transports.map((x) => `${x.name} (${x.limit}/día)`).join(' → ') || 'ninguno (modo dev)');
+  return transports;
+}
 
+async function ensureDevTransporter(): Promise<Transporter> {
+  if (devTransport) return devTransport;
   // Dev fallback: Ethereal — logs a preview URL (no real inbox delivery)
   const testAccount = await nodemailer.createTestAccount();
-  transporter = nodemailer.createTransport({
-    host: 'smtp.ethereal.email',
-    port: 587,
-    secure: false,
+  devTransport = nodemailer.createTransport({
+    host: 'smtp.ethereal.email', port: 587, secure: false,
     auth: { user: testAccount.user, pass: testAccount.pass },
   });
   console.log('[mail] Dev mode — Ethereal test account. Configure SMTP_HOST for real delivery.');
-  return transporter;
+  return devTransport;
+}
+
+function usedToday(x: MailTransport) {
+  const cutoff = Date.now() - DAY;
+  while (x.sent.length && x.sent[0] < cutoff) x.sent.shift();
+  return x.sent.length;
+}
+
+function hasRoom(x: MailTransport, priority: Priority) {
+  if (Date.now() < x.blockedUntil) return false;
+  const cap = priority === 'bulk' ? x.limit - BULK_RESERVE : x.limit;
+  return usedToday(x) < cap;
+}
+
+/** Rechazo por cuota o límite de tasa del proveedor (no por dirección mala). */
+function isQuotaError(err: any) {
+  const code = Number(err?.responseCode);
+  const msg = String(err?.response || err?.message || '').toLowerCase();
+  return [421, 450, 451, 452, 454].includes(code)
+    || /limit|quota|rate|too many|exceeded/.test(msg);
+}
+
+type Mail = Parameters<Transporter['sendMail']>[0];
+const pending: Array<{ mail: Mail; priority: Priority; tries: number }> = [];
+let retryTimer: NodeJS.Timeout | null = null;
+
+function scheduleRetry() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(async () => {
+    retryTimer = null;
+    const batch = pending.splice(0, pending.length);
+    for (const job of batch) {
+      const r = await deliver(job.mail, job.priority, job.tries + 1).catch(() => null);
+      if (!r) continue;
+    }
+    if (pending.length) scheduleRetry();
+  }, 30 * 60_000);
+}
+
+/**
+ * Envía por el primer proveedor con presupuesto. Si ninguno tiene hueco, lo
+ * masivo se encola para reintentar; lo urgente se intenta igual (Hostinger
+ * sigue enviando por encima del tope, solo que más lento).
+ */
+async function deliver(mail: Mail, priority: Priority, tries = 0): Promise<any> {
+  const list = getTransports();
+  if (!list.length) return (await ensureDevTransporter()).sendMail(mail);
+
+  const candidates = list.filter((x) => hasRoom(x, priority));
+  const order = candidates.length ? candidates : priority === 'high' ? [list[0]] : [];
+
+  if (!order.length) {
+    if (tries < 48 && pending.length < 500) {
+      pending.push({ mail, priority, tries });
+      scheduleRetry();
+      console.warn(`[mail] sin presupuesto hoy: encolado (${pending.length} en espera) → ${String(mail.to)}`);
+    } else {
+      console.error(`[mail] descartado tras ${tries} reintentos → ${String(mail.to)}`);
+    }
+    return null;
+  }
+
+  let lastErr: any;
+  for (const x of order) {
+    try {
+      const info = await x.t.sendMail({ ...mail, from: x.from || mail.from });
+      x.sent.push(Date.now());
+      return info;
+    } catch (err: any) {
+      lastErr = err;
+      if (isQuotaError(err)) {
+        x.blockedUntil = Date.now() + 60 * 60_000;
+        console.warn(`[mail] ${x.name} rechazó por cuota; pausado 1 h`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (priority === 'bulk' && tries < 48) {
+    pending.push({ mail, priority, tries });
+    scheduleRetry();
+    return null;
+  }
+  throw lastErr;
+}
+
+/** Estado de uso, para /api/debug/config o diagnóstico. */
+export function mailUsage() {
+  return getTransports().map((x) => ({ provider: x.name, usedToday: usedToday(x), limit: x.limit, paused: Date.now() < x.blockedUntil }))
+    .concat(pending.length ? [{ provider: 'cola', usedToday: pending.length, limit: 500, paused: false }] : []);
 }
 
 export interface TournamentInviteEmailParams {
@@ -154,15 +288,14 @@ export async function sendTournamentInvitationEmail(params: TournamentInviteEmai
   }
 
   try {
-    const transport = await ensureTransporter();
-    const info = await transport.sendMail({
+    const info = await deliver({
       from,
       to: toEmail,
       replyTo: process.env.SMTP_USER || undefined,
       subject: `Invitacion al torneo ${tournamentName} - equipo ${teamName}`,
       text,
       html,
-    });
+    }, 'high');
 
     let previewUrl: string | undefined;
     if (!process.env.SMTP_HOST) {
@@ -231,12 +364,13 @@ export async function sendMatchCodeEmail(params: {
   const text = `${greeting}: el enfrentamiento de ${teamName} vs ${opponentName} en ${tournamentName} ya tiene código.\n\nCódigo: ${code}\n${when ? `Horario: ${when}\n` : ''}\nEn LoL: Jugar → Torneos → Buscar por código. Cada equipo juega en su propio lado tal como se registró.\n\n${tournamentUrl}`;
 
   try {
-    const transport = await ensureTransporter();
-    const info = await transport.sendMail({
+    const info = await deliver({
       from, to: toEmail, replyTo: process.env.SMTP_USER || undefined,
       subject: `Codigo listo - ${teamName} vs ${opponentName} (${tournamentName})`,
       text, html,
-    });
+    }, 'bulk');
+    // null = sin presupuesto hoy: quedó en cola y se reintenta solo.
+    if (!info) return { sent: false };
     if (!process.env.SMTP_HOST) {
       const preview = nodemailer.getTestMessageUrl(info) || undefined;
       if (preview) console.log(`[mail] Match-code preview for ${toEmail}: ${preview}`);
@@ -265,8 +399,7 @@ export async function sendPasswordResetEmail(params: { toEmail: string; toName?:
     <p style="color:#888;font-size:12px">Si no fuiste t&uacute;, ignora este correo &mdash; tu cuenta sigue segura.</p>
   </div>`;
   try {
-    const transport = await ensureTransporter();
-    const info = await transport.sendMail({ from, to: toEmail, subject: 'Restablecer contrasena - ATAK.GG', text: `${greeting}: restablece tu contrasena (15 min): ${resetUrl}`, html });
+    const info = await deliver({ from, to: toEmail, subject: 'Restablecer contrasena - ATAK.GG', text: `${greeting}: restablece tu contrasena (15 min): ${resetUrl}`, html }, 'high');
     let previewUrl: string | undefined;
     if (!process.env.SMTP_HOST) previewUrl = nodemailer.getTestMessageUrl(info) || undefined;
     return { sent: true, previewUrl };
