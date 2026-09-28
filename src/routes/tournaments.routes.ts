@@ -2342,12 +2342,55 @@ router.post('/:id/registrations/move-player', requireAuth, async (req: any, res)
 });
 
 // GET registrations
+// ── Privacidad de las inscripciones ─────────────────────────────────────────
+// Los rosters que llegan del formulario de la LQC traen datos personales:
+// teléfono, correo, nombre real, fecha de nacimiento, municipio, escolaridad y
+// género. Esta ruta los devolvía CRUDOS a cualquiera, sin sesión. Ahora se
+// filtra por LISTA BLANCA (nunca por lista negra: un campo nuevo del
+// formulario quedaría expuesto sin que nadie se entere):
+//   - organizador/admin → todo (lo necesita para gestionar el torneo)
+//   - capitán, en SU equipo → además el contacto y los correos de invitación,
+//     que usa para editar su roster
+//   - cualquier otro → solo lo que ya es público en una partida de LoL
+const PUBLIC_PLAYER_FIELDS = ['name', 'riotId', 'puuid', 'role', 'inviteStatus', 'aliases'] as const;
+const CAPTAIN_PLAYER_FIELDS = [...PUBLIC_PLAYER_FIELDS, 'inviteEmail', 'userId'] as const;
+
+function pick<T extends object>(o: T, keys: readonly string[]) {
+  const out: Record<string, unknown> = {};
+  for (const k of keys) if ((o as any)[k] !== undefined) out[k] = (o as any)[k];
+  return out;
+}
+
+export function redactRegistration(reg: TeamRegistration, level: 'owner' | 'captain' | 'public') {
+  if (level === 'owner') return reg;
+  const fields = level === 'captain' ? CAPTAIN_PLAYER_FIELDS : PUBLIC_PLAYER_FIELDS;
+  return {
+    id: reg.id,
+    teamName: reg.teamName,
+    captainRiotId: reg.captainRiotId,
+    registeredAt: reg.registeredAt,
+    checkedIn: reg.checkedIn,
+    checkedInAt: reg.checkedInAt,
+    // Ids numéricos: la UI los usa para saber si quien mira es el capitán.
+    registeredBy: reg.registeredBy,
+    captainUserId: reg.captainUserId,
+    ...(level === 'captain' ? { contact: reg.contact } : {}),
+    players: (reg.players || []).map((p: any) => pick(p, fields)),
+  };
+}
+
 router.get('/:id/registrations', optionalAuth, async (req: any, res) => {
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
-    if (privateBlocked(t, await getViewerAccess(t, req.auth))) return res.status(403).json(PRIVATE_403);
-    res.json(await getRegs(req.params.id));
+    const access = await getViewerAccess(t, req.auth);
+    if (privateBlocked(t, access)) return res.status(403).json(PRIVATE_403);
+    const regs = await getRegs(req.params.id);
+    const uid = req.auth?.userId;
+    res.json(regs.map((r) => redactRegistration(r,
+      access === 'owner' ? 'owner'
+        : uid && (r.registeredBy === uid || r.captainUserId === uid) ? 'captain'
+        : 'public')));
   }
   catch (err: any) { res.status(500).json({ error: err.message }); }
 });
