@@ -59,9 +59,55 @@ router.get('/', (_req, res) => {
       'GET  /api/ai/health':  'Estado del modelo (si el host de la IA está encendido).',
       'POST /api/ai/chat':     'Chat estilo OpenAI. body: { messages:[{role,content}], model?, temperature?, json?, max_tokens? }',
       'POST /api/ai/generate': 'Completado simple. body: { prompt, system?, model?, temperature?, json? }',
+      'POST /api/ai/draft-coach': 'ATAK Coach (companion). body: { system?, user } → { content: JSON }. Sin key, 6/min por IP.',
     },
     tip: 'Usa json:true para obtener JSON estructurado (ideal para playlists/recomendaciones).',
   });
+});
+
+// ── ATAK Coach (companion): análisis de draft sin API key ─────────────────────
+// El companion de escritorio manda su prompt (system + user) ya armado y
+// validado localmente; aquí solo se reenvía al Ollama hosteado. Sin llave
+// (la app es pública) pero con rate limit por IP y entrada acotada.
+const COACH_MODEL = process.env.ATAK_COACH_MODEL || 'atak-coach';
+const COACH_RL_MAX = Number(process.env.AI_COACH_RATE_PER_MIN || 6);
+const coachHits = new Map<string, number[]>();
+let coachModelResolved: { at: number; model: string } | null = null;
+async function resolveCoachModel(): Promise<string> {
+  if (coachModelResolved && Date.now() - coachModelResolved.at < 10 * 60_000) return coachModelResolved.model;
+  let model = MODEL;
+  try {
+    const { data } = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000 });
+    const names: string[] = Array.isArray(data?.models) ? data.models.map((m: any) => String(m.name)) : [];
+    if (names.some(n => n.split(':')[0] === COACH_MODEL.split(':')[0])) model = COACH_MODEL;
+  } catch { /* se usa el modelo por defecto */ }
+  coachModelResolved = { at: Date.now(), model };
+  return model;
+}
+router.post('/draft-coach', async (req, res) => {
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || 'anon';
+  const now = Date.now();
+  const arr = (coachHits.get(ip) || []).filter(t => now - t < 60000);
+  if (arr.length >= COACH_RL_MAX) return res.status(429).json({ ok: false, error: `Máximo ${COACH_RL_MAX} análisis por minuto.` });
+  arr.push(now); coachHits.set(ip, arr);
+
+  const b = req.body || {};
+  const system = typeof b.system === 'string' ? b.system : '';
+  const user = typeof b.user === 'string' ? b.user : '';
+  if (!user.trim()) return res.status(400).json({ ok: false, error: 'body.user es requerido' });
+  if (system.length + user.length > MAX_CHARS) return res.status(413).json({ ok: false, error: 'Prompt demasiado grande.' });
+
+  const model = await resolveCoachModel();
+  try {
+    const { data } = await axios.post(`${OLLAMA_BASE}/api/chat`, {
+      model, stream: false, format: 'json', think: false,
+      options: { temperature: 0.25, num_ctx: 8192 },
+      messages: [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: user }],
+    }, { timeout: TIMEOUT });
+    res.json({ ok: true, model, content: data?.message?.content ?? '' });
+  } catch (e: any) {
+    handleOllamaError(e, res);
+  }
 });
 
 // ── Salud / disponibilidad del modelo ─────────────────────────────────────────
