@@ -150,7 +150,8 @@ if (solo && (solo.tier || solo.rank)) {
           win: m?.win ?? null,
           queueName: m?.gameMode ?? null,
           championName: m?.championName ?? null,
-          duration: typeof m?.gameDuration === "number" ? Math.floor(m.gameDuration / 1000) : null,
+          // Riot entrega gameDuration en segundos (el front lo pasa a minutos)
+          duration: typeof m?.gameDuration === "number" ? Math.round(m.gameDuration) : null,
         }));
     } catch {
       // si falla, dejamos recent vacío

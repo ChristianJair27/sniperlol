@@ -352,6 +352,12 @@ async function initTables() {
 }
 initTables()
   .then(() => {
+    // Dev local contra la BD de producción: DISABLE_BACKGROUND_JOBS=1 evita que
+    // una segunda instancia duplique el sync de torneos y el scheduler diario.
+    if (process.env.DISABLE_BACKGROUND_JOBS === '1') {
+      console.log('[tournaments] jobs en segundo plano desactivados (DISABLE_BACKGROUND_JOBS=1)');
+      return;
+    }
     startTournamentBackgroundSync();
     // Torneos diarios: import dinámico para no crear ciclo routes ↔ scheduler.
     import('../services/tournament-scheduler.service.js')
