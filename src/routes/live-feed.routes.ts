@@ -55,6 +55,12 @@ function sanitizePlayer(p: any) {
     items: Array.isArray(p?.items)
       ? p.items.slice(0, 7).map((it: any) => num(it?.itemID ?? it)).filter((n: number) => n > 0)
       : [],
+    // Hechizos de invocador (token canónico "SummonerFlash") y runa clave (id):
+    // el overlay los pinta en cada fila. Solo letras: es un nombre de archivo de icono.
+    spells: Array.isArray(p?.spells)
+      ? p.spells.slice(0, 2).map((x: any) => str(x, 32).replace(/[^A-Za-z0-9_]/g, ''))
+      : [],
+    keystone: num(p?.keystone),
   };
 }
 
@@ -90,7 +96,13 @@ function sanitizeSnapshot(body: any) {
     // Color de acento del overlay (hex #rrggbb) — personalización del caster
     accent: /^#[0-9a-fA-F]{6}$/.test(String(body?.accent || '')) ? String(body.accent) : '',
     players: Array.isArray(body?.players) ? body.players.slice(0, 10).map(sanitizePlayer) : [],
-    events: Array.isArray(body?.events) ? body.events.slice(-80).map(sanitizeEvent) : [],
+    // El companion manda TODOS los eventos de objetivos y estructuras + las
+    // últimas kills: con 80 una partida larga perdía dragones y torres viejos.
+    events: Array.isArray(body?.events) ? body.events.slice(-300).map(sanitizeEvent) : [],
+    // ¿El historial de eventos arranca en el inicio de la partida? Si el
+    // espectador entró a medias, el overlay no puede dar por vivo un objetivo.
+    // null = companion viejo (no lo dice).
+    eventsComplete: typeof body?.eventsComplete === 'boolean' ? body.eventsComplete : null,
   };
 }
 
