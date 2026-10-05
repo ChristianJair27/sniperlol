@@ -119,6 +119,8 @@ interface TournamentData {
   // solo y cierra el torneo al terminar la última; la última ronda usa
   // finalSeriesTo. undefined = manual (botón "Siguiente ronda").
   swissRounds?: number;
+  /** Pareos pre-calculados por ronda (ver columna fixed_schedule). */
+  fixedSchedule?: Record<string, Array<[string, string]>>;
   // Formato de juego custom: tamaño de equipo (1-5) y mapa. Los códigos de
   // Riot soportan SR y ARAM; ARENA no tiene lobbies custom, así que se juega
   // como LADDER: las duplas juegan Arena normal dentro de la ventana del evento
@@ -245,6 +247,10 @@ async function initTables() {
     // Suizo: nº de rondas planeadas → habilita avance automático de ronda.
     // NULL = manual (comportamiento clásico con el botón "Siguiente ronda").
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS swiss_rounds INT DEFAULT NULL`,
+    // Calendario fijo por ronda (JSON { "6": [["A","B"],["C","BYE"]], … }): si la
+    // ronda a generar está aquí, se usa tal cual en vez de parear por récord.
+    // Sirve para ligas "todos contra todos" que avanzan ronda a ronda.
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS fixed_schedule LONGTEXT DEFAULT NULL`,
     // Torneo privado: no aparece en listas públicas y solo se puede inscribir
     // quien tenga invitación del organizador (por correo).
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS is_private TINYINT(1) DEFAULT 0`,
@@ -422,6 +428,7 @@ function rowToTournament(row: any): TournamentData {
     isPrivate: !!row.is_private,
     discordWebhookUrl: row.discord_webhook_url || undefined,
     playoffsSize: Number(row.playoffs_size) || 0,
+    fixedSchedule: parseJson(row.fixed_schedule) || undefined,
   };
 }
 
@@ -912,9 +919,58 @@ function generateSwissRound1(teams: string[]): BracketMatch[] {
   return matches;
 }
 
+/** Ronda tomada del calendario fijo (liga "todos contra todos"). Devuelve null
+ *  si el calendario ya no cuadra con el torneo (equipo que no está en la tabla,
+ *  pareja que ya se enfrentó o equipo repetido): entonces se parea por récord. */
+function buildFixedRound(t: TournamentData, round: number, pairs: Array<[string, string]>): BracketMatch[] | null {
+  const inTable = new Set((t.standings || []).map(s => s.team));
+  const played = new Set<string>();
+  for (const m of t.bracket || []) {
+    if (m.team1 && m.team2 && m.team1 !== 'BYE' && m.team2 !== 'BYE') played.add([m.team1, m.team2].sort().join('|'));
+  }
+  const seen = new Set<string>();
+  for (const [a, b] of pairs) {
+    for (const x of [a, b]) {
+      if (x === 'BYE') continue;
+      if (!inTable.has(x) || seen.has(x)) return null;
+      seen.add(x);
+    }
+    if (a === 'BYE') return null;
+    if (b !== 'BYE' && played.has([a, b].sort().join('|'))) return null;
+  }
+  // Nadie de la tabla puede quedarse sin serie ni descanso.
+  if (seen.size !== inTable.size) return null;
+
+  const seriesTo = t.seriesTo || 1;
+  const real = pairs.filter(([, b]) => b !== 'BYE');
+  const resting = pairs.filter(([, b]) => b === 'BYE').map(([a]) => a);
+  const matches: BracketMatch[] = real.map(([t1, t2], i) => ({
+    id: `r${round}m${i + 1}`, round, matchNumber: i + 1,
+    team1: t1, team2: t2, winner: null, code: null, matchStatus: 'ready', seriesTo,
+  }));
+  // Descansos: igual que el BYE del suizo, victoria acreditada en la tabla.
+  for (const team of resting) {
+    matches.push({ id: `r${round}m${matches.length + 1}`, round, matchNumber: matches.length + 1, team1: team, team2: 'BYE', winner: team, code: null, matchStatus: 'complete', seriesTo });
+  }
+  if (t.standings && resting.length) {
+    t.standings = t.standings
+      .map(s => resting.includes(s.team) ? { ...s, wins: s.wins + 1, points: s.points + 3 } : s)
+      .sort((a, b) => b.points - a.points)
+      .map((s, i) => ({ ...s, position: i + 1 }));
+  }
+  return matches;
+}
+
 /** Parea la siguiente ronda suiza: por récord (wins desc), sin revanchas.
+ *  Con calendario fijo (t.fixedSchedule) la ronda sale de ahí.
  *  Exportada: el sync en background la usa para el avance automático. */
 export function pairSwissRound(t: TournamentData, round: number): BracketMatch[] {
+  const fixed = t.fixedSchedule?.[String(round)];
+  if (Array.isArray(fixed) && fixed.length) {
+    const built = buildFixedRound(t, round, fixed);
+    if (built) return built;
+    console.warn(`[tournaments] ${t.id}: el calendario fijo de la ronda ${round} no cuadra con el torneo — se parea por récord`);
+  }
   const played = new Set<string>();
   for (const m of t.bracket || []) {
     if (m.team1 && m.team2) played.add([m.team1, m.team2].sort().join('|'));
