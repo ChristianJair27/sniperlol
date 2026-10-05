@@ -981,7 +981,7 @@ export function pairSwissRound(t: TournamentData, round: number): BracketMatch[]
 
   // Greedy con backtracking: el mejor disponible contra el mejor rival aún no enfrentado
   const result: Array<[string, string]> = [];
-  const pool = [...teams];
+  let pool: string[] = [];
   function backtrack(): boolean {
     if (pool.length < 2) return true;
     const a = pool.shift()!;
@@ -997,7 +997,23 @@ export function pairSwissRound(t: TournamentData, round: number): BracketMatch[]
     pool.unshift(a);
     return false;
   }
-  if (!backtrack()) {
+  const tryPair = (list: string[]) => { result.length = 0; pool = [...list]; return backtrack(); };
+
+  // Equipos impares: descansa el peor clasificado que AÚN no haya descansado
+  // (regla habitual del suizo). Antes descansaba quien sobrara del pareo y un
+  // mismo equipo podía repetir BYE (The Town Boys, r4 y r5 del LQC 2026).
+  let paired = false;
+  if (teams.length % 2 === 1) {
+    const hadBye = new Set((t.bracket || []).filter(m => m.team2 === 'BYE').map(m => m.team1));
+    const fromBottom = [...teams].reverse();
+    const candidates = [...fromBottom.filter(x => !hadBye.has(x)), ...fromBottom.filter(x => hadBye.has(x))];
+    for (const rest of candidates) {
+      if (tryPair(teams.filter(x => x !== rest))) { paired = true; break; }
+    }
+  } else {
+    paired = tryPair(teams);
+  }
+  if (!paired) {
     // Sin pareo perfecto posible: permitir revanchas como último recurso
     result.length = 0;
     const p2 = [...teams];
@@ -1016,7 +1032,7 @@ export function pairSwissRound(t: TournamentData, round: number): BracketMatch[]
     seriesTo: roundSeriesTo,
   }));
   // BYE para el sobrante (impar)
-  if (pool.length === 1 || teams.length % 2 === 1) {
+  if (teams.length % 2 === 1) {
     const rest = teams.filter(x => !result.some(([a, b]) => a === x || b === x));
     if (rest.length === 1) {
       matches.push({ id: `r${round}m${matches.length + 1}`, round, matchNumber: matches.length + 1, team1: rest[0], team2: 'BYE', winner: rest[0], code: null, matchStatus: 'complete', seriesTo: roundSeriesTo });
