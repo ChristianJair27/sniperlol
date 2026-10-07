@@ -31,3 +31,5 @@ scripts/dev/
 mcps/
 agent-tools/
 terminals/
+tools/replay-render/.env
+tools/replay-render/out/

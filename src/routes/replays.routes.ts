@@ -11,6 +11,7 @@ import { Router, raw } from 'express';
 import crypto from 'node:crypto';
 import rateLimit from 'express-rate-limit';
 import { pool } from '../db.js';
+import { riot, getMatchById } from '../services/riot.js';
 
 const router = Router();
 const MAX_BYTES = 80 * 1024 * 1024;
@@ -20,6 +21,26 @@ const uploadLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: 
 const readLimiter = rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: true, legacyHeaders: false });
 
 async function initTables() {
+  // Clips de video (highlights) renderizados a partir del replay.
+  await pool.query(`CREATE TABLE IF NOT EXISTS tournament_clips (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    tournament_id VARCHAR(64) NOT NULL,
+    match_id VARCHAR(32) NOT NULL,
+    game_id BIGINT NOT NULL,
+    game_region VARCHAR(8) NOT NULL,
+    clip_key VARCHAR(64) NOT NULL,
+    t_start INT NOT NULL,
+    t_end INT NOT NULL,
+    kind VARCHAR(32) NOT NULL,
+    title VARCHAR(160) NOT NULL,
+    players TEXT DEFAULT NULL,
+    mime VARCHAR(40) NOT NULL DEFAULT 'video/mp4',
+    size INT NOT NULL,
+    data LONGBLOB NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_clip (game_region, game_id, clip_key),
+    KEY idx_clip_t (tournament_id)
+  )`);
   await pool.query(`CREATE TABLE IF NOT EXISTS tournament_replays (
     id INT AUTO_INCREMENT PRIMARY KEY,
     tournament_id VARCHAR(64) NOT NULL,
@@ -155,6 +176,150 @@ router.post('/:region/:gameId', uploadLimiter, raw({ type: () => true, limit: MA
     if (e?.type === 'entity.too.large') return res.status(413).json({ ok: false, error: 'archivo demasiado grande' });
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── Momentos clave (highlights) desde el timeline de match-v5 ─────────────────
+// Lo usa el render de video para saber qué cortar y la app para listar "momentos".
+const REGIONAL: Record<string, string> = { LA1: 'americas', LA2: 'americas', NA1: 'americas', BR1: 'americas', OC1: 'sea', EUW1: 'europe', EUN1: 'europe', TR1: 'europe', RU: 'europe', KR: 'asia', JP1: 'asia' };
+export interface Moment { key: string; t: number; tStart: number; tEnd: number; kind: string; title: string; score: number; team?: 'blue' | 'red'; pos?: { x: number; y: number }; players: Array<{ name: string; champion: string; team: 'blue' | 'red' }> }
+const momentsCache = new Map<string, { at: number; data: any }>();
+const MULTI: Record<number, [string, number]> = { 2: ['Doble asesinato', 3], 3: ['Triple asesinato', 6], 4: ['Cuádruple asesinato', 9], 5: ['PENTAKILL', 12] };
+const MONSTER: Record<string, [string, number]> = { BARON_NASHOR: ['Barón Nashor', 5], RIFTHERALD: ['Heraldo', 2], DRAGON: ['Dragón', 1], HORDE: ['Vacuolarvas', 0] };
+
+async function computeMoments(region: string, gameId: number) {
+  const platform = region.toLowerCase();
+  const matchId = `${region}_${gameId}`;
+  const match = await getMatchById(platform, matchId);
+  if (!match?.info) return null;
+  const regional = REGIONAL[region] || 'americas';
+  const { data: tl } = await riot.get(`https://${regional}.api.riotgames.com/lol/match/v5/matches/${matchId}/timeline`, { headers: { 'X-Riot-Token': (process.env.RIOT_API_KEY || '').trim() } });
+  const parts = new Map<number, { name: string; champion: string; team: 'blue' | 'red' }>();
+  for (const p of match.info.participants || []) parts.set(Number(p.participantId), { name: p.riotIdGameName || p.summonerName || `P${p.participantId}`, champion: p.championName || '', team: Number(p.teamId) === 100 ? 'blue' : 'red' });
+  const who = (id: any) => parts.get(Number(id));
+  const sec = (ms: number) => Math.round(ms / 1000);
+  const moments: Moment[] = [];
+  const kills: Array<{ t: number; killer?: number; victim: number; assists: number[]; pos?: { x: number; y: number } }> = [];
+  let lastKillPos: { x: number; y: number } | undefined;
+  for (const f of tl?.info?.frames || []) {
+    for (const ev of f.events || []) {
+      const t = sec(ev.timestamp || 0);
+      const pos = ev.position && Number.isFinite(ev.position.x) ? { x: Number(ev.position.x), y: Number(ev.position.y) } : undefined;
+      if (ev.type === 'CHAMPION_KILL') { kills.push({ t, killer: ev.killerId, victim: ev.victimId, assists: ev.assistingParticipantIds || [], pos }); lastKillPos = pos || lastKillPos; }
+      else if (ev.type === 'CHAMPION_SPECIAL_KILL') {
+        const k = who(ev.killerId); if (!k) continue;
+        if (ev.killType === 'KILL_FIRST_BLOOD') moments.push({ key: `fb-${t}`, t, tStart: t - 10, tEnd: t + 4, kind: 'first_blood', title: `Primera sangre · ${k.name}`, score: 3, team: k.team, pos: pos || lastKillPos, players: [k] });
+        else if (ev.killType === 'KILL_MULTI' && MULTI[ev.multiKillLength]) { const [label, sc] = MULTI[ev.multiKillLength]; moments.push({ key: `multi${ev.multiKillLength}-${t}`, t, tStart: t - 14, tEnd: t + 5, kind: `multikill_${ev.multiKillLength}`, title: `${label} · ${k.name} (${k.champion})`, score: sc, team: k.team, pos: pos || lastKillPos, players: [k] }); }
+        else if (ev.killType === 'KILL_ACE') moments.push({ key: `ace-${t}`, t, tStart: t - 16, tEnd: t + 5, kind: 'ace', title: `ACE · ${k.team === 'blue' ? 'lado azul' : 'lado rojo'}`, score: 7, team: k.team, pos: pos || lastKillPos, players: [k] });
+      } else if (ev.type === 'ELITE_MONSTER_KILL') {
+        const base = MONSTER[ev.monsterType]; if (!base) continue;
+        const k = who(ev.killerId); const team: 'blue' | 'red' = Number(ev.killerTeamId) === 100 ? 'blue' : 'red';
+        let [label, sc] = base;
+        if (ev.monsterType === 'DRAGON' && ev.monsterSubType === 'ELDER_DRAGON') { label = 'Dragón Anciano'; sc = 6; }
+        if (sc <= 0) continue;
+        moments.push({ key: `${ev.monsterType.toLowerCase()}-${t}`, t, tStart: t - 12, tEnd: t + 4, kind: ev.monsterType.toLowerCase(), title: `${label} · ${team === 'blue' ? 'lado azul' : 'lado rojo'}${k ? ` (${k.name})` : ''}`, score: sc, team, pos, players: k ? [k] : [] });
+      } else if (ev.type === 'BUILDING_KILL' && ev.buildingType === 'INHIBITOR_BUILDING') {
+        const team: 'blue' | 'red' = Number(ev.teamId) === 100 ? 'red' : 'blue'; // teamId = dueño del edificio
+        moments.push({ key: `inhib-${t}`, t, tStart: t - 10, tEnd: t + 3, kind: 'inhibitor', title: `Inhibidor destruido · ${team === 'blue' ? 'lado azul' : 'lado rojo'}`, score: 2, team, pos, players: [] });
+      }
+    }
+  }
+  // Peleas: 3+ asesinatos en una ventana de 20 s.
+  kills.sort((a, b) => a.t - b.t);
+  let i = 0;
+  while (i < kills.length) {
+    let j = i; while (j + 1 < kills.length && kills[j + 1].t - kills[i].t <= 20) j++;
+    const n = j - i + 1;
+    if (n >= 3) {
+      const t0 = kills[i].t, t1 = kills[j].t;
+      const involved = new Map<number, number>();
+      for (let x = i; x <= j; x++) { if (kills[x].killer) involved.set(kills[x].killer!, (involved.get(kills[x].killer!) || 0) + 1); }
+      const top = [...involved.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([id]) => who(id)!).filter(Boolean);
+      const blueKills = kills.slice(i, j + 1).filter((kk) => who(kk.killer)?.team === 'blue').length;
+      moments.push({ key: `fight-${t0}`, t: t0, tStart: t0 - 8, tEnd: t1 + 5, kind: 'teamfight', title: `Pelea de equipo · ${n} asesinatos (${blueKills}–${n - blueKills})`, score: 2 + n, team: blueKills * 2 > n ? 'blue' : blueKills * 2 < n ? 'red' : undefined, pos: kills[i].pos, players: top });
+      i = j + 1;
+    } else i++;
+  }
+  moments.sort((a, b) => a.t - b.t);
+  const clamp = (m: Moment) => ({ ...m, tStart: Math.max(0, m.tStart), tEnd: Math.min(sec(match.info.gameDuration * 1000), m.tEnd) });
+  return {
+    gameId, region, gameDuration: Number(match.info.gameDuration) || 0, patch: match.info.gameVersion,
+    teams: { blue: [...parts.values()].filter((p) => p.team === 'blue'), red: [...parts.values()].filter((p) => p.team === 'red') },
+    moments: moments.map(clamp),
+    top: [...moments].sort((a, b) => b.score - a.score || a.t - b.t).slice(0, 8).map(clamp),
+  };
+}
+
+// GET /api/replays/:region/:gameId/moments
+router.get('/:region/:gameId/moments', readLimiter, async (req, res) => {
+  try {
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
+    if (!gameId) return res.status(400).json({ ok: false, error: 'gameId inválido' });
+    const k = key(region, gameId); const c = momentsCache.get(k);
+    if (c && Date.now() - c.at < 3600_000) return res.json({ ok: true, ...c.data });
+    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+    if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
+    const data = await computeMoments(region, gameId);
+    if (!data) return res.status(404).json({ ok: false, error: 'partida sin datos en Riot todavía' });
+    momentsCache.set(k, { at: Date.now(), data });
+    res.json({ ok: true, ...data });
+  } catch (e: any) { res.status(e?.response?.status || 500).json({ ok: false, error: e?.response?.data?.status?.message || e.message }); }
+});
+
+// ── Clips (MP4 renderizados por el worker) ────────────────────────────────────
+const clipUrl = (req: any, region: string, gameId: number, k: string) => `${req.protocol}://${req.get('host')}/api/replays/${region}/${gameId}/clips/${encodeURIComponent(k)}`;
+
+// GET /api/replays/:region/:gameId/clips
+router.get('/:region/:gameId/clips', readLimiter, async (req, res) => {
+  try {
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
+    const [rows] = await pool.query<any[]>('SELECT clip_key, t_start, t_end, kind, title, players, mime, size, created_at FROM tournament_clips WHERE game_region = ? AND game_id = ? ORDER BY t_start', [region, gameId]);
+    res.json({ ok: true, clips: rows.map((r) => ({ key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, region, gameId, r.clip_key) })) });
+  } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// GET /api/replays/tournament/:id/clips — todos los clips del torneo (galería)
+router.get('/tournament/:id/clips', readLimiter, async (req, res) => {
+  try {
+    const [rows] = await pool.query<any[]>('SELECT match_id, game_id, game_region, clip_key, t_start, t_end, kind, title, players, mime, size, created_at FROM tournament_clips WHERE tournament_id = ? ORDER BY game_id DESC, t_start', [req.params.id]);
+    res.json({ ok: true, clips: rows.map((r) => ({ matchId: r.match_id, gameId: Number(r.game_id), region: r.game_region, key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, r.game_region, Number(r.game_id), r.clip_key) })) });
+  } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// POST /api/replays/:region/:gameId/clips/:key  (cuerpo = MP4; cabeceras X-Clip-*)
+// Solo el worker de render (token RENDER_TOKEN) puede subir video.
+router.post('/:region/:gameId/clips/:key', uploadLimiter, raw({ type: () => true, limit: 120 * 1024 * 1024 }), async (req, res) => {
+  try {
+    const token = (process.env.RENDER_TOKEN || '').trim();
+    if (!token || req.get('x-render-token') !== token) return res.status(401).json({ ok: false, error: 'token de render inválido' });
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
+    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+    if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
+    const buf: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (buf.length < 10_000) return res.status(400).json({ ok: false, error: 'video demasiado pequeño' });
+    const k = String(req.params.key).slice(0, 64);
+    const players = String(req.get('x-clip-players') || '[]').slice(0, 2000);
+    await pool.query(
+      `INSERT INTO tournament_clips (tournament_id, match_id, game_id, game_region, clip_key, t_start, t_end, kind, title, players, mime, size, data)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE t_start = VALUES(t_start), t_end = VALUES(t_end), kind = VALUES(kind), title = VALUES(title), players = VALUES(players), mime = VALUES(mime), size = VALUES(size), data = VALUES(data), created_at = CURRENT_TIMESTAMP`,
+      [game.tournamentId, game.matchId, gameId, region, k, Number(req.get('x-clip-start')) || 0, Number(req.get('x-clip-end')) || 0, String(req.get('x-clip-kind') || 'clip').slice(0, 32), decodeURIComponent(String(req.get('x-clip-title') || k)).slice(0, 160), players, String(req.get('content-type') || 'video/mp4').slice(0, 40), buf.length, buf]);
+    console.log(`[replays] clip ${k} de ${region}-${gameId} (${(buf.length / 1048576).toFixed(1)} MB)`);
+    res.status(201).json({ ok: true, url: clipUrl(req, region, gameId, k) });
+  } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// GET /api/replays/:region/:gameId/clips/:key → el video
+router.get('/:region/:gameId/clips/:key', readLimiter, async (req, res) => {
+  try {
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
+    const [[row]] = await pool.query<any[]>('SELECT mime, size, data FROM tournament_clips WHERE game_region = ? AND game_id = ? AND clip_key = ?', [region, gameId, String(req.params.key)]);
+    if (!row) return res.status(404).json({ ok: false, error: 'sin clip' });
+    res.setHeader('Content-Type', row.mime || 'video/mp4');
+    res.setHeader('Content-Length', String(row.size));
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Accept-Ranges', 'none');
+    res.end(row.data);
+  } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ── GET /api/replays/:region/:gameId/meta ─────────────────────────────────────
