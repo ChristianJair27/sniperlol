@@ -8,7 +8,9 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here
 New-Item -ItemType Directory -Force -Path (Join-Path $here 'logs') | Out-Null
-Start-Transcript -Path (Join-Path $here ('logs-juego-' + (Get-Date -Format 'HHmmss') + '.log')) | Out-Null
+Add-Content -Path (Join-Path $here (Join-Path 'logs' 'arranques.txt')) -Value "04 elevado iniciado $(Get-Date -Format 'HH:mm:ss') admin=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+New-Item -ItemType Directory -Force -Path (Join-Path $here 'logs') | Out-Null
+Start-Transcript -Path (Join-Path $here (Join-Path 'logs' ('04-juego-' + (Get-Date -Format 'HHmmss') + '.log'))) | Out-Null
 $cfg = @{}; Get-Content (Join-Path $here '.env') | ForEach-Object { if ($_ -match '^\s*([A-Z_]+)\s*=\s*(.*)$') { $cfg[$matches[1]] = $matches[2].Trim().Trim('"') } }
 $Name = if ($cfg.VM_NAME) { $cfg.VM_NAME } else { 'ATAK-Render' }
 $VmPath = if ($cfg.VM_PATH) { $cfg.VM_PATH } else { 'D:\ATAK-RenderVM' }
