@@ -1,4 +1,4 @@
-# ATAK.GG · VM de render (paso 1/3): habilitar Hyper-V en el host. REQUIERE ADMIN y un REINICIO.
+﻿# ATAK.GG · VM de render (paso 1/3): habilitar Hyper-V en el host. REQUIERE ADMIN y un REINICIO.
 # Si no somos administrador, relanzar elevado (aparece el aviso de Windows para aceptar).
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoExit -ExecutionPolicy Bypass -File "' + $MyInvocation.MyCommand.Path + '"' + ($(if ($args.Count) { ' ' + ($args -join ' ') } else { '' })))

@@ -1,4 +1,4 @@
-# ATAK.GG · VM de render (paso 2/3): crear la VM con GPU particionada e instalar Windows desatendido.
+﻿# ATAK.GG · VM de render (paso 2/3): crear la VM con GPU particionada e instalar Windows desatendido.
 # REQUIERE ADMIN. Hyper-V ya habilitado (paso 1 + reinicio). Lee vm\.env (ISO, ruta, nombre, credenciales).
 #
 #   .\02-crear-vm.ps1                → crea la VM y la arranca; Windows se instala solo (10–20 min)

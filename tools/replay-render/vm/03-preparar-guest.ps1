@@ -1,4 +1,4 @@
-# ATAK.GG · VM de render (paso 3/3): dentro de la VM ya con Windows: driver de la GPU, Node,
+﻿# ATAK.GG · VM de render (paso 3/3): dentro de la VM ya con Windows: driver de la GPU, Node,
 # worker, archivos del juego y tarea de arranque. Se ejecuta EN EL HOST (admin) y entra a la VM
 # por PowerShell Direct con las credenciales de vm\.env. Se puede repetir sin problema.
 # Si no somos administrador, relanzar elevado (aparece el aviso de Windows para aceptar).

@@ -1,4 +1,4 @@
-# Se ejecuta DENTRO de la VM (lo lanza 03-preparar-guest.ps1 por PowerShell Direct).
+﻿# Se ejecuta DENTRO de la VM (lo lanza 03-preparar-guest.ps1 por PowerShell Direct).
 # Node, archivos del juego desde el host, Replay API y tarea que arranca el worker al iniciar sesión.
 param([string]$HostIp, [string]$User)
 $ErrorActionPreference = 'Continue'
