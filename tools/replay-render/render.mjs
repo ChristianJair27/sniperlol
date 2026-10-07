@@ -27,7 +27,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import https from 'node:https';
 import os from 'node:os';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -61,11 +61,26 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 if (!TOKEN) { console.error('Falta RENDER_TOKEN en .env'); process.exit(1); }
 
 // ── LCU ──────────────────────────────────────────────────────────────────────
+// Varios usuarios de Windows comparten la instalación (y el lockfile), así que
+// el cliente se localiza por su proceso LeagueClientUx.exe DE ESTA SESIÓN
+// (--app-port / --remoting-auth-token). El lockfile solo como respaldo.
+let lockCache = null;
 function lockfile() {
-  for (const p of [path.join(LOL_DIR, 'lockfile'), path.join(process.env.LOCALAPPDATA || '', 'Riot Games', 'League of Legends', 'lockfile')]) {
-    try { const [, , port, pw] = fs.readFileSync(p, 'utf8').split(':'); if (port && pw) return { port: Number(port), pw }; } catch { /* siguiente */ }
+  if (lockCache && Date.now() - lockCache.at < 30_000) return lockCache.v;
+  let v = null;
+  try {
+    const ps = "$me=(Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").SessionId; Get-CimInstance Win32_Process -Filter \"Name='LeagueClientUx.exe'\" | Where-Object { $_.SessionId -eq $me } | Select-Object -First 1 -ExpandProperty CommandLine";
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 20_000 }).toString();
+    const port = /--app-port=(\d+)/.exec(out)?.[1], pw = /--remoting-auth-token=([\w-]+)/.exec(out)?.[1];
+    if (port && pw) v = { port: Number(port), pw };
+  } catch { /* sin PowerShell o sin cliente en esta sesión */ }
+  if (!v) {
+    for (const p of [path.join(LOL_DIR, 'lockfile')]) {
+      try { const [, , port, pw] = fs.readFileSync(p, 'utf8').split(':'); if (port && pw) v = { port: Number(port), pw }; } catch { /* siguiente */ }
+    }
   }
-  return null;
+  lockCache = { at: Date.now(), v };
+  return v;
 }
 // fetch de Node no acepta `agent`; para HTTPS local autofirmado usamos https.request.
 function httpsJson(method, url, body, headers = {}) {
