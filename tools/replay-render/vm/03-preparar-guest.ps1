@@ -44,7 +44,9 @@ $disp = Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceClass -e
 $inf = $disp.InfName   # oemNN.inf
 $pub = (pnputil /enum-drivers | Out-String) -split "(?=Nombre publicado|Published Name)" | Where-Object { $_ -match [regex]::Escape($inf) } | Select-Object -First 1
 $orig = if ($pub -match '(?m)^(Nombre original|Original Name):\s*(\S+)') { $matches[2] } else { $null }
-$folder = Get-ChildItem "$env:windir\System32\DriverStore\FileRepository" -Directory | Where-Object { $orig -and $_.Name -like "$($orig.Replace('.inf',''))_*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$repo = "$env:windir\System32\DriverStore\FileRepository"
+$folder = Get-ChildItem $repo -Directory | Where-Object { $orig -and $_.Name -like "$orig`_*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $folder) { $folder = Get-ChildItem $repo -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'nvlddmkm.sys') } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
 if (-not $folder) { throw "No encontré la carpeta del driver de la GPU ($inf / $orig) en DriverStore" }
 Write-Host "Driver GPU: $($disp.DeviceName) · $($folder.Name)"
 Invoke-Command -Session $s { New-Item -ItemType Directory -Force -Path "$env:windir\System32\HostDriverStore\FileRepository" | Out-Null }
