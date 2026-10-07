@@ -3,8 +3,12 @@
 #
 #   .\02-crear-vm.ps1                → crea la VM y la arranca; Windows se instala solo (10–20 min)
 #   .\02-crear-vm.ps1 -GpuPercent 50 → porcentaje de la GPU para la VM (por defecto 50)
-#Requires -RunAsAdministrator
 param([int]$GpuPercent = 50, [int]$MemoryGB = 12, [int]$Cpu = 6, [int]$DiskGB = 120)
+# Si no somos administrador, relanzar elevado (aparece el aviso de Windows para aceptar).
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoExit -ExecutionPolicy Bypass -File "' + $MyInvocation.MyCommand.Path + '"' + ($(if ($args.Count) { ' ' + ($args -join ' ') } else { '' })))
+  exit
+}
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $cfg = @{}

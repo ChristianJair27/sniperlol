@@ -1,7 +1,11 @@
 # ATAK.GG · VM de render (paso 3/3): dentro de la VM ya con Windows: driver de la GPU, Node,
 # worker, archivos del juego y tarea de arranque. Se ejecuta EN EL HOST (admin) y entra a la VM
 # por PowerShell Direct con las credenciales de vm\.env. Se puede repetir sin problema.
-#Requires -RunAsAdministrator
+# Si no somos administrador, relanzar elevado (aparece el aviso de Windows para aceptar).
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoExit -ExecutionPolicy Bypass -File "' + $MyInvocation.MyCommand.Path + '"' + ($(if ($args.Count) { ' ' + ($args -join ' ') } else { '' })))
+  exit
+}
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here   # tools\replay-render
