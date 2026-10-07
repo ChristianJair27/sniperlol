@@ -139,8 +139,19 @@ function launchDirect(rofl) {
   const exe = path.join(LOL_DIR, 'Game', 'League of Legends.exe');
   if (!fs.existsSync(exe)) throw new Error(`no encuentro ${exe}`);
   log('Abriendo el replay directamente con el juego…');
-  const child = spawn(exe, [rofl], { cwd: path.join(LOL_DIR, 'Game'), detached: true, stdio: 'ignore', windowsHide: false });
-  child.unref();
+  // Primer intento: CreateProcess directo. Si Windows lo niega (EPERM: p. ej.
+  // "ejecutar como administrador" marcado en el exe o políticas de la sesión),
+  // segundo intento por ShellExecute (cmd /c start), que respeta esas reglas.
+  try {
+    const child = spawn(exe, [rofl], { cwd: path.join(LOL_DIR, 'Game'), detached: true, stdio: 'ignore', windowsHide: false });
+    child.on('error', (e) => log('spawn directo falló:', e.code || e.message));
+    child.unref();
+  } catch (e) {
+    log('spawn directo falló:', e.code || e.message, '→ intento con start');
+  }
+  const viaStart = spawn('cmd.exe', ['/c', 'start', '""', '/D', path.join(LOL_DIR, 'Game'), exe, rofl], { detached: true, stdio: 'ignore', windowsHide: true });
+  viaStart.on('error', (e) => log('start falló:', e.code || e.message));
+  viaStart.unref();
 }
 
 // ── Cámara: coordenadas del mapa → posición de cámara ───────────────────────
