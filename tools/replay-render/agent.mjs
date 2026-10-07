@@ -59,6 +59,13 @@ http.createServer(async (req, res) => {
       await exec('taskkill', ['/F', '/T', '/PID', String(worker.pid)]);
       return json(res, 200, { ok: true });
     }
+    if (req.method === 'POST' && url.pathname === '/worker/killall') {
+      // Cierra cualquier worker (render.mjs) de esta sesión, aunque no lo haya lanzado el agente.
+      const ps = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -match 'render\.mjs' -and $_.ProcessId -ne " + process.pid + " } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }";
+      const r = await exec('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps]);
+      worker = null;
+      return json(res, 200, { ok: r.ok, killed: r.out.trim().split(/\s+/).filter(Boolean), err: r.err });
+    }
     if (req.method === 'POST' && url.pathname === '/game/kill') {
       return json(res, 200, { ok: true, ...(await exec('taskkill', ['/F', '/IM', 'League of Legends.exe'])) });
     }
