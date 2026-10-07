@@ -34,3 +34,4 @@ terminals/
 tools/replay-render/.env
 tools/replay-render/out/
 tools/replay-render/bin/
+tools/replay-render/.agent-token
