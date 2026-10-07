@@ -51,7 +51,12 @@ const WIDTH = Number(process.env.WIDTH || 1920), HEIGHT = Number(process.env.HEI
 const REPLAY_API = 'https://127.0.0.1:2999';
 const insecure = new https.Agent({ rejectUnauthorized: false });
 
-const log = (...a) => console.log(new Date().toLocaleTimeString('es-MX'), ...a);
+// Log también a archivo en la carpeta del worker (legible desde otra sesión de Windows).
+const LOG_FILE = path.join(here, 'out', 'worker.log');
+try { fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true }); } catch { /* */ }
+const log = (...a) => { const line = `${new Date().toLocaleString('es-MX')} ${a.join(' ')}`; console.log(line); try { fs.appendFileSync(LOG_FILE, line + os.EOL); } catch { /* */ } };
+// config.json (opcional) se relee en cada ciclo de --watch: { "enabled": true, "top": 6, "tournament": "lqc-2026" }
+function readConfig() { try { return JSON.parse(fs.readFileSync(path.join(here, 'config.json'), 'utf8')); } catch { return {}; } }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 if (!TOKEN) { console.error('Falta RENDER_TOKEN en .env'); process.exit(1); }
 
@@ -227,7 +232,9 @@ async function pendingGames(tournamentId) {
   if (!tournament) { console.log('uso: node render.mjs --game <gameId> | --tournament <id> [--watch]'); return; }
   const watch = !!opt('watch', false);
   do {
-    const ids = await pendingGames(tournament);
+    const cfg = readConfig();
+    if (cfg.enabled === false) { log('config.json: enabled=false, en pausa'); await sleep(5 * 60_000); continue; }
+    const ids = await pendingGames(cfg.tournament || tournament);
     log(`${tournament}: ${ids.length} partidas con replay y sin clips`);
     for (const id of ids) { try { await renderGame(id); } catch (e) { log(`✗ ${id}: ${e.message}`); if (/cliente está en|no detectado|puerto 2999/i.test(e.message)) break; } }
     if (watch) await sleep(10 * 60_000);
