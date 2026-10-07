@@ -28,6 +28,7 @@ import champSelectRouter from './routes/champ-select.routes.js';
 import lcuProxyRouter from './routes/lcu-proxy.routes.js';
 import opggRouter from './routes/opgg.routes.js';
 import liveFeedRouter from './routes/live-feed.routes.js';
+import replaysRouter from './routes/replays.routes.js';
 import { authLimiter, publicApiLimiter } from './middlewares/rateLimit.js';
 
 // ===== CORS =====
@@ -134,6 +135,7 @@ app.use('/api/lcu-proxy', lcuProxyRouter);
 app.use('/api/opgg', opggRouter);
 // Broadcast en vivo: el Spectator Companion empuja, el navegador lee (/broadcast).
 app.use('/api/live-feed', liveFeedRouter);
+app.use('/api/replays', replaysRouter);
 
 
 
