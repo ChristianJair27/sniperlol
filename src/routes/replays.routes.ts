@@ -150,6 +150,14 @@ router.get('/tournament/:id', readLimiter, async (req, res) => {
   } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// GET /api/replays/tournament/:id/clips — todos los clips del torneo (galería)
+router.get('/tournament/:id/clips', readLimiter, async (req, res) => {
+  try {
+    const [rows] = await pool.query<any[]>('SELECT match_id, game_id, game_region, clip_key, t_start, t_end, kind, title, players, mime, size, created_at FROM tournament_clips WHERE tournament_id = ? ORDER BY game_id DESC, t_start', [req.params.id]);
+    res.json({ ok: true, clips: rows.map((r) => ({ matchId: r.match_id, gameId: Number(r.game_id), region: r.game_region, key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, r.game_region, Number(r.game_id), r.clip_key) })) });
+  } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // ── POST /api/replays/:region/:gameId  (cuerpo = .rofl crudo) ─────────────────
 router.post('/:region/:gameId', uploadLimiter, raw({ type: () => true, limit: MAX_BYTES }), async (req, res) => {
   try {
@@ -274,14 +282,6 @@ router.get('/:region/:gameId/clips', readLimiter, async (req, res) => {
     const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
     const [rows] = await pool.query<any[]>('SELECT clip_key, t_start, t_end, kind, title, players, mime, size, created_at FROM tournament_clips WHERE game_region = ? AND game_id = ? ORDER BY t_start', [region, gameId]);
     res.json({ ok: true, clips: rows.map((r) => ({ key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, region, gameId, r.clip_key) })) });
-  } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// GET /api/replays/tournament/:id/clips — todos los clips del torneo (galería)
-router.get('/tournament/:id/clips', readLimiter, async (req, res) => {
-  try {
-    const [rows] = await pool.query<any[]>('SELECT match_id, game_id, game_region, clip_key, t_start, t_end, kind, title, players, mime, size, created_at FROM tournament_clips WHERE tournament_id = ? ORDER BY game_id DESC, t_start', [req.params.id]);
-    res.json({ ok: true, clips: rows.map((r) => ({ matchId: r.match_id, gameId: Number(r.game_id), region: r.game_region, key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, r.game_region, Number(r.game_id), r.clip_key) })) });
   } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
