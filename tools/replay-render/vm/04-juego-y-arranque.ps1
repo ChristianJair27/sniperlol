@@ -20,6 +20,7 @@ Write-Host "== ATAK Render VM · paso 4: disco del juego + arranque automático 
 $gameVhd = Join-Path $VmPath 'juego.vhdx'
 $attached = Get-VMHardDiskDrive -VMName $Name | Where-Object { $_.Path -eq $gameVhd }
 if ($attached) { $attached | Remove-VMHardDiskDrive; Write-Host "Disco del juego desconectado de la VM para actualizarlo." }
+if (Test-Path $gameVhd) { Dismount-VHD -Path $gameVhd -ErrorAction SilentlyContinue }
 if (-not (Test-Path $gameVhd)) { New-VHD -Path $gameVhd -SizeBytes 80GB -Dynamic | Out-Null; $new = $true } else { $new = $false }
 $disk = Mount-VHD -Path $gameVhd -PassThru | Get-Disk
 if ($new -or $disk.PartitionStyle -eq 'RAW') {
@@ -31,12 +32,14 @@ $dst = "$($letter):\Riot Games\League of Legends"
 Write-Host "Copiando el juego a $dst (unos 30 GB, varios minutos)…"
 robocopy "C:\Riot Games\League of Legends\Game" "$dst\Game" /MIR /R:1 /W:2 /MT:16 /NFL /NDL /NP /NJH /XD Logs | Out-Null
 robocopy "C:\Riot Games\League of Legends\Config" "$dst\Config" /E /R:1 /W:2 /NFL /NDL /NP /NJH /XF PersistedSettings.json | Out-Null
-# Ventana 1920×1080 + Replay API en la copia de la VM
+# Permisos amplios en el disco del juego (lo usa el usuario de la VM) y edición de la configuración
+# a partir de la copia del host (la copia en el VHDX puede quedar con ACL restrictiva).
+icacls "$($letter):\Riot Games" /grant "*S-1-5-32-545:(OI)(CI)M" /T /C /Q | Out-Null
 $gc = Join-Path $dst 'Config\game.cfg'
-$txt = Get-Content $gc -Raw
+$txt = [IO.File]::ReadAllText('C:\Riot Games\League of Legends\Config\game.cfg')
 $txt = $txt -replace '(?m)^WindowMode=.*$', 'WindowMode=1' -replace '(?m)^Width=.*$', 'Width=1920' -replace '(?m)^Height=.*$', 'Height=1080'
 if ($txt -notmatch '(?mi)^EnableReplayApi=1') { $txt = $txt -replace '(?m)^\[General\]\s*$', "[General]`r`nEnableReplayApi=1" }
-Set-Content -Path $gc -Value $txt -Encoding ASCII
+[IO.File]::WriteAllText($gc, $txt, [Text.Encoding]::ASCII)
 $gb = [math]::Round((Get-ChildItem $dst -Recurse -File | Measure-Object Length -Sum).Sum / 1GB, 1)
 Dismount-VHD -Path $gameVhd
 Add-VMHardDiskDrive -VMName $Name -Path $gameVhd
