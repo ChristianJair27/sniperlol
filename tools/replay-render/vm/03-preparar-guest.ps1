@@ -18,6 +18,18 @@ $cred = New-Object System.Management.Automation.PSCredential($cfg.RENDER_VM_USER
 Write-Host "== ATAK Render VM · paso 3: preparar '$Name' ==" -ForegroundColor Cyan
 
 $vm = Get-VM -Name $Name
+# GPU particionada: se quitó durante la instalación de Windows (pantalla negra en el instalador). Añadirla ahora.
+if (-not (Get-VMGpuPartitionAdapter -VMName $Name -ErrorAction SilentlyContinue)) {
+  Write-Host "Añadiendo la GPU particionada (la VM se apaga un momento)…"
+  if ($vm.State -ne 'Off') { Stop-VM -Name $Name -Force; Start-Sleep 5 }
+  $pct = 50; $max = [math]::Round(1000000000 / 100 * $pct); $min = [math]::Round($max * 0.8)
+  Add-VMGpuPartitionAdapter -VMName $Name
+  Set-VMGpuPartitionAdapter -VMName $Name -MinPartitionVRAM $min -MaxPartitionVRAM $max -OptimalPartitionVRAM $max -MinPartitionEncode $min -MaxPartitionEncode $max -OptimalPartitionEncode $max -MinPartitionDecode $min -MaxPartitionDecode $max -OptimalPartitionDecode $max -MinPartitionCompute $min -MaxPartitionCompute $max -OptimalPartitionCompute $max
+  Set-VM -Name $Name -GuestControlledCacheTypes $true -LowMemoryMappedIoSpace 1GB -HighMemoryMappedIoSpace 32GB
+  # Quitar la ISO de respuestas y la de Windows: ya no hacen falta
+  Get-VMDvdDrive -VMName $Name | Remove-VMDvdDrive -ErrorAction SilentlyContinue
+  $vm = Get-VM -Name $Name
+}
 if ($vm.State -ne 'Running') { Start-VM -Name $Name; Start-Sleep 30 }
 Write-Host "Esperando a que la VM acepte PowerShell Direct (Windows instalado y sesión iniciada)…"
 $s = $null
