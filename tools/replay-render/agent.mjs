@@ -49,7 +49,7 @@ http.createServer(async (req, res) => {
       if (!a.every((x) => ALLOWED_ARGS.test(x))) return json(res, 400, { ok: false, error: 'argumento no permitido' });
       await fsp.mkdir(path.dirname(LOG), { recursive: true });
       const out = fs.openSync(LOG, 'a');
-      worker = spawn(NODE, [path.join(here, 'render.mjs'), ...a], { cwd: here, stdio: ['ignore', out, out], windowsHide: false });
+      worker = spawn(NODE, [path.join(here, 'render.mjs'), ...a], { cwd: here, stdio: ['ignore', out, out], windowsHide: false, env: { ...process.env, ATAK_QUIET: '1' } });
       worker.on('exit', (code) => log('worker terminó', code));
       log('worker iniciado', a.join(' '));
       return json(res, 200, { ok: true, pid: worker.pid });

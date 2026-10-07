@@ -54,7 +54,7 @@ const insecure = new https.Agent({ rejectUnauthorized: false });
 // Log también a archivo en la carpeta del worker (legible desde otra sesión de Windows).
 const LOG_FILE = path.join(here, 'out', 'worker.log');
 try { fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true }); } catch { /* */ }
-const log = (...a) => { const line = `${new Date().toLocaleString('es-MX')} ${a.join(' ')}`; console.log(line); try { fs.appendFileSync(LOG_FILE, line + os.EOL); } catch { /* */ } };
+const log = (...a) => { const line = `${new Date().toLocaleString('es-MX')} ${a.join(' ')}`; if (!process.env.ATAK_QUIET) console.log(line); try { fs.appendFileSync(LOG_FILE, line + os.EOL); } catch { /* */ } };
 // config.json (opcional) se relee en cada ciclo de --watch: { "enabled": true, "top": 6, "tournament": "lqc-2026" }
 function readConfig() { try { return JSON.parse(fs.readFileSync(path.join(here, 'config.json'), 'utf8')); } catch { return {}; } }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -83,20 +83,20 @@ function lockfile() {
   return v;
 }
 // fetch de Node no acepta `agent`; para HTTPS local autofirmado usamos https.request.
-function httpsJson(method, url, body, headers = {}) {
+function httpsJson(method, url, body, headers = {}, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
     const req = https.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method, agent: insecure, headers: { 'Content-Type': 'application/json', ...(payload ? { 'Content-Length': payload.length } : {}), ...headers } }, (res) => {
       let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => { let d = null; try { d = JSON.parse(b); } catch { d = b; } resolve({ status: res.statusCode || 0, data: d }); });
     });
-    req.on('error', reject); req.setTimeout(8000, () => { req.destroy(new Error('timeout')); });
+    req.on('error', reject); req.setTimeout(timeoutMs, () => { req.destroy(new Error('timeout')); });
     if (payload) req.write(payload); req.end();
   });
 }
-async function lcuReq(method, p, body) {
+async function lcuReq(method, p, body, timeoutMs = 20_000) {
   const lf = lockfile(); if (!lf) throw new Error('Cliente de League no detectado (lockfile)');
-  return httpsJson(method, `https://127.0.0.1:${lf.port}${p}`, body, { Authorization: `Basic ${Buffer.from(`riot:${lf.pw}`).toString('base64')}` });
+  return httpsJson(method, `https://127.0.0.1:${lf.port}${p}`, body, { Authorization: `Basic ${Buffer.from(`riot:${lf.pw}`).toString('base64')}` }, timeoutMs);
 }
 const replay = (method, p, body) => httpsJson(method, `${REPLAY_API}${p}`, body);
 
@@ -189,7 +189,10 @@ async function renderGame(gameId) {
   ensureReplayApi();
   if (!(await waitPortFree())) throw new Error('el puerto 2999 siguió ocupado (partida en curso) demasiado tiempo');
 
-  if (DIRECT) {
+  const alreadyOpen = await port2999Busy();
+  if (alreadyOpen) {
+    log('Ya hay un juego/replay abierto en la máquina: uso ese');
+  } else if (DIRECT) {
     launchDirect(await downloadRofl(gameId));
   } else {
     // Cliente en reposo
@@ -203,7 +206,9 @@ async function renderGame(gameId) {
       for (let i = 0; i < 60 && meta?.state !== 'watch'; i++) { await sleep(2000); meta = (await lcuReq('GET', `/lol-replays/v1/metadata/${gameId}`)).data; if (['lost', 'incompatible', 'missing', 'error'].includes(meta?.state)) throw new Error(`replay no disponible (${meta.state})`); }
       if (meta?.state !== 'watch') throw new Error('la descarga del replay no terminó');
     }
-    const w = await lcuReq('POST', `/lol-replays/v1/rofls/${gameId}/watch`, { componentType: 'replay-button_match-history' });
+    let w = { status: 0 };
+    try { w = await lcuReq('POST', `/lol-replays/v1/rofls/${gameId}/watch`, { componentType: 'replay-button_match-history' }, 90_000); }
+    catch (e) { log('watch sin respuesta del cliente (' + e.message + '); sigo esperando al juego'); }
     if (w.status >= 400) throw new Error(`no se pudo abrir el replay (${w.status})`);
   }
   log('Abriendo el replay… esperando la Replay API');
