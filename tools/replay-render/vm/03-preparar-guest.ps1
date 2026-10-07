@@ -8,7 +8,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'logs') | Out-Null
-Start-Transcript -Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) ('logs' + [IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Path) + '.log')) -Append | Out-Null
+Start-Transcript -Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) (Join-Path 'logs' ([IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Path) + '.log'))) -Append | Out-Null
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here   # tools\replay-render
 $cfg = @{}
