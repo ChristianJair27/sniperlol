@@ -53,14 +53,6 @@ function lockfile() {
   }
   return null;
 }
-async function lcu(method, p, body) {
-  const lf = lockfile(); if (!lf) throw new Error('Cliente de League no detectado (lockfile)');
-  const r = await fetch(`https://127.0.0.1:${lf.port}${p}`, { method, headers: { Authorization: `Basic ${Buffer.from(`riot:${lf.pw}`).toString('base64')}`, 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), dispatcher: undefined, // @ts-ignore
-    agent: insecure });
-  const text = await r.text();
-  let data = null; try { data = JSON.parse(text); } catch { data = text; }
-  return { status: r.status, data };
-}
 // fetch de Node no acepta `agent`; para HTTPS local autofirmado usamos https.request.
 function httpsJson(method, url, body, headers = {}) {
   return new Promise((resolve, reject) => {
