@@ -185,8 +185,7 @@ function dumpGameLog(n = 40) {
     if (!dirs.length) { log('  (sin logs del juego en', root + ')'); return; }
     const f = fs.readdirSync(dirs[0]).find((x) => x.endsWith('r3dlog.txt'));
     if (!f) { log('  (sin r3dlog en', dirs[0] + ')'); return; }
-    const lines = fs.readFileSync(path.join(dirs[0], f), 'utf8').split(/?
-/).filter(Boolean);
+    const lines = fs.readFileSync(path.join(dirs[0], f), 'utf8').split(/\r?\n/).filter(Boolean);
     log(`  --- ${path.join(dirs[0], f)} (${lines.length} líneas, últimas ${Math.min(n, lines.length)}):`);
     for (const l of lines.slice(-n)) log('  | ' + l.slice(0, 220));
   } catch (e) { log('  (no pude leer el log del juego:', e.message + ')'); }
