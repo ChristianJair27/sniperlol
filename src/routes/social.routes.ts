@@ -126,7 +126,7 @@ router.get('/posts', async (req: any, res) => {
               p.likes_count, p.comments_count, p.created_at,
               ${likedExpr} AS liked_by_me, ${repostedExpr} AS reposted_by_me,
               o.id AS orig_id, o.user_name AS orig_user_name, o.content AS orig_content, o.kind AS orig_kind, o.tournament_id AS orig_tournament_id,
-              o.media_url AS orig_media_url, o.title AS orig_title, o.meta_json AS orig_meta_json, o.likes_count AS orig_likes_count,
+              o.media_url AS orig_media_url, o.title AS orig_title, o.clip_region AS orig_clip_region, o.clip_game_id AS orig_clip_game_id, o.meta_json AS orig_meta_json, o.likes_count AS orig_likes_count,
               o.comments_count AS orig_comments_count, o.reposts_count AS orig_reposts_count
        FROM social_posts p LEFT JOIN social_posts o ON o.id = p.repost_of ${where}
        ORDER BY p.created_at DESC

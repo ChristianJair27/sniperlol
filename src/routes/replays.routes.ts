@@ -195,13 +195,22 @@ const momentsCache = new Map<string, { at: number; data: any }>();
 const MULTI: Record<number, [string, number]> = { 2: ['Doble asesinato', 3], 3: ['Triple asesinato', 6], 4: ['Cuádruple asesinato', 9], 5: ['PENTAKILL', 12] };
 const MONSTER: Record<string, [string, number]> = { BARON_NASHOR: ['Barón Nashor', 5], RIFTHERALD: ['Heraldo', 2], DRAGON: ['Dragón', 1], HORDE: ['Vacuolarvas', 0] };
 
+const tlCache = new Map<string, { at: number; tl: any }>();
+async function getTimeline(region: string, matchId: string) {
+  const c = tlCache.get(matchId);
+  if (c && Date.now() - c.at < 6 * 3600_000) return c.tl;
+  const regional = REGIONAL[region] || 'americas';
+  const { data: tl } = await riot.get(`https://${regional}.api.riotgames.com/lol/match/v5/matches/${matchId}/timeline`, { headers: { 'X-Riot-Token': (process.env.RIOT_API_KEY || '').trim() } });
+  tlCache.set(matchId, { at: Date.now(), tl });
+  return tl;
+}
+
 async function computeMoments(region: string, gameId: number) {
   const platform = region.toLowerCase();
   const matchId = `${region}_${gameId}`;
   const match = await getMatchById(platform, matchId);
   if (!match?.info) return null;
-  const regional = REGIONAL[region] || 'americas';
-  const { data: tl } = await riot.get(`https://${regional}.api.riotgames.com/lol/match/v5/matches/${matchId}/timeline`, { headers: { 'X-Riot-Token': (process.env.RIOT_API_KEY || '').trim() } });
+  const tl = await getTimeline(region, matchId);
   const parts = new Map<number, { name: string; champion: string; team: 'blue' | 'red' }>();
   for (const p of match.info.participants || []) parts.set(Number(p.participantId), { name: p.riotIdGameName || p.summonerName || `P${p.participantId}`, champion: p.championName || '', team: Number(p.teamId) === 100 ? 'blue' : 'red' });
   const who = (id: any) => parts.get(Number(id));
@@ -271,6 +280,76 @@ router.get('/:region/:gameId/moments', readLimiter, async (req, res) => {
     if (!data) return res.status(404).json({ ok: false, error: 'partida sin datos en Riot todavía' });
     data.match = { tournamentId: game.tournamentId, tournamentName: game.tournamentName, matchId: game.matchId, round: game.round, gameNumber: game.gameNumber, team1: game.team1, team2: game.team2 };
     momentsCache.set(k, { at: Date.now(), data });
+    res.json({ ok: true, ...data });
+  } catch (e: any) { res.status(e?.response?.status || 500).json({ ok: false, error: e?.response?.data?.status?.message || e.message }); }
+});
+
+// ── Stats de una pelea (ventana de un clip) ───────────────────────────────────
+// Daño a campeones, daño recibido y oro salen de la diferencia entre los frames
+// de la timeline (1 por minuto) que encierran la ventana; las bajas y asistencias
+// son exactas (eventos CHAMPION_KILL dentro de la ventana).
+const fightCache = new Map<string, { at: number; data: any }>();
+async function computeFight(region: string, gameId: number, start: number, end: number) {
+  const platform = region.toLowerCase();
+  const matchId = `${region}_${gameId}`;
+  const match = await getMatchById(platform, matchId);
+  if (!match?.info) return null;
+  const tl = await getTimeline(region, matchId);
+  const frames: any[] = tl?.info?.frames || [];
+  if (!frames.length) return null;
+  const parts = new Map<number, any>();
+  for (const p of match.info.participants || []) parts.set(Number(p.participantId), { id: Number(p.participantId), name: p.riotIdGameName || p.summonerName || `P${p.participantId}`, champion: p.championName || '', team: Number(p.teamId) === 100 ? 'blue' : 'red', kills: 0, deaths: 0, assists: 0, damage: 0, damageTaken: 0, gold: 0, killDamage: 0 });
+  const startMs = start * 1000, endMs = end * 1000;
+  // Frames que encierran la ventana
+  let f0 = frames[0], f1 = frames[frames.length - 1];
+  for (const f of frames) { if (f.timestamp <= startMs) f0 = f; if (f.timestamp >= endMs) { f1 = f; break; } }
+  const pf = (f: any, id: number) => f?.participantFrames?.[String(id)] || null;
+  for (const p of parts.values()) {
+    const a = pf(f0, p.id), b = pf(f1, p.id);
+    if (a && b) {
+      p.damage = Math.max(0, (b.damageStats?.totalDamageDoneToChampions || 0) - (a.damageStats?.totalDamageDoneToChampions || 0));
+      p.damageTaken = Math.max(0, (b.damageStats?.totalDamageTaken || 0) - (a.damageStats?.totalDamageTaken || 0));
+      p.gold = Math.max(0, (b.totalGold || 0) - (a.totalGold || 0));
+    }
+  }
+  const kills: any[] = [];
+  for (const f of frames) for (const ev of f.events || []) {
+    if (ev.type !== 'CHAMPION_KILL' || ev.timestamp < startMs || ev.timestamp > endMs) continue;
+    const k = parts.get(Number(ev.killerId)), v = parts.get(Number(ev.victimId));
+    if (k) k.kills++;
+    if (v) v.deaths++;
+    for (const aid of ev.assistingParticipantIds || []) { const a = parts.get(Number(aid)); if (a) a.assists++; }
+    // Daño exacto que recibió la víctima, por atacante → "daño en bajas"
+    for (const d of ev.victimDamageReceived || []) { const a = parts.get(Number(d.participantId)); if (a && v && a.team !== v.team) a.killDamage += (d.physicalDamage || 0) + (d.magicDamage || 0) + (d.trueDamage || 0); }
+    kills.push({ t: Math.round(ev.timestamp / 1000), killer: k ? { name: k.name, champion: k.champion, team: k.team } : null, victim: v ? { name: v.name, champion: v.champion, team: v.team } : null, assists: (ev.assistingParticipantIds || []).map((x: any) => parts.get(Number(x))?.champion).filter(Boolean), bounty: ev.bounty || 0, shutdown: ev.shutdownBounty || 0 });
+  }
+  const players = [...parts.values()];
+  const team = (t: 'blue' | 'red') => { const ps = players.filter((p) => p.team === t); return { kills: ps.reduce((s, p) => s + p.kills, 0), deaths: ps.reduce((s, p) => s + p.deaths, 0), damage: ps.reduce((s, p) => s + p.damage, 0), damageTaken: ps.reduce((s, p) => s + p.damageTaken, 0), gold: ps.reduce((s, p) => s + p.gold, 0) }; };
+  const totalDamage = players.reduce((s, p) => s + p.damage, 0) || 1;
+  const mvp = [...players].sort((a, b) => b.damage - a.damage || b.kills - a.kills)[0];
+  return {
+    region, gameId, start, end, frameStart: Math.round((f0?.timestamp || 0) / 1000), frameEnd: Math.round((f1?.timestamp || 0) / 1000),
+    teams: { blue: team('blue'), red: team('red') },
+    players: players.map((p) => ({ ...p, damagePct: Math.round((p.damage / totalDamage) * 100) })).sort((a, b) => (a.team === b.team ? b.damage - a.damage : a.team === 'blue' ? -1 : 1)),
+    mvp: mvp && mvp.damage > 0 ? { name: mvp.name, champion: mvp.champion, team: mvp.team, damage: mvp.damage } : null,
+    kills,
+  };
+}
+
+// GET /api/replays/:region/:gameId/fight?start=&end=   (segundos)
+router.get('/:region/:gameId/fight', readLimiter, async (req, res) => {
+  try {
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
+    const start = Math.max(0, Math.floor(Number(req.query.start) || 0)); const end = Math.floor(Number(req.query.end) || 0);
+    if (!gameId || !(end > start) || end - start > 600) return res.status(400).json({ ok: false, error: 'ventana inválida (start < end, máx. 10 min)' });
+    const k = `${key(region, gameId)}:${start}-${end}`; const c = fightCache.get(k);
+    if (c && Date.now() - c.at < 6 * 3600_000) return res.json({ ok: true, ...c.data });
+    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+    if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
+    const data = await computeFight(region, gameId, start, end);
+    if (!data) return res.status(404).json({ ok: false, error: 'partida sin datos en Riot todavía' });
+    fightCache.set(k, { at: Date.now(), data });
+    res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json({ ok: true, ...data });
   } catch (e: any) { res.status(e?.response?.status || 500).json({ ok: false, error: e?.response?.data?.status?.message || e.message }); }
 });
