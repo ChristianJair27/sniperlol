@@ -439,6 +439,23 @@ function clickPlay() {
   log(`ui: ${r}`);
   return r !== 'no-window';
 }
+// ¿Responde la API del cliente? (el lockfile puede quedarse viejo cuando VAN 59 cierra el cliente)
+async function lcuAlive() {
+  lockCache = null; if (!lockfile()) return false;
+  try { const r = await lcuReq('GET', '/lol-summoner/v1/current-summoner', undefined, 6000); return r.status > 0; } catch { return false; }
+}
+async function lcuSession() {
+  try { const me = (await lcuReq('GET', '/lol-summoner/v1/current-summoner', undefined, 6000)).data; return !!(me?.summonerId || me?.puuid); } catch { return false; }
+}
+/** Deja el cliente de League abierto y con sesión (lo reabre si VAN 59 lo cerró). */
+async function ensureClient() {
+  if (await lcuAlive()) { if (await lcuSession()) return true; }
+  else { try { fs.unlinkSync(path.join(LOL_DIR, 'lockfile')); } catch { /* no había */ } lockCache = null; await launchClient(); }
+  for (let i = 0; i < 30; i++) { if (await lcuAlive()) break; await sleep(5000); }
+  for (let i = 0; i < 12; i++) { if (await lcuSession()) return true; await sleep(5000); }
+  log('replays: el cliente no quedó listo (sin API o sin sesión)');
+  return false;
+}
 async function waitRiotWindow(sec) {
   for (let i = 0; i < sec / 3; i++) {
     try { const t = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', "(Get-Process | Where-Object { $_.MainWindowTitle -eq 'Riot Client' }).Count"], { windowsHide: true, timeout: 20_000 }).toString().trim(); if (Number(t) > 0) return true; } catch { /* */ }
@@ -487,8 +504,7 @@ async function wantedGames(tournamentId) {
   return out.sort((a, b) => b.gameId - a.gameId);
 }
 async function fetchReplays(limit = 10, tournamentId = 'lqc-2026') {
-  let lf = lockfile();
-  if (!lf) { log('replays: el cliente de League no está abierto en la VM (inicia sesión en su consola)'); return 0; }
+  if (!(await lcuAlive())) { log('replays: el cliente de League no está abierto en la VM'); return 0; }
   let me; try { me = (await lcuReq('GET', '/lol-summoner/v1/current-summoner')).data; } catch { /* */ }
   if (!me?.summonerId && !me?.puuid) { log('replays: el cliente está abierto pero sin sesión iniciada'); return 0; }
   const wanted = await wantedGames(tournamentId);
@@ -571,7 +587,19 @@ function diag() {
   if (args[0] === 'ui-focus') { uiFocus(args.slice(1).join(' ')); return; }
   if (args.includes('install-client')) { await installClient(); return; }
   if (args.includes('launch-client')) { await launchClient(); return; }
-  if (args.includes('fetch-replays')) { const n = await fetchReplays(120, opt('tournament', 'lqc-2026')); log(`replays subidos: ${n}`); return; }
+  if (args[0] === 'test-download') {
+    // Prueba real de descarga por LCU (partida cualquiera del parche actual), sin subir nada.
+    const gid = Number(args[1]); if (!gid) { log('uso: test-download <gameId>'); return; }
+    if (!(await ensureClient())) { log('test: cliente no abierto'); return; }
+    let meta = (await lcuReq('GET', `/lol-replays/v1/metadata/${gid}`)).data; log(`test: estado inicial ${JSON.stringify(meta).slice(0, 200)}`);
+    const r = await lcuReq('POST', `/lol-replays/v1/rofls/${gid}/download`, { componentType: 'replay-button_match-history' }); log(`test: download → ${r.status} ${JSON.stringify(r.data).slice(0, 200)}`);
+    for (let i = 0; i < 60; i++) { await sleep(2000); meta = (await lcuReq('GET', `/lol-replays/v1/metadata/${gid}`)).data; if (['watch', 'lost', 'incompatible', 'error', 'missing'].includes(meta?.state)) break; }
+    log(`test: estado final ${JSON.stringify(meta).slice(0, 300)}`);
+    const dir = (await lcuReq('GET', '/lol-replays/v1/rofls/path')).data; log(`test: carpeta ${dir}`);
+    try { const f = fs.readdirSync(String(dir)).filter((x) => x.includes(String(gid))); log(`test: archivos ${JSON.stringify(f.map((x) => [x, fs.statSync(path.join(String(dir), x)).size]))}`); } catch (e) { log(`test: ${e.message}`); }
+    return;
+  }
+  if (args.includes('fetch-replays')) { await ensureClient(); const n = await fetchReplays(120, opt('tournament', 'lqc-2026')); log(`replays subidos: ${n}`); return; }
   const game = opt('game'); const tournament = opt('tournament');
   if (game) { const n = await renderGame(Number(game)); log(`listo: ${n} clips`); return; }
   if (!tournament) { console.log('uso: node render.mjs --game <gameId> | --tournament <id> [--watch] | install-client | fetch-replays'); return; }
@@ -584,12 +612,8 @@ function diag() {
     if (watch && cfg.fetch !== false) {
       try {
         // El cliente en la VM se cierra solo al rato (VAN 59): se reabre y se espera a que tenga sesión.
-        if (!lockfile() && cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE)) {
-          await launchClient(); lockCache = null;
-          for (let i = 0; i < 24 && !lockfile(); i++) { await sleep(5000); lockCache = null; }
-          for (let i = 0; i < 12 && lockfile(); i++) { try { const me = (await lcuReq('GET', '/lol-summoner/v1/current-summoner')).data; if (me?.summonerId || me?.puuid) break; } catch { /* arrancando */ } await sleep(5000); }
-        }
-        fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 10, cfg.tournament || tournament);
+        const ready = cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE) ? await ensureClient() : await lcuAlive();
+        if (ready) fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 10, cfg.tournament || tournament);
       } catch (e) { log(`replays: ${e.message}`); }
     }
     // 2) Render de lo que tenga replay y no tenga clips
