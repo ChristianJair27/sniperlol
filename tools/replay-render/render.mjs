@@ -560,7 +560,17 @@ function diag() {
     if (cfg.enabled === false) { log('config.json: enabled=false, en pausa'); await sleep(5 * 60_000); continue; }
     // 1) Replays que falten, desde el cliente de la VM (si está abierto y con sesión)
     let fetched = 0;
-    if (watch && cfg.fetch !== false) { try { if (!lockfile() && cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE)) launchClient(); fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 10, cfg.tournament || tournament); } catch (e) { log(`replays: ${e.message}`); } }
+    if (watch && cfg.fetch !== false) {
+      try {
+        // El cliente en la VM se cierra solo al rato (VAN 59): se reabre y se espera a que tenga sesión.
+        if (!lockfile() && cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE)) {
+          launchClient(); lockCache = null;
+          for (let i = 0; i < 24 && !lockfile(); i++) { await sleep(5000); lockCache = null; }
+          for (let i = 0; i < 12 && lockfile(); i++) { try { const me = (await lcuReq('GET', '/lol-summoner/v1/current-summoner')).data; if (me?.summonerId || me?.puuid) break; } catch { /* arrancando */ } await sleep(5000); }
+        }
+        fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 10, cfg.tournament || tournament);
+      } catch (e) { log(`replays: ${e.message}`); }
+    }
     // 2) Render de lo que tenga replay y no tenga clips
     const ids = await pendingGames(cfg.tournament || tournament, Number(cfg.top) || TOP);
     log(`${tournament}: ${ids.length} partidas con replay y sin clips`);
