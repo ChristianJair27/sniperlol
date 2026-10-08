@@ -154,27 +154,24 @@ function launchDirect(rofl) {
   const exe = path.join(LOL_DIR, 'Game', 'League of Legends.exe');
   if (!fs.existsSync(exe)) throw new Error(`no encuentro ${exe}`);
   log('Abriendo el replay directamente con el juego…');
-  // Primer intento: CreateProcess directo. Si Windows lo niega (EPERM: p. ej.
-  // "ejecutar como administrador" marcado en el exe o políticas de la sesión),
-  // segundo intento por ShellExecute (cmd /c start), que respeta esas reglas.
-  try {
-    const child = spawn(exe, [rofl], { cwd: path.join(LOL_DIR, 'Game'), detached: true, stdio: 'ignore', windowsHide: false });
-    child.on('error', (e) => log('spawn directo falló:', e.code || e.message));
-    child.unref();
-  } catch (e) {
-    log('spawn directo falló:', e.code || e.message, '→ intento con start');
-  }
-  const viaStart = spawn('cmd.exe', ['/c', 'start', '""', '/D', path.join(LOL_DIR, 'Game'), exe, rofl], { detached: true, stdio: 'ignore', windowsHide: true });
-  viaStart.on('error', (e) => log('start falló:', e.code || e.message));
-  viaStart.unref();
-}
-
-// ── Cámara: coordenadas del mapa → posición de cámara ───────────────────────
-function cameraFor(pos) {
-  if (!pos) return null;
-  // El mapa va de 0 a ~14800 en x y z; la cámara "top" mira hacia -z con cierta inclinación,
-  // así que se coloca un poco al sur del punto y a ~1900 de altura.
-  return { x: Number(pos.x) || 7400, y: 1900, z: (Number(pos.y) || 7400) - 1300 };
+  // Primer intento: CreateProcess directo. Solo si Windows lo niega (EPERM: p. ej. políticas
+  // de la sesión o "ejecutar como administrador" en el exe) se intenta por ShellExecute.
+  return new Promise((resolve) => {
+    let failed = false;
+    try {
+      const child = spawn(exe, [rofl], { cwd: path.join(LOL_DIR, 'Game'), detached: true, stdio: 'ignore', windowsHide: false });
+      child.on('error', (e) => { failed = true; log('spawn directo falló:', e.code || e.message, '→ intento con start'); });
+      child.unref();
+    } catch (e) { failed = true; log('spawn directo falló:', e.code || e.message, '→ intento con start'); }
+    setTimeout(() => {
+      if (failed) {
+        const viaStart = spawn('cmd.exe', ['/c', 'start', '""', '/D', path.join(LOL_DIR, 'Game'), exe, rofl], { detached: true, stdio: 'ignore', windowsHide: true });
+        viaStart.on('error', (e) => log('start falló:', e.code || e.message));
+        viaStart.unref();
+      }
+      resolve();
+    }, 3000);
+  });
 }
 
 // ── Render de UNA partida ───────────────────────────────────────────────────
@@ -193,7 +190,7 @@ async function renderGame(gameId) {
   if (alreadyOpen) {
     log('Ya hay un juego/replay abierto en la máquina: uso ese');
   } else if (DIRECT) {
-    launchDirect(await downloadRofl(gameId));
+    await launchDirect(await downloadRofl(gameId));
   } else {
     // Cliente en reposo
     const phase = (await lcuReq('GET', '/lol-gameflow/v1/gameflow-phase')).data;
