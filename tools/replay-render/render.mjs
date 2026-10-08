@@ -424,24 +424,45 @@ async function installClient() {
   log('  metadatos listos');
   // 4) Limpieza y arranque del cliente (la sesión la inicia una persona en la consola de la VM)
   try { await fsp.rm(tmp, { recursive: true, force: true }); } catch { /* */ }
-  launchClient();
+  await launchClient();
 }
-function launchClient() {
+// El Riot Client, al pedirle que abra League, se para en la comprobación de Vanguard y se
+// queda en "Play"; con un clic en Play sí abre el cliente (VAN 59 en pantalla, pero la API LCU
+// funciona). El botón se busca relativo a la ventana del Riot Client (tamaño fijo en la VM).
+function clickPlay() {
+  const ps = `Add-Type -Name U -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r); [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y); [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint x,uint y,uint d,int e); public struct RECT { public int L; public int T; public int R; public int B; }';
+    $p = Get-Process | Where-Object { $_.MainWindowTitle -eq 'Riot Client' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1; if (-not $p) { 'no-window'; exit }
+    [W.U]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -m 400; $r = New-Object W.U+RECT; [W.U]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+    $w = $r.R - $r.L; $h = $r.B - $r.T; $x = $r.L + [int]($w * 0.165); $y = $r.T + [int]($h * 0.357)
+    [W.U]::SetCursorPos($x, $y) | Out-Null; Start-Sleep -m 150; [W.U]::mouse_event(2,0,0,0,0); Start-Sleep -m 60; [W.U]::mouse_event(4,0,0,0,0); "clic Play en $x,$y (ventana $w x $h)"`;
+  const r = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 30_000 }).toString().trim();
+  log(`ui: ${r}`);
+  return r !== 'no-window';
+}
+async function waitRiotWindow(sec) {
+  for (let i = 0; i < sec / 3; i++) {
+    try { const t = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', "(Get-Process | Where-Object { $_.MainWindowTitle -eq 'Riot Client' }).Count"], { windowsHide: true, timeout: 20_000 }).toString().trim(); if (Number(t) > 0) return true; } catch { /* */ }
+    await sleep(3000);
+  }
+  return false;
+}
+async function launchClient() {
   if (!fs.existsSync(RC_EXE)) throw new Error('Riot Client no instalado (install-client)');
   if (lockfile()) { log('El cliente ya está abierto'); return; }
   let rcRunning = false;
   try { rcRunning = /RiotClientServices/i.test(execFileSync('tasklist', ['/FI', 'IMAGENAME eq RiotClientServices.exe', '/NH'], { windowsHide: true }).toString()); } catch { /* */ }
   const lcExe = path.join(LOL_DIR, 'LeagueClient.exe');
-  if (rcRunning && fs.existsSync(lcExe)) {
-    // Con el Riot Client ya abierto (y con sesión), LeagueClient.exe arranca el cliente directamente.
-    log('Abriendo LeagueClient.exe…');
-    const child = spawn(lcExe, [], { cwd: LOL_DIR, detached: true, stdio: 'ignore', windowsHide: false });
-    child.unref();
+  void lcExe;
+  if (rcRunning && (await waitRiotWindow(3))) {
+    // Riot Client abierto en "Play": basta con pulsarlo.
+    clickPlay();
     return;
   }
   log('Abriendo el Riot Client con League…');
   const child = spawn(RC_EXE, ['--launch-product=league_of_legends', '--launch-patchline=live'], { detached: true, stdio: 'ignore', windowsHide: false });
   child.unref();
+  // Con "mantener sesión" entra solo; en cuanto aparece la ventana (y carga), se pulsa Play.
+  if (await waitRiotWindow(90)) { await sleep(20_000); clickPlay(); }
 }
 
 // ── Replays: del cliente (LCU) a ATAK.GG ──────────────────────────────────────
@@ -549,7 +570,7 @@ function diag() {
   if (args[0] === 'ui-keys') { uiKeys(args.slice(1)); return; }
   if (args[0] === 'ui-focus') { uiFocus(args.slice(1).join(' ')); return; }
   if (args.includes('install-client')) { await installClient(); return; }
-  if (args.includes('launch-client')) { launchClient(); return; }
+  if (args.includes('launch-client')) { await launchClient(); return; }
   if (args.includes('fetch-replays')) { const n = await fetchReplays(120, opt('tournament', 'lqc-2026')); log(`replays subidos: ${n}`); return; }
   const game = opt('game'); const tournament = opt('tournament');
   if (game) { const n = await renderGame(Number(game)); log(`listo: ${n} clips`); return; }
@@ -564,7 +585,7 @@ function diag() {
       try {
         // El cliente en la VM se cierra solo al rato (VAN 59): se reabre y se espera a que tenga sesión.
         if (!lockfile() && cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE)) {
-          launchClient(); lockCache = null;
+          await launchClient(); lockCache = null;
           for (let i = 0; i < 24 && !lockfile(); i++) { await sleep(5000); lockCache = null; }
           for (let i = 0; i < 12 && lockfile(); i++) { try { const me = (await lcuReq('GET', '/lol-summoner/v1/current-summoner')).data; if (me?.summonerId || me?.puuid) break; } catch { /* arrancando */ } await sleep(5000); }
         }
