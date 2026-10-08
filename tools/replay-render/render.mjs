@@ -116,11 +116,13 @@ function ensureReplayApi() {
 
 // ── ATAK.GG ──────────────────────────────────────────────────────────────────
 async function atak(p) { const r = await fetch(`${BACKEND}${p}`); if (!r.ok) throw new Error(`${p} → ${r.status}`); return r.json(); }
+// Las cabeceras HTTP solo admiten Latin-1: los nombres con otros caracteres se escapan como \uXXXX (sigue siendo JSON valido).
+const asciiJson = (v) => JSON.stringify(v).replace(/[\u0080-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 async function uploadClip(gameId, m, file) {
   const buf = await fsp.readFile(file);
   const r = await fetch(`${BACKEND}/api/replays/${REGION}/${gameId}/clips/${encodeURIComponent(m.key)}`, {
     method: 'POST', body: buf,
-    headers: { 'Content-Type': 'video/mp4', 'X-Render-Token': TOKEN, 'X-Clip-Start': String(m.tStart), 'X-Clip-End': String(m.tEnd), 'X-Clip-Kind': m.kind, 'X-Clip-Title': encodeURIComponent(m.title), 'X-Clip-Players': JSON.stringify(m.players || []).slice(0, 1900) },
+    headers: { 'Content-Type': 'video/mp4', 'X-Render-Token': TOKEN, 'X-Clip-Start': String(m.tStart), 'X-Clip-End': String(m.tEnd), 'X-Clip-Kind': m.kind, 'X-Clip-Title': encodeURIComponent(m.title), 'X-Clip-Players': asciiJson(m.players || []).slice(0, 1900) },
   });
   if (!r.ok) throw new Error(`subida ${m.key} → ${r.status} ${await r.text()}`);
   return r.json();
