@@ -44,7 +44,7 @@ const KEEP = !!opt('keep', false);
 const LOL_DIR = process.env.LOL_DIR || 'C:\\Riot Games\\League of Legends';
 const OUT = process.env.OUT_DIR || path.join(os.tmpdir(), 'atak-render');
 const ROFL_DIR = process.env.ROFL_DIR || path.join(OUT, 'rofl');
-const DIRECT = !!opt('direct', false);
+let DIRECT = !!opt('direct', false);
 const FFMPEG = process.env.FFMPEG || (fs.existsSync(path.join(here, 'bin', 'ffmpeg.exe')) ? path.join(here, 'bin', 'ffmpeg.exe') : 'ffmpeg');
 const FPS = Number(process.env.FPS || 30);
 const WIDTH = Number(process.env.WIDTH || 1920), HEIGHT = Number(process.env.HEIGHT || 1080);
@@ -431,10 +431,11 @@ async function installClient() {
 // queda en "Play"; con un clic en Play sí abre el cliente (VAN 59 en pantalla, pero la API LCU
 // funciona). El botón se busca relativo a la ventana del Riot Client (tamaño fijo en la VM).
 function clickPlay() {
-  const ps = `Add-Type -Name U -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r); [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y); [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint x,uint y,uint d,int e); public struct RECT { public int L; public int T; public int R; public int B; }';
+  const ps = `Add-Type -Name U -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r); [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y); [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint x,uint y,uint d,int e); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd); public struct RECT { public int L; public int T; public int R; public int B; }';
     $p = Get-Process | Where-Object { $_.MainWindowTitle -eq 'Riot Client' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1; if (-not $p) { 'no-window'; exit }
-    [W.U]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -m 400; $r = New-Object W.U+RECT; [W.U]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
-    $w = $r.R - $r.L; $h = $r.B - $r.T; $x = $r.L + [int]($w * 0.165); $y = $r.T + [int]($h * 0.357)
+    [W.U]::ShowWindow($p.MainWindowHandle, 9) | Out-Null; Start-Sleep -m 500; [W.U]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -m 400; $r = New-Object W.U+RECT; [W.U]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+    $w = $r.R - $r.L; $h = $r.B - $r.T; if ($w -lt 600 -or $h -lt 400 -or $r.L -lt -5000) { 'no-window'; exit }
+    $x = $r.L + [int]($w * 0.165); $y = $r.T + [int]($h * 0.357)
     [W.U]::SetCursorPos($x, $y) | Out-Null; Start-Sleep -m 150; [W.U]::mouse_event(2,0,0,0,0); Start-Sleep -m 60; [W.U]::mouse_event(4,0,0,0,0); "clic Play en $x,$y (ventana $w x $h)"`;
   const r = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 30_000 }).toString().trim();
   log(`ui: ${r}`);
@@ -611,6 +612,7 @@ function diag() {
   if (args[0] === 'player') {
     // Partidas sueltas de un jugador (pruebas): node render.mjs player Nombre Tag [n]
     const name = String(args[1] || ''), tag = String(args[2] || ''), n = Number(args[3]) || 3;
+    DIRECT = true; // el render en la VM siempre abre el replay con el juego directamente
     if (!name || !tag) { log('uso: player <nombre> <tag> [n]'); return; }
     const acc = await atak(`/api/stats/resolve?region=${REGION.toLowerCase()}&gameName=${encodeURIComponent(name)}&tagLine=${encodeURIComponent(tag)}`);
     if (!acc?.puuid) { log('jugador no encontrado'); return; }
