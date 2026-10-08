@@ -28,3 +28,21 @@ en cada arranque de la VM (robocopy espejo desde `\host\RiotGames`).
 - Hyper-V Manager → Conectar para ver la VM. Registro: `C:\ATAK\replay-render\out\worker.log`.
 - La VM arranca sola con el host (AutomaticStartAction) y se apaga limpiamente al apagarlo.
 - GPU: `-GpuPercent` en el paso 2 (50 % por defecto). Si el host nota lag mientras renderiza, bajar a 30.
+
+## Cliente de League dentro de la VM (replays sin depender de nadie)
+La VM solo tenía el juego (carpeta `Game`). Para que ella misma baje los replays de torneo con la API del
+cliente (LCU) se le copia el cliente desde el host:
+1. En el host, empaquetar (sin UAC): `pkg/riotclient.tar` (`C:\Riot Games\Riot Client`), `pkg/client.tar`
+   (`C:\Riot Games\League of Legends` sin `Game`, `Logs`, `Saved`, `Config`) y `pkg/riotdata.tar`
+   (`C:\ProgramData\Riot Games`: `RiotClientInstalls.json` + `Metadata\Riot Client` + `Metadata\league_of_legends.live`).
+   `pkg/` está en .gitignore y lo sirve el mismo `python -m http.server 8098` del host.
+2. Desde el host, con el agente: `POST /worker/update` y `POST /worker/start {"args":["install-client"]}`.
+   El worker baja los tres .tar, los extrae (Riot Client en `C:\Riot Games\Riot Client`, cliente junto al `Game` del
+   disco del juego), reescribe las rutas de ProgramData y abre el Riot Client.
+3. **Una persona inicia sesión en la consola de la VM** (`ver-vm.ps1` → vmconnect) con "Mantener sesión". Vanguard no
+   arranca en la VM: el cliente abre y deja bajar replays, solo no se puede jugar.
+4. `POST /worker/start {"args":["--tournament","lqc-2026","--watch","--direct"]}`: en cada ciclo el worker pide a
+   ATAK.GG qué replays faltan, el cliente los baja (solo partidas del parche actual), los sube y después renderiza los
+   clips. `config.json`: `fetch` (false para apagarlo), `fetchPerCycle` (10), `autoLaunchClient` (abre el cliente si
+   está cerrado).
+- Manual: `node render.mjs fetch-replays` (sube todo lo que pueda) · `node render.mjs launch-client`.

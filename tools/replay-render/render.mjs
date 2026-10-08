@@ -359,17 +359,151 @@ async function pendingGames(tournamentId, want = TOP) {
   return replays.filter((r) => r.region === REGION && (count.get(`${r.region}:${r.gameId}`) || 0) < want).map((r) => r.gameId);
 }
 
+
+// ── Cliente de League dentro de la VM ─────────────────────────────────────────
+// La VM solo tenía el juego (carpeta Game). Para que ella misma baje los replays
+// con la API del cliente (LCU) hace falta el cliente: se copia desde el host en
+// tres .tar servidos por AGENT_UPDATE_URL/pkg (client.tar = instalación sin Game,
+// riotclient.tar = Riot Client, riotdata.tar = metadatos de ProgramData) y se
+// reescriben las rutas. Uso: node render.mjs install-client
+const PKG_URL = process.env.AGENT_UPDATE_URL ? `${process.env.AGENT_UPDATE_URL.replace(/\/$/, '')}/pkg` : '';
+const RC_DIR = 'C:\\Riot Games\\Riot Client';
+const RC_EXE = path.join(RC_DIR, 'RiotClientServices.exe');
+const PROGRAMDATA_RG = path.join(process.env.ProgramData || 'C:\\ProgramData', 'Riot Games');
+const TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+const fwd = (p) => p.replace(/\\/g, '/');
+
+async function downloadTo(url, file) {
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  const r = await fetch(url);
+  if (!r.ok || !r.body) throw new Error(`${url} → ${r.status}`);
+  const total = Number(r.headers.get('content-length') || 0);
+  const ws = fs.createWriteStream(file);
+  let got = 0, lastLog = Date.now();
+  for await (const chunk of r.body) {
+    got += chunk.length;
+    if (!ws.write(chunk)) await new Promise((res) => ws.once('drain', res));
+    if (Date.now() - lastLog > 15_000) { lastLog = Date.now(); log(`  ${path.basename(file)}: ${(got / 1048576).toFixed(0)} / ${(total / 1048576).toFixed(0)} MB`); }
+  }
+  await new Promise((res, rej) => { ws.on('error', rej); ws.end(res); });
+  return file;
+}
+function untar(file, dest, excludes = []) {
+  fs.mkdirSync(dest, { recursive: true });
+  const args = ['-xf', file, '-C', dest, ...excludes.flatMap((e) => ['--exclude', e])];
+  const r = execFileSync(TAR, args, { windowsHide: true, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+  return String(r || '');
+}
+async function installClient() {
+  if (!PKG_URL) throw new Error('sin AGENT_UPDATE_URL');
+  const tmp = path.join(OUT, 'pkg');
+  await fsp.mkdir(tmp, { recursive: true });
+  const lolRoot = path.dirname(LOL_DIR); // p. ej. J:\Riot Games
+  log(`Instalando el cliente de League en ${LOL_DIR} (Riot Client en ${RC_DIR})…`);
+  // 1) Riot Client
+  if (!fs.existsSync(RC_EXE)) {
+    const f = await downloadTo(`${PKG_URL}/riotclient.tar`, path.join(tmp, 'riotclient.tar'));
+    untar(f, path.dirname(RC_DIR));
+    log('  Riot Client copiado');
+  } else log('  Riot Client ya estaba');
+  // 2) Cliente de League (sin Game: ya está en el disco del juego)
+  if (!fs.existsSync(path.join(LOL_DIR, 'LeagueClient.exe'))) {
+    const f = await downloadTo(`${PKG_URL}/client.tar`, path.join(tmp, 'client.tar'));
+    untar(f, lolRoot, ['League of Legends/Config']);
+    log('  LeagueClient copiado');
+  } else log('  LeagueClient ya estaba');
+  // 3) Metadatos de ProgramData con las rutas de esta máquina
+  const f = await downloadTo(`${PKG_URL}/riotdata.tar`, path.join(tmp, 'riotdata.tar'));
+  untar(f, PROGRAMDATA_RG);
+  const fixes = [
+    [path.join(PROGRAMDATA_RG, 'RiotClientInstalls.json'), (t) => t.replace(/C:\/Riot Games\/League of Legends\//g, `${fwd(LOL_DIR)}/`).replace(/C:\/Riot Games\/Riot Client\/RiotClientServices\.exe/g, fwd(RC_EXE))],
+    [path.join(PROGRAMDATA_RG, 'Metadata', 'league_of_legends.live', 'league_of_legends.live.product_settings.yaml'), (t) => t.replace(/product_install_full_path: ".*"/, `product_install_full_path: "${fwd(LOL_DIR)}"`).replace(/product_install_root: ".*"/, `product_install_root: "${fwd(lolRoot)}"`).replace(/should_repair: true/, 'should_repair: false')],
+    [path.join(PROGRAMDATA_RG, 'Metadata', 'Riot Client', 'Riot Client.settings.yaml'), () => `user_data_paths:\n- "${fwd(path.join(os.homedir(), 'AppData', 'Local', 'Riot Games', 'Riot Client'))}"\n`],
+  ];
+  for (const [file, fn] of fixes) { try { await fsp.writeFile(file, fn(await fsp.readFile(file, 'utf8'))); } catch (e) { log(`  aviso: ${path.basename(file)}: ${e.message}`); } }
+  log('  metadatos listos');
+  // 4) Limpieza y arranque del cliente (la sesión la inicia una persona en la consola de la VM)
+  try { await fsp.rm(tmp, { recursive: true, force: true }); } catch { /* */ }
+  launchClient();
+}
+function launchClient() {
+  if (!fs.existsSync(RC_EXE)) throw new Error('Riot Client no instalado (install-client)');
+  if (lockfile()) { log('El cliente ya está abierto'); return; }
+  try { const t = execFileSync('tasklist', ['/FI', 'IMAGENAME eq RiotClientServices.exe', '/NH'], { windowsHide: true }).toString(); if (/RiotClientServices/i.test(t)) { log('El Riot Client ya está abierto (falta iniciar sesión en la consola de la VM)'); return; } } catch { /* */ }
+  log('Abriendo el cliente de League…');
+  const child = spawn(RC_EXE, ['--launch-product=league_of_legends', '--launch-patchline=live'], { detached: true, stdio: 'ignore', windowsHide: false });
+  child.unref();
+}
+
+// ── Replays: del cliente (LCU) a ATAK.GG ──────────────────────────────────────
+// Lo mismo que hace el companion, pero desde la VM: pide a ATAK.GG qué partidas
+// faltan, el cliente las baja (solo con sesión iniciada y mismo parche) y se
+// suben. En --watch corre antes de cada ciclo de render (config.fetch !== false).
+const fetchSkip = new Set(); const fetchTried = new Map();
+async function fetchReplays(limit = 10) {
+  let lf = lockfile();
+  if (!lf) { log('replays: el cliente de League no está abierto en la VM (inicia sesión en su consola)'); return 0; }
+  let me; try { me = (await lcuReq('GET', '/lol-summoner/v1/current-summoner')).data; } catch { /* */ }
+  if (!me?.summonerId && !me?.puuid) { log('replays: el cliente está abierto pero sin sesión iniciada'); return 0; }
+  const { wanted } = await atak(`/api/replays/wanted?region=${REGION}&limit=50`);
+  const todo = (wanted || []).filter((w) => !fetchSkip.has(w.gameId) && Date.now() - (fetchTried.get(w.gameId) || 0) > 30 * 60_000).slice(0, limit);
+  log(`replays: ${wanted?.length || 0} por subir, intento ${todo.length}`);
+  let done = 0;
+  const bad = new Set(['lost', 'incompatible', 'error', 'missing']);
+  for (const w of todo) {
+    fetchTried.set(w.gameId, Date.now());
+    const label = `${w.team1} vs ${w.team2} (${w.gameId})`;
+    try {
+      let meta = (await lcuReq('GET', `/lol-replays/v1/metadata/${w.gameId}`)).data;
+      if (meta?.state && bad.has(meta.state)) { fetchSkip.add(w.gameId); log(`  ✗ ${label}: no disponible (${meta.state})`); continue; }
+      if (meta?.state !== 'watch') {
+        const r = await lcuReq('POST', `/lol-replays/v1/rofls/${w.gameId}/download`, { componentType: 'replay-button_match-history' });
+        if (r.status >= 300) { log(`  ✗ ${label}: el cliente rechazó la descarga (${r.status})`); continue; }
+        for (let i = 0; i < 90; i++) {
+          await sleep(2000);
+          meta = (await lcuReq('GET', `/lol-replays/v1/metadata/${w.gameId}`)).data;
+          if (meta?.state === 'watch') break;
+          if (meta?.state && bad.has(meta.state)) break;
+        }
+        if (meta?.state && bad.has(meta.state)) { fetchSkip.add(w.gameId); log(`  ✗ ${label}: no disponible (${meta.state})`); continue; }
+        if (meta?.state !== 'watch') { log(`  ✗ ${label}: la descarga no terminó (${meta?.state})`); continue; }
+      }
+      let dir = (await lcuReq('GET', '/lol-replays/v1/rofls/path')).data;
+      if (typeof dir !== 'string') dir = (await lcuReq('GET', '/lol-replays/v1/rofls-path')).data;
+      if (typeof dir !== 'string') { log(`  ✗ ${label}: el cliente no dice dónde guarda los replays`); continue; }
+      let file = null;
+      for (const c of [path.join(dir, `${REGION}-${w.gameId}.rofl`), path.join(dir, `${w.region}-${w.gameId}.rofl`)]) if (fs.existsSync(c)) { file = c; break; }
+      if (!file) { const found = (await fsp.readdir(dir).catch(() => [])).find((f) => f.includes(String(w.gameId)) && f.endsWith('.rofl')); if (found) file = path.join(dir, found); }
+      if (!file) { log(`  ✗ ${label}: el archivo no apareció en ${dir}`); continue; }
+      const buf = await fsp.readFile(file);
+      const up = await fetch(`${BACKEND}/api/replays/${encodeURIComponent(w.region)}/${w.gameId}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream', 'X-Patch': String(meta?.gameVersion || ''), 'X-Uploader': 'atak-render-vm' } });
+      if (!up.ok) { log(`  ✗ ${label}: ATAK.GG respondió ${up.status}`); continue; }
+      done++; log(`  ✓ ${label}: subido (${(buf.length / 1048576).toFixed(1)} MB)`);
+      try { await fsp.unlink(file); } catch { /* */ }
+    } catch (e) { log(`  ✗ ${label}: ${e.message}`); if (/no detectado/i.test(e.message)) break; }
+  }
+  return done;
+}
+
 (async () => {
+  if (args.includes('install-client')) { await installClient(); return; }
+  if (args.includes('launch-client')) { launchClient(); return; }
+  if (args.includes('fetch-replays')) { const n = await fetchReplays(50); log(`replays subidos: ${n}`); return; }
   const game = opt('game'); const tournament = opt('tournament');
   if (game) { const n = await renderGame(Number(game)); log(`listo: ${n} clips`); return; }
-  if (!tournament) { console.log('uso: node render.mjs --game <gameId> | --tournament <id> [--watch]'); return; }
+  if (!tournament) { console.log('uso: node render.mjs --game <gameId> | --tournament <id> [--watch] | install-client | fetch-replays'); return; }
   const watch = !!opt('watch', false);
   do {
     const cfg = readConfig();
     if (cfg.enabled === false) { log('config.json: enabled=false, en pausa'); await sleep(5 * 60_000); continue; }
+    // 1) Replays que falten, desde el cliente de la VM (si está abierto y con sesión)
+    let fetched = 0;
+    if (watch && cfg.fetch !== false) { try { if (!lockfile() && cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE)) launchClient(); fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 10); } catch (e) { log(`replays: ${e.message}`); } }
+    // 2) Render de lo que tenga replay y no tenga clips
     const ids = await pendingGames(cfg.tournament || tournament, Number(cfg.top) || TOP);
     log(`${tournament}: ${ids.length} partidas con replay y sin clips`);
-    for (const id of ids) { try { await renderGame(id); } catch (e) { log(`✗ ${id}: ${e.message}`); if (/cliente está en|no detectado|puerto 2999/i.test(e.message)) break; } }
-    if (watch) await sleep(10 * 60_000);
+    let rendered = 0;
+    for (const id of ids) { try { await renderGame(id); rendered++; } catch (e) { log(`✗ ${id}: ${e.message}`); if (/cliente está en|no detectado|puerto 2999/i.test(e.message)) break; } }
+    if (watch) await sleep(fetched || rendered ? 20_000 : 10 * 60_000);
   } while (watch);
 })().catch((e) => { console.error('ERROR:', e.message); process.exit(1); });
