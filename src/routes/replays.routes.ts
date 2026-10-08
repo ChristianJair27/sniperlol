@@ -12,6 +12,7 @@ import crypto from 'node:crypto';
 import rateLimit from 'express-rate-limit';
 import { pool } from '../db.js';
 import { riot, getMatchById } from '../services/riot.js';
+import { upsertClipPost } from './social.routes.js';
 
 const router = Router();
 const MAX_BYTES = 80 * 1024 * 1024;
@@ -266,8 +267,9 @@ router.get('/:region/:gameId/moments', readLimiter, async (req, res) => {
     if (c && Date.now() - c.at < 3600_000) return res.json({ ok: true, ...c.data });
     const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
     if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
-    const data = await computeMoments(region, gameId);
+    const data: any = await computeMoments(region, gameId);
     if (!data) return res.status(404).json({ ok: false, error: 'partida sin datos en Riot todavía' });
+    data.match = { tournamentId: game.tournamentId, tournamentName: game.tournamentName, matchId: game.matchId, round: game.round, gameNumber: game.gameNumber, team1: game.team1, team2: game.team2 };
     momentsCache.set(k, { at: Date.now(), data });
     res.json({ ok: true, ...data });
   } catch (e: any) { res.status(e?.response?.status || 500).json({ ok: false, error: e?.response?.data?.status?.message || e.message }); }
@@ -304,7 +306,17 @@ router.post('/:region/:gameId/clips/:key', uploadLimiter, raw({ type: () => true
        ON DUPLICATE KEY UPDATE t_start = VALUES(t_start), t_end = VALUES(t_end), kind = VALUES(kind), title = VALUES(title), players = VALUES(players), mime = VALUES(mime), size = VALUES(size), data = VALUES(data), created_at = CURRENT_TIMESTAMP`,
       [game.tournamentId, game.matchId, gameId, region, k, Number(req.get('x-clip-start')) || 0, Number(req.get('x-clip-end')) || 0, String(req.get('x-clip-kind') || 'clip').slice(0, 32), decodeURIComponent(String(req.get('x-clip-title') || k)).slice(0, 160), players, String(req.get('content-type') || 'video/mp4').slice(0, 40), buf.length, buf]);
     console.log(`[replays] clip ${k} de ${region}-${gameId} (${(buf.length / 1048576).toFixed(1)} MB)`);
-    res.status(201).json({ ok: true, url: clipUrl(req, region, gameId, k) });
+    const url = clipUrl(req, region, gameId, k);
+    // Publicación automática en el feed social del torneo
+    let postId: number | null = null;
+    try {
+      postId = await upsertClipPost({
+        tournamentId: game.tournamentId, tournamentName: game.tournamentName, region, gameId, key: k,
+        title: decodeURIComponent(String(req.get('x-clip-title') || k)).slice(0, 200), mediaUrl: url,
+        meta: { team1: game.team1, team2: game.team2, round: game.round, gameNumber: game.gameNumber, matchId: game.matchId, tStart: Number(req.get('x-clip-start')) || 0, tEnd: Number(req.get('x-clip-end')) || 0, kind: String(req.get('x-clip-kind') || 'clip') },
+      });
+    } catch (e: any) { console.warn('[replays] no se pudo publicar el clip en social:', e.message); }
+    res.status(201).json({ ok: true, url, postId });
   } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

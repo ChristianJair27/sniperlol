@@ -49,6 +49,9 @@ const FFMPEG = process.env.FFMPEG || (fs.existsSync(path.join(here, 'bin', 'ffmp
 const FPS = Number(process.env.FPS || 30);
 const WIDTH = Number(process.env.WIDTH || 1920), HEIGHT = Number(process.env.HEIGHT || 1080);
 const REPLAY_API = 'https://127.0.0.1:2999';
+const ASSETS_URL = process.env.AGENT_UPDATE_URL ? `${process.env.AGENT_UPDATE_URL.replace(/\/$/, '')}/assets` : '';
+const ASSETS_DIR = path.join(here, 'assets');
+const ASSET_FILES = ['Orbitron-900.ttf', 'JetBrainsMono-700.ttf', 'lqc-wordmark.png', 'atak-logo-mark.png'];
 const insecure = new https.Agent({ rejectUnauthorized: false });
 
 // Log también a archivo en la carpeta del worker (legible desde otra sesión de Windows).
@@ -121,6 +124,55 @@ async function uploadClip(gameId, m, file) {
   });
   if (!r.ok) throw new Error(`subida ${m.key} → ${r.status} ${await r.text()}`);
   return r.json();
+}
+
+// ── Assets del overlay (fuentes y logos), bajados del host si faltan ───────────
+async function ensureAssets() {
+  await fsp.mkdir(ASSETS_DIR, { recursive: true });
+  for (const f of ASSET_FILES) {
+    const dst = path.join(ASSETS_DIR, f);
+    if (fs.existsSync(dst) && fs.statSync(dst).size > 1000) continue;
+    if (!ASSETS_URL) continue;
+    try { const r = await fetch(`${ASSETS_URL}/${f}`); if (r.ok) await fsp.writeFile(dst, Buffer.from(await r.arrayBuffer())); } catch { /* sin overlay */ }
+  }
+  return ASSET_FILES.every((f) => fs.existsSync(path.join(ASSETS_DIR, f)));
+}
+// ffmpeg: rutas con barras normales y ':' escapado para los filtros.
+const ff = (p) => p.replace(/\\/g, '/').replace(/:/g, '\\:');
+const mmss = (sec) => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
+
+/** Convierte el webm a MP4 1920×1080 con el overlay de la liga (título del momento, serie, ronda, hora). */
+async function encodeClip(webm, mp4, m, match) {
+  const hasAssets = await ensureAssets();
+  const base = ['-i', webm];
+  if (!hasAssets) {
+    await ffmpeg([...base, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
+    return;
+  }
+  const tdir = path.dirname(mp4);
+  const titleTxt = path.join(tdir, 'ov-title.txt'), metaTxt = path.join(tdir, 'ov-meta.txt'), brandTxt = path.join(tdir, 'ov-brand.txt');
+  const title = String(m.title || '').split(' · ')[0].toUpperCase();
+  const who = (m.players && m.players[0]) ? ` · ${m.players[0].name}` : '';
+  const meta = match ? `${match.team1} vs ${match.team2} · Ronda ${match.round} · Juego ${match.gameNumber} · ${mmss(m.t)}` : mmss(m.t);
+  await fsp.writeFile(titleTxt, title + who.toUpperCase(), 'utf8');
+  await fsp.writeFile(metaTxt, meta.toUpperCase(), 'utf8');
+  await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
+  const fOrb = ff(path.join(ASSETS_DIR, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS_DIR, 'JetBrainsMono-700.ttf'));
+  const filter = [
+    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c[v0]`,
+    `[1:v]scale=-1:40[lqc]`,
+    `[2:v]scale=-1:44[atak]`,
+    `[v0]drawbox=x=60:y=890:w=1120:h=130:color=0x020b1c@0.88:t=fill,drawbox=x=60:y=890:w=6:h=130:color=0x4ea1ff@1:t=fill,drawbox=x=66:y=890:w=1114:h=1:color=0x60a5ff@0.5:t=fill[v1]`,
+    `[v1][lqc]overlay=90:935[v2]`,
+    `[v2]drawbox=x=226:y=905:w=1:h=100:color=0xffffff@0.35:t=fill[v3]`,
+    `[v3]drawtext=fontfile='${fOrb}':textfile='${ff(titleTxt)}':fontcolor=white:fontsize=36:x=250:y=908:borderw=0:shadowcolor=0x3f97ff@0.8:shadowx=0:shadowy=0[v4]`,
+    `[v4]drawtext=fontfile='${fMono}':textfile='${ff(metaTxt)}':fontcolor=0xbcd0ee:fontsize=20:x=250:y=966[v5]`,
+    `[v5]drawbox=x=1420:y=962:w=220:h=58:color=0x020b1c@0.88:t=fill[v6]`,
+    `[v6][atak]overlay=1434:969[v7]`,
+    `[v7]drawtext=fontfile='${fMono}':textfile='${ff(brandTxt)}':fontcolor=white:fontsize=22:x=1490:y=980[vout]`,
+  ].join(';');
+  await ffmpeg(['-i', webm, '-i', path.join(ASSETS_DIR, 'lqc-wordmark.png'), '-i', path.join(ASSETS_DIR, 'atak-logo-mark.png'),
+    '-filter_complex', filter, '-map', '[vout]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
 }
 
 // ── ffmpeg ───────────────────────────────────────────────────────────────────
@@ -220,8 +272,10 @@ function cameraFor(pos) {
 async function renderGame(gameId) {
   log(`== ${REGION}-${gameId} ==`);
   const info = await atak(`/api/replays/${REGION}/${gameId}/moments`);
-  const have = new Set((await atak(`/api/replays/${REGION}/${gameId}/clips`)).clips.map((c) => c.key));
-  const todo = (info.top || []).slice(0, TOP).filter((m) => !have.has(m.key)).sort((a, b) => a.t - b.t);
+  const cfgNow = readConfig();
+  const have = cfgNow.force ? new Set() : new Set((await atak(`/api/replays/${REGION}/${gameId}/clips`)).clips.map((c) => c.key));
+  const want = Number(cfgNow.top) || TOP;
+  const todo = (info.top || []).slice(0, want).filter((m) => !have.has(m.key)).sort((a, b) => a.t - b.t);
   if (!todo.length) { log('Sin momentos nuevos que grabar'); return 0; }
   log(`${todo.length} clips por grabar:`, todo.map((m) => `${m.key}`).join(' '));
 
@@ -280,7 +334,7 @@ async function renderGame(gameId) {
       const maxWait = (m.tEnd - m.tStart + 25) * 1000; const t0 = Date.now();
       while (Date.now() - t0 < maxWait) { await sleep(1500); const r = await replay('GET', '/replay/recording'); if (r.data && r.data.recording === false) break; }
       if (!fs.existsSync(webm)) { log('  ✗ no se generó el archivo', webm); continue; }
-      await ffmpeg(['-i', webm, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
+      await encodeClip(webm, mp4, m, info.match);
       const up = await uploadClip(gameId, m, mp4);
       log(`  ✓ subido ${up.url}`);
       done++;
