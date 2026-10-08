@@ -159,19 +159,40 @@ function launchDirect(rofl) {
   return new Promise((resolve) => {
     let failed = false;
     try {
-      const child = spawn(exe, [rofl], { cwd: path.join(LOL_DIR, 'Game'), detached: true, stdio: 'ignore', windowsHide: false });
+      // Mismos argumentos que usa el cliente al abrir un replay (ver r3dlog): sin -GameBaseDir el juego
+      // no encuentra Config\game.cfg (y con ello EnableReplayApi y el modo ventana).
+      const args = [rofl, `-GameBaseDir=${LOL_DIR}`, `-Region=${REGION}`, `-PlatformID=${REGION}`, '-Locale=es_MX', '-SkipBuild', '-EnableCrashpad=false'];
+      const child = spawn(exe, args, { cwd: path.join(LOL_DIR, 'Game'), detached: true, stdio: 'ignore', windowsHide: false });
       child.on('error', (e) => { failed = true; log('spawn directo falló:', e.code || e.message, '→ intento con start'); });
       child.unref();
     } catch (e) { failed = true; log('spawn directo falló:', e.code || e.message, '→ intento con start'); }
     setTimeout(() => {
       if (failed) {
-        const viaStart = spawn('cmd.exe', ['/c', 'start', '""', '/D', path.join(LOL_DIR, 'Game'), exe, rofl], { detached: true, stdio: 'ignore', windowsHide: true });
+        const viaStart = spawn('cmd.exe', ['/c', 'start', '""', '/D', path.join(LOL_DIR, 'Game'), exe, rofl, `-GameBaseDir=${LOL_DIR}`, `-Region=${REGION}`, `-PlatformID=${REGION}`, '-Locale=es_MX', '-SkipBuild', '-EnableCrashpad=false'], { detached: true, stdio: 'ignore', windowsHide: true });
         viaStart.on('error', (e) => log('start falló:', e.code || e.message));
         viaStart.unref();
       }
       resolve();
     }, 3000);
   });
+}
+
+// Cola del último r3dlog del juego (diagnóstico cuando no arranca o no responde la Replay API).
+function dumpGameLog(n = 40) {
+  try {
+    const root = path.join(LOL_DIR, 'Logs', 'GameLogs');
+    const dirs = fs.readdirSync(root).map((d) => path.join(root, d)).filter((d) => fs.statSync(d).isDirectory()).sort().reverse();
+    if (!dirs.length) { log('  (sin logs del juego en', root + ')'); return; }
+    const f = fs.readdirSync(dirs[0]).find((x) => x.endsWith('r3dlog.txt'));
+    if (!f) { log('  (sin r3dlog en', dirs[0] + ')'); return; }
+    const lines = fs.readFileSync(path.join(dirs[0], f), 'utf8').split(/?
+/).filter(Boolean);
+    log(`  --- ${path.join(dirs[0], f)} (${lines.length} líneas, últimas ${Math.min(n, lines.length)}):`);
+    for (const l of lines.slice(-n)) log('  | ' + l.slice(0, 220));
+  } catch (e) { log('  (no pude leer el log del juego:', e.message + ')'); }
+}
+async function gameRunning() {
+  return new Promise((resolve) => execFile('tasklist', ['/FI', 'IMAGENAME eq League of Legends.exe', '/FO', 'CSV'], { windowsHide: true }, (e, out) => resolve(!e && /League of Legends\.exe/i.test(out || ''))));
 }
 
 // ── Render de UNA partida ───────────────────────────────────────────────────
@@ -210,8 +231,14 @@ async function renderGame(gameId) {
   }
   log('Abriendo el replay… esperando la Replay API');
   let ready = false;
-  for (let i = 0; i < 90; i++) { await sleep(2000); try { const r = await replay('GET', '/replay/playback'); if (r.status === 200 && r.data && typeof r.data.length === 'number') { ready = true; break; } } catch { /* aún no */ } }
-  if (!ready) throw new Error('la Replay API no respondió (¿EnableReplayApi=1? ¿el juego abrió?)');
+  let lastApi = '';
+  for (let i = 0; i < 180; i++) {
+    await sleep(2000);
+    try { const r = await replay('GET', '/replay/playback'); lastApi = `${r.status} ${JSON.stringify(r.data).slice(0, 120)}`; if (r.status === 200 && r.data && typeof r.data.length === 'number') { ready = true; break; } } catch (e) { lastApi = e.message; }
+    if (i >= 5 && i % 5 === 0 && !(await gameRunning())) { log('  el juego se cerró solo mientras cargaba el replay'); dumpGameLog(); throw new Error('el juego se cerró al abrir el replay (ver r3dlog arriba)'); }
+    if (i % 30 === 29) log('  aún sin Replay API:', lastApi);
+  }
+  if (!ready) { dumpGameLog(); throw new Error(`la Replay API no respondió (última respuesta: ${lastApi}) — ¿EnableReplayApi=1 en Config\game.cfg?`); }
   await sleep(4000);
 
   await fsp.mkdir(OUT, { recursive: true });
