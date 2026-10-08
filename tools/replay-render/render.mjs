@@ -295,11 +295,13 @@ async function renderGame(gameId) {
 }
 
 // ── Lotes ────────────────────────────────────────────────────────────────────
-async function pendingGames(tournamentId) {
+async function pendingGames(tournamentId, want = TOP) {
   const { replays } = await atak(`/api/replays/tournament/${tournamentId}`);
   const { clips } = await atak(`/api/replays/tournament/${tournamentId}/clips`);
-  const withClips = new Set(clips.map((c) => `${c.region}:${c.gameId}`));
-  return replays.filter((r) => r.region === REGION && !withClips.has(`${r.region}:${r.gameId}`)).map((r) => r.gameId);
+  const count = new Map();
+  for (const c of clips) { const k = `${c.region}:${c.gameId}`; count.set(k, (count.get(k) || 0) + 1); }
+  // Pendiente = partida con replay y menos clips de los que se quieren por partida.
+  return replays.filter((r) => r.region === REGION && (count.get(`${r.region}:${r.gameId}`) || 0) < want).map((r) => r.gameId);
 }
 
 (async () => {
@@ -310,7 +312,7 @@ async function pendingGames(tournamentId) {
   do {
     const cfg = readConfig();
     if (cfg.enabled === false) { log('config.json: enabled=false, en pausa'); await sleep(5 * 60_000); continue; }
-    const ids = await pendingGames(cfg.tournament || tournament);
+    const ids = await pendingGames(cfg.tournament || tournament, Number(cfg.top) || TOP);
     log(`${tournament}: ${ids.length} partidas con replay y sin clips`);
     for (const id of ids) { try { await renderGame(id); } catch (e) { log(`✗ ${id}: ${e.message}`); if (/cliente está en|no detectado|puerto 2999/i.test(e.message)) break; } }
     if (watch) await sleep(10 * 60_000);
