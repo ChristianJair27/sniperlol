@@ -457,6 +457,14 @@ async function ensureClient() {
   log('replays: el cliente no quedó listo (sin API o sin sesión)');
   return false;
 }
+/** Cierra el cliente de League (no el Riot Client): abierto, el juego directo se cierra al cargar el replay. */
+async function closeLeagueClient() {
+  if (!(await lcuAlive())) return;
+  log('Cerrando el cliente de League antes de renderizar…');
+  for (const img of ['LeagueClientUxRender.exe', 'LeagueClientUx.exe', 'LeagueClient.exe']) { try { execFileSync('taskkill', ['/F', '/T', '/IM', img], { windowsHide: true, stdio: 'ignore' }); } catch { /* */ } }
+  try { fs.unlinkSync(path.join(LOL_DIR, 'lockfile')); } catch { /* */ }
+  lockCache = null; await sleep(4000);
+}
 async function waitRiotWindow(sec) {
   for (let i = 0; i < sec / 3; i++) {
     try { const t = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', "(Get-Process | Where-Object { $_.MainWindowTitle -eq 'Riot Client' }).Count"], { windowsHide: true, timeout: 20_000 }).toString().trim(); if (Number(t) > 0) return true; } catch { /* */ }
@@ -614,6 +622,7 @@ function diag() {
     const todo = list.filter((x) => !have.has(x.gameId));
     const up = todo.length ? await fetchReplays(todo.length, 'manual', todo) : 0;
     log(`replays subidos: ${up} (ya había ${list.length - todo.length})`);
+    await closeLeagueClient();
     for (const g of list) { if (have.has(g.gameId) || todo.find((x) => x.gameId === g.gameId)) { try { const c = await renderGame(g.gameId); log(`${g.gameId}: ${c} clips`); } catch (e) { log(`✗ ${g.gameId}: ${e.message}`); } } }
     return;
   }
@@ -638,6 +647,7 @@ function diag() {
     const ids = await pendingGames(cfg.tournament || tournament, Number(cfg.top) || TOP);
     log(`${tournament}: ${ids.length} partidas con replay y sin clips`);
     let rendered = 0;
+    if (ids.length) await closeLeagueClient();
     for (const id of ids) { try { await renderGame(id); rendered++; } catch (e) { log(`✗ ${id}: ${e.message}`); if (/cliente está en|no detectado|puerto 2999/i.test(e.message)) break; } }
     if (watch) await sleep(fetched || rendered ? 20_000 : (Number(cfg.idleMinutes) || 3) * 60_000);
   } while (watch);
