@@ -208,6 +208,14 @@ async function gameRunning() {
   return new Promise((resolve) => execFile('tasklist', ['/FI', 'IMAGENAME eq League of Legends.exe', '/FO', 'CSV'], { windowsHide: true }, (e, out) => resolve(!e && /League of Legends\.exe/i.test(out || ''))));
 }
 
+// ── Cámara: coordenadas del mapa → posición de cámara ───────────────────────
+function cameraFor(pos) {
+  if (!pos) return null;
+  // El mapa va de 0 a ~14800 en x y z; la cámara "top" mira hacia -z con cierta inclinación,
+  // así que se coloca un poco al sur del punto y a ~1900 de altura.
+  return { x: Number(pos.x) || 7400, y: 1900, z: (Number(pos.y) || 7400) - 1300 };
+}
+
 // ── Render de UNA partida ───────────────────────────────────────────────────
 async function renderGame(gameId) {
   log(`== ${REGION}-${gameId} ==`);
