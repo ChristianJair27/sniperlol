@@ -330,6 +330,10 @@ router.get('/:region/:gameId/clips/:key', readLimiter, async (req, res) => {
     const data: Buffer = row.data; const total = data.length;
     res.setHeader('Content-Type', row.mime || 'video/mp4');
     res.setHeader('Cache-Control', 'public, max-age=86400');
+    // El sitio (atakgg.*) carga el <video> desde este origen (atakback.*): helmet manda
+    // CORP same-origin por defecto y el navegador bloquea el medio.
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
     res.setHeader('Accept-Ranges', 'bytes');
     const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
     if (range) {
@@ -369,6 +373,7 @@ router.get('/:region/:gameId', readLimiter, async (req, res) => {
     res.setHeader('Content-Length', String(row.size));
     res.setHeader('Content-Disposition', `attachment; filename="${region}-${gameId}.rofl"`);
     res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     if (row.patch) res.setHeader('X-Patch', row.patch);
     res.end(row.data);
   } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
