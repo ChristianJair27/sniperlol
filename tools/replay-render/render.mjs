@@ -150,9 +150,23 @@ async function downloadRofl(gameId) {
   await fsp.writeFile(file, Buffer.from(await r.arrayBuffer()));
   return file;
 }
+// Idioma instalado: el juego exige el WAD Localized/Global.<locale>.wad.client de la instalación
+// (es_MX en la del jugador, en_US en otras). Se detecta por los archivos presentes.
+function detectLocale() {
+  try {
+    const dir = path.join(LOL_DIR, 'Game', 'DATA', 'FINAL', 'Localized');
+    const found = fs.readdirSync(dir).map((f) => /^Global\.([a-z]{2}_[A-Z]{2})\.wad\.client$/.exec(f)?.[1]).filter(Boolean);
+    const pref = ['es_MX', 'es_ES', 'en_US'];
+    return pref.find((l) => found.includes(l)) || found[0] || 'en_US';
+  } catch { return 'en_US'; }
+}
 function launchDirect(rofl) {
   const exe = path.join(LOL_DIR, 'Game', 'League of Legends.exe');
   if (!fs.existsSync(exe)) throw new Error(`no encuentro ${exe}`);
+  // Si un arranque anterior dejó marca de reparación, quitarla (en la VM no hay parcheador).
+  try { fs.unlinkSync(path.join(LOL_DIR, 'SOFT_REPAIR')); } catch { /* no existía */ }
+  const locale = detectLocale();
+  log(`Idioma del juego: ${locale}`);
   log('Abriendo el replay directamente con el juego…');
   // Primer intento: CreateProcess directo. Solo si Windows lo niega (EPERM: p. ej. políticas
   // de la sesión o "ejecutar como administrador" en el exe) se intenta por ShellExecute.
@@ -161,14 +175,14 @@ function launchDirect(rofl) {
     try {
       // Mismos argumentos que usa el cliente al abrir un replay (ver r3dlog): sin -GameBaseDir el juego
       // no encuentra Config\game.cfg (y con ello EnableReplayApi y el modo ventana).
-      const args = [rofl, `-GameBaseDir=${LOL_DIR}`, `-Region=${REGION}`, `-PlatformID=${REGION}`, '-Locale=es_MX', '-SkipBuild', '-EnableCrashpad=false'];
+      const args = [rofl, `-GameBaseDir=${LOL_DIR}`, `-Region=${REGION}`, `-PlatformID=${REGION}`, `-Locale=${locale}`, '-SkipBuild', '-EnableCrashpad=false'];
       const child = spawn(exe, args, { cwd: path.join(LOL_DIR, 'Game'), detached: true, stdio: 'ignore', windowsHide: false });
       child.on('error', (e) => { failed = true; log('spawn directo falló:', e.code || e.message, '→ intento con start'); });
       child.unref();
     } catch (e) { failed = true; log('spawn directo falló:', e.code || e.message, '→ intento con start'); }
     setTimeout(() => {
       if (failed) {
-        const viaStart = spawn('cmd.exe', ['/c', 'start', '""', '/D', path.join(LOL_DIR, 'Game'), exe, rofl, `-GameBaseDir=${LOL_DIR}`, `-Region=${REGION}`, `-PlatformID=${REGION}`, '-Locale=es_MX', '-SkipBuild', '-EnableCrashpad=false'], { detached: true, stdio: 'ignore', windowsHide: true });
+        const viaStart = spawn('cmd.exe', ['/c', 'start', '""', '/D', path.join(LOL_DIR, 'Game'), exe, rofl, `-GameBaseDir=${LOL_DIR}`, `-Region=${REGION}`, `-PlatformID=${REGION}`, `-Locale=${locale}`, '-SkipBuild', '-EnableCrashpad=false'], { detached: true, stdio: 'ignore', windowsHide: true });
         viaStart.on('error', (e) => log('start falló:', e.code || e.message));
         viaStart.unref();
       }
