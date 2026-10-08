@@ -23,6 +23,8 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.AGENT_PORT || 47777);
+const HOST = process.env.AGENT_HOST || '127.0.0.1';   // en la VM: 0.0.0.0 (solo la alcanza el host por la red interna)
+const UPDATE_URL = process.env.AGENT_UPDATE_URL || ''; // p. ej. http://172.24.48.1:8098 (carpeta replay-render del host)
 const TOKEN = fs.readFileSync(path.join(here, '.agent-token'), 'utf8').trim();
 const NODE = process.execPath;
 const LOG = path.join(here, 'out', 'worker.log');
@@ -49,7 +51,7 @@ http.createServer(async (req, res) => {
       if (!a.every((x) => ALLOWED_ARGS.test(x))) return json(res, 400, { ok: false, error: 'argumento no permitido' });
       await fsp.mkdir(path.dirname(LOG), { recursive: true });
       const out = fs.openSync(LOG, 'a');
-      worker = spawn(NODE, [path.join(here, 'render.mjs'), ...a], { cwd: here, stdio: ['ignore', out, out], windowsHide: false, env: { ...process.env, ATAK_QUIET: '1' } });
+      worker = spawn(NODE, [path.join(here, 'render.mjs'), ...a], { cwd: here, stdio: ['ignore', out, out], windowsHide: false, env: { ...process.env, ATAK_QUIET: '1', ...(process.env.LOL_DIR ? { LOL_DIR: process.env.LOL_DIR } : {}) } });
       worker.on('exit', (code) => log('worker terminó', code));
       log('worker iniciado', a.join(' '));
       return json(res, 200, { ok: true, pid: worker.pid });
@@ -58,6 +60,25 @@ http.createServer(async (req, res) => {
       if (!worker || worker.exitCode !== null) return json(res, 200, { ok: true, note: 'no corría' });
       await exec('taskkill', ['/F', '/T', '/PID', String(worker.pid)]);
       return json(res, 200, { ok: true });
+    }
+    if (req.method === 'POST' && url.pathname === '/worker/update') {
+      // Trae render.mjs (y config.json si existe) desde la carpeta del host servida por HTTP.
+      if (!UPDATE_URL) return json(res, 400, { ok: false, error: 'sin AGENT_UPDATE_URL' });
+      const got = [];
+      for (const f of ['render.mjs', 'config.json']) {
+        try { const r = await fetch(`${UPDATE_URL}/${f}?t=${Date.now()}`); if (r.ok) { await fsp.writeFile(path.join(here, f), Buffer.from(await r.arrayBuffer())); got.push(f); } } catch { /* opcional */ }
+      }
+      return json(res, 200, { ok: true, updated: got });
+    }
+    if (req.method === 'GET' && url.pathname === '/files') {
+      const list = (dir) => { try { return fs.readdirSync(dir).map((n) => { const st = fs.statSync(path.join(dir, n)); return { name: n, size: st.size, mtime: st.mtime }; }); } catch { return []; } };
+      return json(res, 200, { ok: true, out: list(path.join(here, 'out')), rofl: list(path.join(os.tmpdir(), 'atak-render', 'rofl')) });
+    }
+    if (req.method === 'GET' && url.pathname === '/gamelog') {
+      // Último r3dlog del juego (en la unidad JUEGO o en C:)
+      const roots = ['D:/Riot Games/League of Legends/Logs/GameLogs', 'C:/Riot Games/League of Legends/Logs/GameLogs', path.join(process.env.LOL_DIR || '', 'Logs', 'GameLogs')];
+      for (const r of roots) { try { const dirs = fs.readdirSync(r).map((d) => path.join(r, d)).filter((d) => fs.statSync(d).isDirectory()).sort().reverse(); if (dirs.length) { const f = fs.readdirSync(dirs[0]).find((n) => n.endsWith('r3dlog.txt')); if (f) { const text = fs.readFileSync(path.join(dirs[0], f), 'utf8'); return json(res, 200, { ok: true, dir: dirs[0], lines: text.split(/\r?\n/).filter((l) => /Adapter|Failed|Error|CRSH|Replay|Command Line|port|ALWAYS\|\s+CFG/.test(l)).slice(0, 40) }); } } } catch { /* siguiente */ } }
+      return json(res, 200, { ok: true, lines: [], note: 'sin logs del juego' });
     }
     if (req.method === 'POST' && url.pathname === '/worker/killall') {
       // Cierra cualquier worker (render.mjs) de esta sesión, aunque no lo haya lanzado el agente.
@@ -89,4 +110,4 @@ http.createServer(async (req, res) => {
     }
     json(res, 404, { ok: false, error: 'ruta' });
   } catch (e) { json(res, 500, { ok: false, error: e.message }); }
-}).listen(PORT, '127.0.0.1', () => log(`agente ATAK en 127.0.0.1:${PORT} como ${os.userInfo().username} (sesión ${process.env.SESSIONNAME || '?'})`));
+}).listen(PORT, HOST, () => log(`agente ATAK en ${HOST}:${PORT} como ${os.userInfo().username} (sesión ${process.env.SESSIONNAME || '?'})`));
