@@ -429,8 +429,17 @@ async function installClient() {
 function launchClient() {
   if (!fs.existsSync(RC_EXE)) throw new Error('Riot Client no instalado (install-client)');
   if (lockfile()) { log('El cliente ya está abierto'); return; }
-  try { const t = execFileSync('tasklist', ['/FI', 'IMAGENAME eq RiotClientServices.exe', '/NH'], { windowsHide: true }).toString(); if (/RiotClientServices/i.test(t)) { log('El Riot Client ya está abierto (falta iniciar sesión en la consola de la VM)'); return; } } catch { /* */ }
-  log('Abriendo el cliente de League…');
+  let rcRunning = false;
+  try { rcRunning = /RiotClientServices/i.test(execFileSync('tasklist', ['/FI', 'IMAGENAME eq RiotClientServices.exe', '/NH'], { windowsHide: true }).toString()); } catch { /* */ }
+  const lcExe = path.join(LOL_DIR, 'LeagueClient.exe');
+  if (rcRunning && fs.existsSync(lcExe)) {
+    // Con el Riot Client ya abierto (y con sesión), LeagueClient.exe arranca el cliente directamente.
+    log('Abriendo LeagueClient.exe…');
+    const child = spawn(lcExe, [], { cwd: LOL_DIR, detached: true, stdio: 'ignore', windowsHide: false });
+    child.unref();
+    return;
+  }
+  log('Abriendo el Riot Client con League…');
   const child = spawn(RC_EXE, ['--launch-product=league_of_legends', '--launch-patchline=live'], { detached: true, stdio: 'ignore', windowsHide: false });
   child.unref();
 }
@@ -485,7 +494,44 @@ async function fetchReplays(limit = 10) {
   return done;
 }
 
+// ── Pequeñas acciones de interfaz dentro de la VM (clic / teclas) ─────────────
+// El worker corre en la sesión interactiva de la VM, así que puede pulsar en la
+// pantalla sin pasar por la consola. Uso: node render.mjs ui-click 1480 894
+//                                         node render.mjs ui-keys ENTER
+function uiClick(x, y) {
+  const ps = `Add-Type -Name U -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y); [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint x,uint y,uint d,int e);'; [W.U]::SetCursorPos(${x},${y}); Start-Sleep -m 120; [W.U]::mouse_event(2,0,0,0,0); Start-Sleep -m 60; [W.U]::mouse_event(4,0,0,0,0)`;
+  execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 20_000 });
+  log(`ui: clic en ${x},${y}`);
+}
+function uiKeys(keys) {
+  const map = { ENTER: '{ENTER}', ESC: '{ESC}', TAB: '{TAB}', SPACE: ' ' };
+  const seq = keys.map((k) => map[k.toUpperCase()] || k).join('');
+  const ps = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${seq.replace(/'/g, "''")}')`;
+  execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 20_000 });
+  log(`ui: teclas ${keys.join(' ')}`);
+}
+function uiFocus(title) {
+  const ps = `Add-Type -Name U -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);'; $p = Get-Process | Where-Object { $_.MainWindowTitle -like '*${title.replace(/'/g, "''")}*' } | Select-Object -First 1; if ($p) { [W.U]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; 'ok ' + $p.MainWindowTitle } else { 'no' }`;
+  const r = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 20_000 }).toString().trim();
+  log(`ui: foco "${title}" → ${r}`);
+}
+
+function diag() {
+  try { log('procesos: ' + execFileSync('tasklist', ['/NH'], { windowsHide: true }).toString().split(/\r?\n/).filter((l) => /league|riot|vgc|vgtray/i.test(l)).map((l) => l.trim().split(/\s+/).slice(0, 2).join(':')).join(' | ')); } catch (e) { log('tasklist: ' + e.message); }
+  for (const dir of [path.join(LOL_DIR, 'Logs', 'LeagueClient Logs'), path.join(os.homedir(), 'AppData', 'Local', 'Riot Games', 'Riot Client', 'Logs', 'Riot Client Logs')]) {
+    try {
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.log')).map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t).slice(0, 2);
+      for (const { f } of files) { const txt = fs.readFileSync(path.join(dir, f), 'utf8').split(/\r?\n/); log(`--- ${f} (${txt.length} líneas)`); for (const l of txt.filter((x) => /error|fatal|vanguard|exit|crash|warn/i.test(x)).slice(-25)) log('   ' + l.slice(0, 220)); }
+    } catch (e) { log(`sin logs en ${dir}: ${e.message}`); }
+  }
+  log('lockfile: ' + JSON.stringify(lockfile()));
+}
+
 (async () => {
+  if (args[0] === 'diag') { diag(); return; }
+  if (args[0] === 'ui-click') { uiClick(Number(args[1]), Number(args[2])); return; }
+  if (args[0] === 'ui-keys') { uiKeys(args.slice(1)); return; }
+  if (args[0] === 'ui-focus') { uiFocus(args.slice(1).join(' ')); return; }
   if (args.includes('install-client')) { await installClient(); return; }
   if (args.includes('launch-client')) { launchClient(); return; }
   if (args.includes('fetch-replays')) { const n = await fetchReplays(50); log(`replays subidos: ${n}`); return; }
