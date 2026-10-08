@@ -448,15 +448,31 @@ function launchClient() {
 // Lo mismo que hace el companion, pero desde la VM: pide a ATAK.GG qué partidas
 // faltan, el cliente las baja (solo con sesión iniciada y mismo parche) y se
 // suben. En --watch corre antes de cada ciclo de render (config.fetch !== false).
-const fetchSkip = new Set(); const fetchTried = new Map();
-async function fetchReplays(limit = 10) {
+const SKIP_FILE = path.join(here, 'out', 'fetch-skip.json');
+const fetchSkip = new Set((() => { try { return JSON.parse(fs.readFileSync(SKIP_FILE, 'utf8')); } catch { return []; } })());
+const fetchTried = new Map();
+const saveSkip = () => { try { fs.writeFileSync(SKIP_FILE, JSON.stringify([...fetchSkip])); } catch { /* */ } };
+// Lista propia de partidas que faltan: bracket del torneo menos replays ya guardados,
+// de la más reciente a la más antigua (las viejas ya no se pueden bajar: otro parche).
+async function wantedGames(tournamentId) {
+  const t = await atak(`/api/tournaments/${tournamentId}`); const tour = t?.tournament ?? t;
+  const { replays } = await atak(`/api/replays/tournament/${tournamentId}`);
+  const have = new Set((replays || []).map((r) => `${r.region}:${r.gameId}`));
+  const out = [];
+  for (const m of tour?.bracket || []) for (const g of m.games || []) {
+    const gameId = Number(g.gameId); if (!gameId || have.has(`${REGION}:${gameId}`)) continue;
+    out.push({ gameId, region: REGION, matchId: m.id, team1: m.team1, team2: m.team2, round: m.round });
+  }
+  return out.sort((a, b) => b.gameId - a.gameId);
+}
+async function fetchReplays(limit = 10, tournamentId = 'lqc-2026') {
   let lf = lockfile();
   if (!lf) { log('replays: el cliente de League no está abierto en la VM (inicia sesión en su consola)'); return 0; }
   let me; try { me = (await lcuReq('GET', '/lol-summoner/v1/current-summoner')).data; } catch { /* */ }
   if (!me?.summonerId && !me?.puuid) { log('replays: el cliente está abierto pero sin sesión iniciada'); return 0; }
-  const { wanted } = await atak(`/api/replays/wanted?region=${REGION}&limit=50`);
-  const todo = (wanted || []).filter((w) => !fetchSkip.has(w.gameId) && Date.now() - (fetchTried.get(w.gameId) || 0) > 30 * 60_000).slice(0, limit);
-  log(`replays: ${wanted?.length || 0} por subir, intento ${todo.length}`);
+  const wanted = await wantedGames(tournamentId);
+  const todo = wanted.filter((w) => !fetchSkip.has(w.gameId) && Date.now() - (fetchTried.get(w.gameId) || 0) > 30 * 60_000).slice(0, limit);
+  log(`replays: ${wanted.length} sin replay (${wanted.length - todo.length} descartadas o ya probadas), intento ${todo.length}`);
   let done = 0;
   const bad = new Set(['lost', 'incompatible', 'error', 'missing']);
   for (const w of todo) {
@@ -464,7 +480,7 @@ async function fetchReplays(limit = 10) {
     const label = `${w.team1} vs ${w.team2} (${w.gameId})`;
     try {
       let meta = (await lcuReq('GET', `/lol-replays/v1/metadata/${w.gameId}`)).data;
-      if (meta?.state && bad.has(meta.state)) { fetchSkip.add(w.gameId); log(`  ✗ ${label}: no disponible (${meta.state})`); continue; }
+      if (meta?.state && bad.has(meta.state)) { fetchSkip.add(w.gameId); saveSkip(); log(`  ✗ ${label}: no disponible (${meta.state})`); continue; }
       if (meta?.state !== 'watch') {
         const r = await lcuReq('POST', `/lol-replays/v1/rofls/${w.gameId}/download`, { componentType: 'replay-button_match-history' });
         if (r.status >= 300) { log(`  ✗ ${label}: el cliente rechazó la descarga (${r.status})`); continue; }
@@ -474,7 +490,7 @@ async function fetchReplays(limit = 10) {
           if (meta?.state === 'watch') break;
           if (meta?.state && bad.has(meta.state)) break;
         }
-        if (meta?.state && bad.has(meta.state)) { fetchSkip.add(w.gameId); log(`  ✗ ${label}: no disponible (${meta.state})`); continue; }
+        if (meta?.state && bad.has(meta.state)) { fetchSkip.add(w.gameId); saveSkip(); log(`  ✗ ${label}: no disponible (${meta.state})`); continue; }
         if (meta?.state !== 'watch') { log(`  ✗ ${label}: la descarga no terminó (${meta?.state})`); continue; }
       }
       let dir = (await lcuReq('GET', '/lol-replays/v1/rofls/path')).data;
@@ -534,7 +550,7 @@ function diag() {
   if (args[0] === 'ui-focus') { uiFocus(args.slice(1).join(' ')); return; }
   if (args.includes('install-client')) { await installClient(); return; }
   if (args.includes('launch-client')) { launchClient(); return; }
-  if (args.includes('fetch-replays')) { const n = await fetchReplays(50); log(`replays subidos: ${n}`); return; }
+  if (args.includes('fetch-replays')) { const n = await fetchReplays(120, opt('tournament', 'lqc-2026')); log(`replays subidos: ${n}`); return; }
   const game = opt('game'); const tournament = opt('tournament');
   if (game) { const n = await renderGame(Number(game)); log(`listo: ${n} clips`); return; }
   if (!tournament) { console.log('uso: node render.mjs --game <gameId> | --tournament <id> [--watch] | install-client | fetch-replays'); return; }
@@ -544,7 +560,7 @@ function diag() {
     if (cfg.enabled === false) { log('config.json: enabled=false, en pausa'); await sleep(5 * 60_000); continue; }
     // 1) Replays que falten, desde el cliente de la VM (si está abierto y con sesión)
     let fetched = 0;
-    if (watch && cfg.fetch !== false) { try { if (!lockfile() && cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE)) launchClient(); fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 10); } catch (e) { log(`replays: ${e.message}`); } }
+    if (watch && cfg.fetch !== false) { try { if (!lockfile() && cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE)) launchClient(); fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 10, cfg.tournament || tournament); } catch (e) { log(`replays: ${e.message}`); } }
     // 2) Render de lo que tenga replay y no tenga clips
     const ids = await pendingGames(cfg.tournament || tournament, Number(cfg.top) || TOP);
     log(`${tournament}: ${ids.length} partidas con replay y sin clips`);
