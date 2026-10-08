@@ -103,8 +103,76 @@ function sanitizeSnapshot(body: any) {
     // espectador entró a medias, el overlay no puede dar por vivo un objetivo.
     // null = companion viejo (no lo dice).
     eventsComplete: typeof body?.eventsComplete === 'boolean' ? body.eventsComplete : null,
+    // 'player' = lo manda un jugador de la partida (eventos completos); 'spectator' = el caster.
+    source: body?.source === 'player' ? 'player' : 'spectator',
+    activePlayer: String(body?.activePlayer || '').slice(0, 64),
   };
 }
+
+// ── Plantillas de torneos activos (para reconocer una partida por sus jugadores) ──
+type RosterIndex = { tournamentId: string; tournamentName: string; byId: Map<string, string>; byName: Map<string, string>; bracket: any[] };
+let rosterCache: { at: number; list: RosterIndex[] } = { at: 0, list: [] };
+async function rosters(): Promise<RosterIndex[]> {
+  if (Date.now() - rosterCache.at < 60_000) return rosterCache.list;
+  const [ts] = await pool.query<any[]>("SELECT id, name, bracket FROM tournaments WHERE phase IN ('active') AND name NOT REGEXP 'prueba|test|demo'");
+  const list: RosterIndex[] = [];
+  for (const t of ts) {
+    const [regs] = await pool.query<any[]>('SELECT team_name, captain_riot_id, players FROM tournament_registrations WHERE tournament_id = ?', [t.id]);
+    const byId = new Map<string, string>(), byName = new Map<string, string>();
+    const add = (riotId: any, team: string) => { const r = String(riotId || '').trim().toLowerCase(); if (!r) return; byId.set(r, team); byName.set(r.split('#')[0], team); };
+    for (const r of regs) { add(r.captain_riot_id, r.team_name); let ps: any[] = []; try { ps = typeof r.players === 'string' ? JSON.parse(r.players) : (r.players || []); } catch { ps = []; } for (const p of ps) add(p?.riotId, r.team_name); }
+    let bracket: any[] = []; try { bracket = typeof t.bracket === 'string' ? JSON.parse(t.bracket) : (t.bracket || []); } catch { bracket = []; }
+    list.push({ tournamentId: String(t.id), tournamentName: String(t.name), byId, byName, bracket: Array.isArray(bracket) ? bracket : [] });
+  }
+  rosterCache = { at: Date.now(), list };
+  return list;
+}
+/** ¿A qué torneo y equipos pertenece esta partida? (≥ 5 de los 10 jugadores registrados) */
+async function matchTournament(snapshot: any) {
+  const players: any[] = snapshot.players || [];
+  const teamOf = (idx: RosterIndex, riotId: string) => { const r = String(riotId || '').toLowerCase(); return idx.byId.get(r) || idx.byName.get(r.split('#')[0]) || null; };
+  let best: { idx: RosterIndex; n: number; sides: Record<string, Record<string, number>> } | null = null;
+  for (const idx of await rosters()) {
+    const sides: Record<string, Record<string, number>> = { ORDER: {}, CHAOS: {} };
+    let n = 0;
+    for (const p of players) { const team = teamOf(idx, p.riotId); if (!team) continue; n++; const side = p.team === 'CHAOS' ? 'CHAOS' : 'ORDER'; sides[side][team] = (sides[side][team] || 0) + 1; }
+    if (n >= 5 && (!best || n > best.n)) best = { idx, n, sides };
+  }
+  if (!best) return null;
+  const top = (m: Record<string, number>) => Object.entries(m).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+  const team1 = top(best.sides.ORDER), team2 = top(best.sides.CHAOS);
+  const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+  const m = best.idx.bracket.find((x: any) => (same(x.team1, team1) && same(x.team2, team2)) || (same(x.team1, team2) && same(x.team2, team1)));
+  const played = m ? (m.games || []).length : 0;
+  const bo = m ? (Number(m.bestOf) || Number(m.bo) || (Number(m.score1) + Number(m.score2) >= 2 ? 3 : 3)) : 3;
+  const matchLabel = m ? `${best.idx.tournamentName.toUpperCase()} / RONDA ${m.round} / JUEGO ${played + 1} DE ${bo}` : best.idx.tournamentName.toUpperCase();
+  return { channel: best.idx.tournamentId, team1, team2, matchLabel, matched: best.n };
+}
+
+// ── POST /api/live-feed/auto/push (companion de un JUGADOR de torneo; sin token) ──
+// El backend reconoce la partida por la plantilla registrada y la publica en el
+// canal del torneo con los nombres de los equipos y el rótulo de la serie.
+router.post('/auto/push', async (req, res) => {
+  if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'bad_body' });
+  try {
+    const snap: any = sanitizeSnapshot(req.body);
+    if (snap.source !== 'player' || (snap.players || []).length < 6) return res.json({ ok: false, reason: 'not_player' });
+    const hit = await matchTournament(snap);
+    if (!hit) return res.json({ ok: false, reason: 'not_tournament' });
+    snap.team1 = hit.team1; snap.team2 = hit.team2; snap.matchLabel = hit.matchLabel;
+    const [result] = await pool.query<any>(
+      `INSERT INTO live_feed_channels (channel, seq, at, snapshot)
+       VALUES (?, LAST_INSERT_ID(1), ?, ?)
+       ON DUPLICATE KEY UPDATE
+         seq = LAST_INSERT_ID(seq + 1), at = VALUES(at), snapshot = VALUES(snapshot)`,
+      [hit.channel, Date.now(), JSON.stringify(snap)]
+    );
+    return res.json({ ok: true, channel: hit.channel, team1: hit.team1, team2: hit.team2, matched: hit.matched, seq: Number(result.insertId) || 1 });
+  } catch (e: any) {
+    console.error('[live-feed] auto push error:', e.message);
+    return res.status(500).json({ error: 'push_failed' });
+  }
+});
 
 // ── POST /api/live-feed/:channel/push (companion → backend; requiere token) ──
 router.post('/:channel/push', async (req, res) => {
@@ -119,7 +187,17 @@ router.post('/:channel/push', async (req, res) => {
   if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'bad_body' });
 
   try {
-    const snapshot = JSON.stringify(sanitizeSnapshot(req.body));
+    const snap = sanitizeSnapshot(req.body);
+    // Si un JUGADOR de la partida está mandando el feed (eventos completos), el del
+    // espectador no lo pisa mientras esté fresco.
+    if (snap.source !== 'player') {
+      const [[cur]] = await pool.query<any[]>('SELECT at, snapshot FROM live_feed_channels WHERE channel = ?', [channel]);
+      if (cur && Date.now() - Number(cur.at) < 8000) {
+        let prev: any = null; try { prev = typeof cur.snapshot === 'string' ? JSON.parse(cur.snapshot) : cur.snapshot; } catch { /* */ }
+        if (prev?.source === 'player') return res.json({ ok: true, skipped: 'player_feed' });
+      }
+    }
+    const snapshot = JSON.stringify(snap);
     // Truco LAST_INSERT_ID: el seq incrementado queda en result.insertId sin
     // necesidad de un SELECT extra ni de estado en memoria.
     const [result] = await pool.query<any>(
