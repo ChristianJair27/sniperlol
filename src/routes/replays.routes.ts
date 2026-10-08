@@ -354,6 +354,50 @@ router.get('/:region/:gameId/fight', readLimiter, async (req, res) => {
   } catch (e: any) { res.status(e?.response?.status || 500).json({ ok: false, error: e?.response?.data?.status?.message || e.message }); }
 });
 
+// ── Gráfica de la partida (post-game): oro por minuto y objetivos desde la timeline ──
+const graphCache = new Map<string, { at: number; data: any }>();
+router.get('/:region/:gameId/graph', readLimiter, async (req, res) => {
+  try {
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
+    if (!gameId) return res.status(400).json({ ok: false, error: 'gameId inválido' });
+    const k = key(region, gameId); const c = graphCache.get(k);
+    if (c && Date.now() - c.at < 6 * 3600_000) return res.json({ ok: true, ...c.data });
+    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+    if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
+    const matchId = `${region}_${gameId}`;
+    const match = await getMatchById(region.toLowerCase(), matchId);
+    if (!match?.info) return res.status(404).json({ ok: false, error: 'partida sin datos en Riot todavía' });
+    const tl = await getTimeline(region, matchId);
+    const teamOf = new Map<number, 'blue' | 'red'>();
+    for (const p of match.info.participants || []) teamOf.set(Number(p.participantId), Number(p.teamId) === 100 ? 'blue' : 'red');
+    const gold: Array<{ t: number; blue: number; red: number }> = [];
+    const elders = { blue: 0, red: 0 }, grubs = { blue: 0, red: 0 }, barons = { blue: 0, red: 0 }, heralds = { blue: 0, red: 0 };
+    const dragons: { blue: string[]; red: string[] } = { blue: [], red: [] };
+    const kills: Array<{ t: number; side: 'blue' | 'red' }> = [];
+    for (const f of tl?.info?.frames || []) {
+      let blue = 0, red = 0;
+      for (const [id, pf] of Object.entries<any>(f.participantFrames || {})) { if (teamOf.get(Number(id)) === 'red') red += pf.totalGold || 0; else blue += pf.totalGold || 0; }
+      gold.push({ t: Math.round((f.timestamp || 0) / 1000), blue, red });
+      for (const ev of f.events || []) {
+        const side: 'blue' | 'red' = Number(ev.killerTeamId) === 200 ? 'red' : 'blue';
+        if (ev.type === 'ELITE_MONSTER_KILL') {
+          if (ev.monsterType === 'DRAGON') { if (ev.monsterSubType === 'ELDER_DRAGON') elders[side]++; else dragons[side].push(String(ev.monsterSubType || 'DRAGON').replace('_DRAGON', '').toLowerCase()); }
+          else if (ev.monsterType === 'HORDE') grubs[side]++;
+          else if (ev.monsterType === 'BARON_NASHOR') barons[side]++;
+          else if (ev.monsterType === 'RIFTHERALD') heralds[side]++;
+        } else if (ev.type === 'CHAMPION_KILL') {
+          const ks = teamOf.get(Number(ev.killerId)); const vs = teamOf.get(Number(ev.victimId));
+          kills.push({ t: Math.round((ev.timestamp || 0) / 1000), side: ks || (vs === 'blue' ? 'red' : 'blue') });
+        }
+      }
+    }
+    const data = { region, gameId, gameDuration: Number(match.info.gameDuration) || 0, gold, elders, grubs, barons, heralds, dragons, kills };
+    graphCache.set(k, { at: Date.now(), data });
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.json({ ok: true, ...data });
+  } catch (e: any) { res.status(e?.response?.status || 500).json({ ok: false, error: e?.response?.data?.status?.message || e.message }); }
+});
+
 // ── Clips (MP4 renderizados por el worker) ────────────────────────────────────
 const clipUrl = (req: any, region: string, gameId: number, k: string) => `${req.protocol}://${req.get('host')}/api/replays/${region}/${gameId}/clips/${encodeURIComponent(k)}`;
 
