@@ -98,6 +98,15 @@ export async function tournamentGames(): Promise<TournamentGame[]> {
   return list;
 }
 
+/** Partida de torneo o, si no, partida "manual" (de prueba) que ya tenga replay guardado. */
+async function gameInfo(region: string, gameId: number): Promise<TournamentGame | null> {
+  const t = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+  if (t) return t;
+  const [[row]] = await pool.query<any[]>("SELECT tournament_id, match_id FROM tournament_replays WHERE game_region = ? AND game_id = ? AND tournament_id = 'manual' LIMIT 1", [region, gameId]);
+  if (!row) return null;
+  return { tournamentId: 'manual', tournamentName: 'Pruebas', matchId: String(row.match_id), round: 0, gameId, region, team1: 'Lado azul', team2: 'Lado rojo', winner: null, gameNumber: 1 };
+}
+
 async function storedSet(): Promise<Set<string>> {
   const [rows] = await pool.query<any[]>('SELECT game_region, game_id FROM tournament_replays');
   return new Set(rows.map((r) => `${r.game_region}:${r.game_id}`));
@@ -165,8 +174,13 @@ router.post('/:region/:gameId', uploadLimiter, raw({ type: () => true, limit: MA
     const region = normRegion(req.params.region);
     const gameId = Number(req.params.gameId);
     if (!gameId) return res.status(400).json({ ok: false, error: 'gameId inválido' });
-    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
-    if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
+    let game = await gameInfo(region, gameId);
+    if (!game) {
+      // Fuera de torneo solo el worker de render (pruebas / partidas sueltas): tournament_id 'manual'.
+      const token = (process.env.RENDER_TOKEN || '').trim();
+      if (token && req.get('x-render-token') === token) game = { tournamentId: 'manual', tournamentName: 'Pruebas', matchId: `manual-${gameId}`, round: 0, gameId, region, team1: 'Lado azul', team2: 'Lado rojo', winner: null, gameNumber: 1 };
+      else return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
+    }
     const buf: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
     if (buf.length < MIN_BYTES) return res.status(400).json({ ok: false, error: 'archivo demasiado pequeño' });
     if (buf.toString('latin1', 0, 4) !== 'RIOT') return res.status(400).json({ ok: false, error: 'no es un archivo .rofl' });
@@ -274,7 +288,7 @@ router.get('/:region/:gameId/moments', readLimiter, async (req, res) => {
     if (!gameId) return res.status(400).json({ ok: false, error: 'gameId inválido' });
     const k = key(region, gameId); const c = momentsCache.get(k);
     if (c && Date.now() - c.at < 3600_000) return res.json({ ok: true, ...c.data });
-    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+    const game = await gameInfo(region, gameId);
     if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
     const data: any = await computeMoments(region, gameId);
     if (!data) return res.status(404).json({ ok: false, error: 'partida sin datos en Riot todavía' });
@@ -344,7 +358,7 @@ router.get('/:region/:gameId/fight', readLimiter, async (req, res) => {
     if (!gameId || !(end > start) || end - start > 600) return res.status(400).json({ ok: false, error: 'ventana inválida (start < end, máx. 10 min)' });
     const k = `${key(region, gameId)}:${start}-${end}`; const c = fightCache.get(k);
     if (c && Date.now() - c.at < 6 * 3600_000) return res.json({ ok: true, ...c.data });
-    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+    const game = await gameInfo(region, gameId);
     if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
     const data = await computeFight(region, gameId, start, end);
     if (!data) return res.status(404).json({ ok: false, error: 'partida sin datos en Riot todavía' });
@@ -362,7 +376,7 @@ router.get('/:region/:gameId/graph', readLimiter, async (req, res) => {
     if (!gameId) return res.status(400).json({ ok: false, error: 'gameId inválido' });
     const k = key(region, gameId); const c = graphCache.get(k);
     if (c && Date.now() - c.at < 6 * 3600_000) return res.json({ ok: true, ...c.data });
-    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+    const game = await gameInfo(region, gameId);
     if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
     const matchId = `${region}_${gameId}`;
     const match = await getMatchById(region.toLowerCase(), matchId);
@@ -417,7 +431,7 @@ router.post('/:region/:gameId/clips/:key', uploadLimiter, raw({ type: () => true
     const token = (process.env.RENDER_TOKEN || '').trim();
     if (!token || req.get('x-render-token') !== token) return res.status(401).json({ ok: false, error: 'token de render inválido' });
     const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
-    const game = (await tournamentGames()).find((g) => g.gameId === gameId && g.region === region);
+    const game = await gameInfo(region, gameId);
     if (!game) return res.status(404).json({ ok: false, error: 'esa partida no es de ningún torneo de ATAK.GG' });
     const buf: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
     if (buf.length < 10_000) return res.status(400).json({ ok: false, error: 'video demasiado pequeño' });
@@ -432,7 +446,7 @@ router.post('/:region/:gameId/clips/:key', uploadLimiter, raw({ type: () => true
     const url = clipUrl(req, region, gameId, k);
     // Publicación automática en el feed social del torneo
     let postId: number | null = null;
-    try {
+    if (game.tournamentId !== 'manual') try {
       postId = await upsertClipPost({
         tournamentId: game.tournamentId, tournamentName: game.tournamentName, region, gameId, key: k,
         title: decodeURIComponent(String(req.get('x-clip-title') || k)).slice(0, 200), mediaUrl: url,

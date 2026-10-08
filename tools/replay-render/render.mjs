@@ -154,7 +154,8 @@ async function encodeClip(webm, mp4, m, match) {
   // Orbitron no tiene el punto medio: el título usa " / " (como los rótulos de la liga).
   const title = String(m.title || '').split(' · ')[0].toUpperCase();
   const who = (m.players && m.players[0]) ? ` / ${m.players[0].name}` : '';
-  const meta = match ? `${match.team1} vs ${match.team2} · Ronda ${match.round} · Juego ${match.gameNumber} · ${mmss(m.t)}` : mmss(m.t);
+  const meta = match ? (match.round ? `${match.team1} vs ${match.team2} · Ronda ${match.round} · Juego ${match.gameNumber} · ${mmss(m.t)}` : `${match.team1} vs ${match.team2} · ${mmss(m.t)}`) : mmss(m.t);
+  const brandImg = match && match.tournamentId === 'lqc-2026' ? 'lqc-wordmark.png' : 'atak-logo-mark.png';
   await fsp.writeFile(titleTxt, title + who.toUpperCase(), 'utf8');
   await fsp.writeFile(metaTxt, meta.toUpperCase(), 'utf8');
   await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
@@ -172,7 +173,7 @@ async function encodeClip(webm, mp4, m, match) {
     `[v6][atak]overlay=1434:969[v7]`,
     `[v7]drawtext=fontfile='${fMono}':textfile='${ff(brandTxt)}':fontcolor=white:fontsize=22:x=1490:y=980[vout]`,
   ].join(';');
-  await ffmpeg(['-i', webm, '-i', path.join(ASSETS_DIR, 'lqc-wordmark.png'), '-i', path.join(ASSETS_DIR, 'atak-logo-mark.png'),
+  await ffmpeg(['-i', webm, '-i', path.join(ASSETS_DIR, brandImg), '-i', path.join(ASSETS_DIR, 'atak-logo-mark.png'),
     '-filter_complex', filter, '-map', '[vout]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
 }
 
@@ -503,11 +504,11 @@ async function wantedGames(tournamentId) {
   }
   return out.sort((a, b) => b.gameId - a.gameId);
 }
-async function fetchReplays(limit = 10, tournamentId = 'lqc-2026') {
+async function fetchReplays(limit = 10, tournamentId = 'lqc-2026', explicit = null) {
   if (!(await lcuAlive())) { log('replays: el cliente de League no está abierto en la VM'); return 0; }
   let me; try { me = (await lcuReq('GET', '/lol-summoner/v1/current-summoner')).data; } catch { /* */ }
   if (!me?.summonerId && !me?.puuid) { log('replays: el cliente está abierto pero sin sesión iniciada'); return 0; }
-  const wanted = await wantedGames(tournamentId);
+  const wanted = explicit || await wantedGames(tournamentId);
   const todo = wanted.filter((w) => !fetchSkip.has(w.gameId) && Date.now() - (fetchTried.get(w.gameId) || 0) > 30 * 60_000).slice(0, limit);
   log(`replays: ${wanted.length} sin replay (${wanted.length - todo.length} descartadas o ya probadas), intento ${todo.length}`);
   let done = 0;
@@ -538,7 +539,7 @@ async function fetchReplays(limit = 10, tournamentId = 'lqc-2026') {
       if (!file) { const found = (await fsp.readdir(dir).catch(() => [])).find((f) => f.includes(String(w.gameId)) && f.endsWith('.rofl')); if (found) file = path.join(dir, found); }
       if (!file) { log(`  ✗ ${label}: el archivo no apareció en ${dir}`); continue; }
       const buf = await fsp.readFile(file);
-      const up = await fetch(`${BACKEND}/api/replays/${encodeURIComponent(w.region)}/${w.gameId}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream', 'X-Patch': String(meta?.gameVersion || ''), 'X-Uploader': 'atak-render-vm' } });
+      const up = await fetch(`${BACKEND}/api/replays/${encodeURIComponent(w.region)}/${w.gameId}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream', 'X-Patch': String(meta?.gameVersion || ''), 'X-Uploader': 'atak-render-vm', 'X-Render-Token': TOKEN } });
       if (!up.ok) { log(`  ✗ ${label}: ATAK.GG respondió ${up.status}`); continue; }
       done++; log(`  ✓ ${label}: subido (${(buf.length / 1048576).toFixed(1)} MB)`);
       try { await fsp.unlink(file); } catch { /* */ }
@@ -599,6 +600,23 @@ function diag() {
     try { const f = fs.readdirSync(String(dir)).filter((x) => x.includes(String(gid))); log(`test: archivos ${JSON.stringify(f.map((x) => [x, fs.statSync(path.join(String(dir), x)).size]))}`); } catch (e) { log(`test: ${e.message}`); }
     return;
   }
+  if (args[0] === 'player') {
+    // Partidas sueltas de un jugador (pruebas): node render.mjs player Nombre Tag [n]
+    const name = String(args[1] || ''), tag = String(args[2] || ''), n = Number(args[3]) || 3;
+    if (!name || !tag) { log('uso: player <nombre> <tag> [n]'); return; }
+    const acc = await atak(`/api/stats/resolve?region=${REGION.toLowerCase()}&gameName=${encodeURIComponent(name)}&tagLine=${encodeURIComponent(tag)}`);
+    if (!acc?.puuid) { log('jugador no encontrado'); return; }
+    const ids = await atak(`/api/stats/matches/americas/${acc.puuid}/ids?count=${n + 4}`);
+    const list = (Array.isArray(ids) ? ids : []).filter((x) => String(x).startsWith(`${REGION}_`)).slice(0, n).map((x) => ({ gameId: Number(String(x).split('_')[1]), region: REGION, matchId: 'manual', team1: name, team2: 'rival' }));
+    log(`${name}#${tag}: ${list.length} partidas recientes: ${list.map((x) => x.gameId).join(' ')}`);
+    if (!(await ensureClient())) return;
+    const have = new Set(((await atak(`/api/replays/tournament/manual`)).replays || []).map((r) => r.gameId));
+    const todo = list.filter((x) => !have.has(x.gameId));
+    const up = todo.length ? await fetchReplays(todo.length, 'manual', todo) : 0;
+    log(`replays subidos: ${up} (ya había ${list.length - todo.length})`);
+    for (const g of list) { if (have.has(g.gameId) || todo.find((x) => x.gameId === g.gameId)) { try { const c = await renderGame(g.gameId); log(`${g.gameId}: ${c} clips`); } catch (e) { log(`✗ ${g.gameId}: ${e.message}`); } } }
+    return;
+  }
   if (args.includes('fetch-replays')) { await ensureClient(); const n = await fetchReplays(120, opt('tournament', 'lqc-2026')); log(`replays subidos: ${n}`); return; }
   const game = opt('game'); const tournament = opt('tournament');
   if (game) { const n = await renderGame(Number(game)); log(`listo: ${n} clips`); return; }
@@ -613,7 +631,7 @@ function diag() {
       try {
         // El cliente en la VM se cierra solo al rato (VAN 59): se reabre y se espera a que tenga sesión.
         const ready = cfg.autoLaunchClient !== false && fs.existsSync(RC_EXE) ? await ensureClient() : await lcuAlive();
-        if (ready) fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 10, cfg.tournament || tournament);
+        if (ready) fetched = await fetchReplays(Number(cfg.fetchPerCycle) || 20, cfg.tournament || tournament);
       } catch (e) { log(`replays: ${e.message}`); }
     }
     // 2) Render de lo que tenga replay y no tenga clips
@@ -621,6 +639,6 @@ function diag() {
     log(`${tournament}: ${ids.length} partidas con replay y sin clips`);
     let rendered = 0;
     for (const id of ids) { try { await renderGame(id); rendered++; } catch (e) { log(`✗ ${id}: ${e.message}`); if (/cliente está en|no detectado|puerto 2999/i.test(e.message)) break; } }
-    if (watch) await sleep(fetched || rendered ? 20_000 : 10 * 60_000);
+    if (watch) await sleep(fetched || rendered ? 20_000 : (Number(cfg.idleMinutes) || 3) * 60_000);
   } while (watch);
 })().catch((e) => { console.error('ERROR:', e.message); process.exit(1); });
