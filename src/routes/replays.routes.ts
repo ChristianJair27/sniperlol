@@ -326,11 +326,24 @@ router.get('/:region/:gameId/clips/:key', readLimiter, async (req, res) => {
     const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
     const [[row]] = await pool.query<any[]>('SELECT mime, size, data FROM tournament_clips WHERE game_region = ? AND game_id = ? AND clip_key = ?', [region, gameId, String(req.params.key)]);
     if (!row) return res.status(404).json({ ok: false, error: 'sin clip' });
+    // El <video> del navegador pide rangos (Range: bytes=…): sin 206 Chrome no carga el clip.
+    const data: Buffer = row.data; const total = data.length;
     res.setHeader('Content-Type', row.mime || 'video/mp4');
-    res.setHeader('Content-Length', String(row.size));
     res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.setHeader('Accept-Ranges', 'none');
-    res.end(row.data);
+    res.setHeader('Accept-Ranges', 'bytes');
+    const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
+    if (range) {
+      let start = range[1] ? Number(range[1]) : 0;
+      let end = range[2] ? Number(range[2]) : total - 1;
+      if (!range[1] && range[2]) { start = Math.max(0, total - Number(range[2])); end = total - 1; }
+      if (start >= total || end >= total || start > end) { res.setHeader('Content-Range', `bytes */${total}`); return res.status(416).end(); }
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', String(end - start + 1));
+      return res.end(data.subarray(start, end + 1));
+    }
+    res.setHeader('Content-Length', String(total));
+    res.end(data);
   } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
