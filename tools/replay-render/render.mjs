@@ -151,8 +151,9 @@ async function encodeClip(webm, mp4, m, match) {
   }
   const tdir = path.dirname(mp4);
   const titleTxt = path.join(tdir, 'ov-title.txt'), metaTxt = path.join(tdir, 'ov-meta.txt'), brandTxt = path.join(tdir, 'ov-brand.txt');
+  // Orbitron no tiene el punto medio: el título usa " / " (como los rótulos de la liga).
   const title = String(m.title || '').split(' · ')[0].toUpperCase();
-  const who = (m.players && m.players[0]) ? ` · ${m.players[0].name}` : '';
+  const who = (m.players && m.players[0]) ? ` / ${m.players[0].name}` : '';
   const meta = match ? `${match.team1} vs ${match.team2} · Ronda ${match.round} · Juego ${match.gameNumber} · ${mmss(m.t)}` : mmss(m.t);
   await fsp.writeFile(titleTxt, title + who.toUpperCase(), 'utf8');
   await fsp.writeFile(metaTxt, meta.toUpperCase(), 'utf8');
