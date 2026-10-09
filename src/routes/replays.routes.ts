@@ -164,8 +164,8 @@ router.get('/tournament/:id', readLimiter, async (req, res) => {
 // GET /api/replays/tournament/:id/clips — todos los clips del torneo (galería)
 router.get('/tournament/:id/clips', readLimiter, async (req, res) => {
   try {
-    const [rows] = await pool.query<any[]>('SELECT match_id, game_id, game_region, clip_key, t_start, t_end, kind, title, players, mime, size, created_at FROM tournament_clips WHERE tournament_id = ? ORDER BY game_id DESC, t_start', [req.params.id]);
-    res.json({ ok: true, clips: rows.map((r) => ({ matchId: r.match_id, gameId: Number(r.game_id), region: r.game_region, key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, r.game_region, Number(r.game_id), r.clip_key) })) });
+    const [rows] = await pool.query<any[]>('SELECT match_id, game_id, game_region, clip_key, t_start, t_end, kind, title, players, mime, size, created_at, poster IS NOT NULL AS has_poster FROM tournament_clips WHERE tournament_id = ? ORDER BY game_id DESC, t_start', [req.params.id]);
+    res.json({ ok: true, clips: rows.map((r) => ({ matchId: r.match_id, gameId: Number(r.game_id), region: r.game_region, key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, r.game_region, Number(r.game_id), r.clip_key), poster: posterUrl(req, r.game_region, Number(r.game_id), r.clip_key, !!r.has_poster), share: shareUrl(req, r.game_region, Number(r.game_id), r.clip_key) })) });
   } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -519,9 +519,10 @@ router.post('/:region/:gameId/clips/:key/poster', uploadLimiter, raw({ type: () 
 router.get('/:region/:gameId/clips/:key/poster.jpg', readLimiter, async (req, res) => {
   try {
     const region = normRegion(req.params.region); const gameId = Number(req.params.gameId); const k = String(req.params.key).slice(0, 64);
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     const [[row]] = await pool.query<any[]>('SELECT poster FROM tournament_clips WHERE game_region = ? AND game_id = ? AND clip_key = ?', [region, gameId, k]);
     if (!row || !row.poster) return res.status(404).end();
-    res.setHeader('Content-Type', 'image/jpeg'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Content-Type', 'image/jpeg'); res.setHeader('Cache-Control', 'public, max-age=86400');
     res.end(row.poster);
   } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
 });
