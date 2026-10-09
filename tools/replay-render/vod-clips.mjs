@@ -102,6 +102,16 @@ async function brandVertical(raw, mp4, m, match, brandImg) {
     '-filter_complex', filter, '-map', '[vout]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', mp4]);
 }
 
+
+async function uploadPoster(gameId, key, mp4) {
+  const jpg = mp4.replace(/\.mp4$/, '.poster.jpg');
+  try {
+    await run(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-ss', '1.2', '-i', mp4, '-frames:v', '1', '-vf', 'scale=1280:-2', '-q:v', '3', jpg]);
+    const r = await fetch(`${BACKEND}/api/replays/${REGION}/${gameId}/clips/${encodeURIComponent(key)}/poster`, { method: 'POST', body: await fsp.readFile(jpg), headers: { 'Content-Type': 'image/jpeg', 'X-Render-Token': TOKEN } });
+    if (!r.ok) console.log(`    póster ${key} → ${r.status}`);
+  } catch (e) { console.log(`    póster ${key}: ${e.message}`); }
+  finally { try { await fsp.unlink(jpg); } catch { /* */ } }
+}
 async function upload(gameId, m, key, file) {
   const buf = await fsp.readFile(file);
   const ascii = (v) => JSON.stringify(v).replace(/[\u0080-￿]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
@@ -132,8 +142,8 @@ async function upload(gameId, m, key, file) {
       try {
         console.log(`  ▶ ${m.title} · juego ${mmss(m.tStart)}–${mmss(m.tEnd)} → VOD ${hms(start)}–${hms(end)}`);
         const raw = await cutClip(plan.vod, start, end, mp4);
-        if (needH) { await brand(raw, mp4, m, match, brandImg); if (!DRY) { const r = await upload(g.gameId, m, key, mp4); console.log(`    ✓ subido ${r.url}`); } }
-        if (needV) { await brandVertical(raw, vmp4, m, match, brandImg); if (!DRY) { const r = await upload(g.gameId, m, vkey, vmp4); console.log(`    ✓ vertical ${r.url}`); } }
+        if (needH) { await brand(raw, mp4, m, match, brandImg); if (!DRY) { const r = await upload(g.gameId, m, key, mp4); console.log(`    ✓ subido ${r.url}`); await uploadPoster(g.gameId, key, mp4); } }
+        if (needV) { await brandVertical(raw, vmp4, m, match, brandImg); if (!DRY) { const r = await upload(g.gameId, m, vkey, vmp4); console.log(`    ✓ vertical ${r.url}`); await uploadPoster(g.gameId, vkey, vmp4); } }
         try { await fsp.unlink(raw); } catch { /* */ }
         if (DRY) console.log(`    listo (sin subir): ${mp4}`);
       } catch (e) { console.log(`    ✗ ${e.message}`); }

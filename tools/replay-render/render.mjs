@@ -118,6 +118,17 @@ function ensureReplayApi() {
 async function atak(p) { const r = await fetch(`${BACKEND}${p}`); if (!r.ok) throw new Error(`${p} → ${r.status}`); return r.json(); }
 // Las cabeceras HTTP solo admiten Latin-1: los nombres con otros caracteres se escapan como \uXXXX (sigue siendo JSON valido).
 const asciiJson = (v) => JSON.stringify(v).replace(/[\u0080-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+
+// Póster del clip (fotograma a 1.2 s, con la tarjeta aún visible) → /clips/:key/poster
+async function uploadPoster(gameId, key, mp4) {
+  const jpg = mp4.replace(/\.mp4$/, '.poster.jpg');
+  try {
+    await ffmpeg(['-ss', '1.2', '-i', mp4, '-frames:v', '1', '-vf', 'scale=1280:-2', '-q:v', '3', jpg]);
+    const r = await fetch(`${BACKEND}/api/replays/${REGION}/${gameId}/clips/${encodeURIComponent(key)}/poster`, { method: 'POST', body: await fsp.readFile(jpg), headers: { 'Content-Type': 'image/jpeg', 'X-Render-Token': TOKEN } });
+    if (!r.ok) log(`  póster ${key} → ${r.status}`);
+  } catch (e) { log(`  póster ${key}: ${e.message}`); }
+  finally { try { await fsp.unlink(jpg); } catch { /* */ } }
+}
 async function uploadClip(gameId, m, file) {
   const buf = await fsp.readFile(file);
   const r = await fetch(`${BACKEND}/api/replays/${REGION}/${gameId}/clips/${encodeURIComponent(m.key)}`, {
@@ -374,6 +385,7 @@ async function renderGame(gameId) {
         await encodeClip(webm, mp4, m, info.match);
         const up = await uploadClip(gameId, m, mp4);
         log(`  ✓ subido ${up.url}`);
+        await uploadPoster(gameId, m.key, mp4);
         done++;
       }
       // Vertical para redes (1080×1920): misma grabación, clave v-<key>, kind vertical_<kind>
@@ -383,6 +395,7 @@ async function renderGame(gameId) {
           await encodeVertical(webm, vmp4, m, info.match);
           const upv = await uploadClip(gameId, { ...m, key: `v-${m.key}`, kind: `vertical_${m.kind}`, title: `${m.title} · Vertical` }, vmp4);
           log(`  ✓ vertical ${upv.url}`);
+          await uploadPoster(gameId, `v-${m.key}`, vmp4);
         } catch (e) { log(`  ✗ vertical: ${e.message}`); }
       }
       if (!KEEP) { for (const f of [webm, mp4, vmp4]) { try { await fsp.unlink(f); } catch { /* */ } } }
