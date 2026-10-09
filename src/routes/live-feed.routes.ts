@@ -187,7 +187,13 @@ router.post('/:channel/push', async (req, res) => {
   if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'bad_body' });
 
   try {
-    const snap = sanitizeSnapshot(req.body);
+    const snap: any = sanitizeSnapshot(req.body);
+    // Equipos y rótulo automáticos: si los 10 jugadores coinciden con una plantilla del
+    // torneo de este canal, se ignora lo que el caster escribió (suele quedar la serie anterior).
+    try {
+      const hit = await matchTournament(snap);
+      if (hit && hit.channel === channel) { snap.team1 = hit.team1; snap.team2 = hit.team2; snap.matchLabel = hit.matchLabel; snap.logo1 = ''; snap.logo2 = ''; }
+    } catch { /* sin plantillas: se respeta lo configurado */ }
     // Si un JUGADOR de la partida está mandando el feed (eventos completos), el del
     // espectador no lo pisa mientras esté fresco.
     if (snap.source !== 'player') {
