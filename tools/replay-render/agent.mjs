@@ -35,7 +35,7 @@ const body = (req) => new Promise((resolve) => { let b = ''; req.on('data', (c) 
 const exec = (cmd, args) => new Promise((resolve) => execFile(cmd, args, { windowsHide: true, timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }, (e, out, err) => resolve({ ok: !e, out: String(out || ''), err: String(err || '') })));
 const port2999 = async () => /:2999\s+\S+\s+LISTENING/i.test((await exec('netstat', ['-ano', '-p', 'tcp'])).out);
 const gameOpen = async () => /League of Legends\.exe/i.test((await exec('tasklist', ['/FI', 'IMAGENAME eq League of Legends.exe', '/FO', 'CSV'])).out);
-const ALLOWED_ARGS = /^(--(game|region|top|keep|tournament|watch|direct)|[A-Za-z0-9_-]{1,40})$/;
+const ALLOWED_ARGS = /^(--(game|region|top|keep|tournament|watch|direct)|[A-Za-z0-9_-]{1,60})$/;
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');

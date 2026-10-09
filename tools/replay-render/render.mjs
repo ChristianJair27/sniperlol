@@ -176,7 +176,35 @@ async function encodeClip(webm, mp4, m, match) {
     `[v7]drawtext=fontfile='${fMono}':textfile='${ff(brandTxt)}':fontcolor=white:fontsize=22:x=1490:y=980[vout]`,
   ].join(';');
   await ffmpeg(['-i', webm, '-i', path.join(ASSETS_DIR, brandImg), '-i', path.join(ASSETS_DIR, 'atak-logo-mark.png'),
-    '-filter_complex', filter, '-map', '[vout]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
+    '-filter_complex', filter, '-map', '[vout]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
+}
+
+// ── Versión vertical 1080×1920 (redes): la acción al centro, fondo desenfocado y tarjeta arriba ──
+async function encodeVertical(webm, mp4, m, match) {
+  const tdir = path.dirname(mp4);
+  const titleTxt = path.join(tdir, 'ov-title.txt'), metaTxt = path.join(tdir, 'ov-meta.txt'), brandTxt = path.join(tdir, 'ov-brand.txt');
+  const brandImg = match && match.tournamentId === 'lqc-2026' ? 'lqc-wordmark.png' : 'atak-logo-mark.png';
+  const fOrb = ff(path.join(ASSETS_DIR, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS_DIR, 'JetBrainsMono-700.ttf'));
+  const filter = [
+    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,split=2[a][b]`,
+    `[a]crop=1080:1080:420:0[sq]`,
+    `[b]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:3,eq=brightness=-0.25[bg]`,
+    `[bg][sq]overlay=0:420[v0]`,
+    `[1:v]scale=-1:44[lqc]`, `[2:v]scale=-1:52[atak]`,
+    `[v0]drawbox=x=0:y=250:w=1080:h=150:color=0x020b1c@0.85:t=fill,drawbox=x=0:y=250:w=8:h=150:color=0x4ea1ff@1:t=fill[v1]`,
+    `[v1][lqc]overlay=40:303[v2]`,
+    `[v2]drawtext=fontfile='${fOrb}':textfile='${ff(titleTxt)}':fontcolor=white:fontsize=34:x=40:y=262:borderw=0[v3]`,
+    `[v3]drawtext=fontfile='${fMono}':textfile='${ff(metaTxt)}':fontcolor=0xbcd0ee:fontsize=22:x=200:y=314[v4]`,
+    `[v4]drawbox=x=0:y=1500:w=1080:h=90:color=0x020b1c@0.85:t=fill[v5]`,
+    `[v5][atak]overlay=430:1519[v6]`,
+    `[v6]drawtext=fontfile='${fMono}':textfile='${ff(brandTxt)}':fontcolor=white:fontsize=30:x=500:y=1530[vout]`,
+  ].join(';');
+  // Los textos ya los escribió encodeClip (misma carpeta); si no existen, se escriben aquí.
+  if (!fs.existsSync(titleTxt)) { const who = (m.players && m.players[0]) ? ` / ${m.players[0].name}` : ''; await fsp.writeFile(titleTxt, (String(m.title || '').split(' · ')[0] + who).toUpperCase(), 'utf8'); }
+  if (!fs.existsSync(metaTxt)) await fsp.writeFile(metaTxt, (match ? `${match.team1} vs ${match.team2} · ${mmss(m.t)}` : mmss(m.t)).toUpperCase(), 'utf8');
+  if (!fs.existsSync(brandTxt)) await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
+  await ffmpeg(['-i', webm, '-i', path.join(ASSETS_DIR, brandImg), '-i', path.join(ASSETS_DIR, 'atak-logo-mark.png'),
+    '-filter_complex', filter, '-map', '[vout]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
 }
 
 // ── ffmpeg ───────────────────────────────────────────────────────────────────
@@ -277,7 +305,7 @@ async function renderGame(gameId) {
   log(`== ${REGION}-${gameId} ==`);
   const info = await atak(`/api/replays/${REGION}/${gameId}/moments`);
   const cfgNow = readConfig();
-  const have = cfgNow.force ? new Set() : new Set((await atak(`/api/replays/${REGION}/${gameId}/clips`)).clips.map((c) => c.key));
+  const have = cfgNow.force ? new Set() : new Set((await atak(`/api/replays/${REGION}/${gameId}/clips`)).clips.map((c) => c.key).filter((k) => !String(k).startsWith('vod-')));
   const want = Number(cfgNow.top) || TOP;
   const todo = (info.top || []).slice(0, want).filter((m) => !have.has(m.key)).sort((a, b) => a.t - b.t);
   if (!todo.length) { log('Sin momentos nuevos que grabar'); return 0; }
@@ -342,7 +370,16 @@ async function renderGame(gameId) {
       const up = await uploadClip(gameId, m, mp4);
       log(`  ✓ subido ${up.url}`);
       done++;
-      if (!KEEP) { for (const f of [webm, mp4]) { try { await fsp.unlink(f); } catch { /* */ } } }
+      // Vertical para redes (1080×1920): misma grabación, clave v-<key>, kind vertical_<kind>
+      const vmp4 = `${base}.vertical.mp4`;
+      if (cfgNow.vertical !== false) {
+        try {
+          await encodeVertical(webm, vmp4, m, info.match);
+          const upv = await uploadClip(gameId, { ...m, key: `v-${m.key}`, kind: `vertical_${m.kind}`, title: `${m.title} · Vertical` }, vmp4);
+          log(`  ✓ vertical ${upv.url}`);
+        } catch (e) { log(`  ✗ vertical: ${e.message}`); }
+      }
+      if (!KEEP) { for (const f of [webm, mp4, vmp4]) { try { await fsp.unlink(f); } catch { /* */ } } }
     }
   } finally {
     // Cerrar el juego (el replay) para dejar el cliente libre.
@@ -357,7 +394,7 @@ async function pendingGames(tournamentId, want = TOP) {
   const { replays } = await atak(`/api/replays/tournament/${tournamentId}`);
   const { clips } = await atak(`/api/replays/tournament/${tournamentId}/clips`);
   const count = new Map();
-  for (const c of clips) { const k = `${c.region}:${c.gameId}`; count.set(k, (count.get(k) || 0) + 1); }
+  for (const c of clips) { if (String(c.key).startsWith('vod-')) continue; const k = `${c.region}:${c.gameId}`; count.set(k, (count.get(k) || 0) + 1); }
   // Pendiente = partida con replay y menos clips de los que se quieren por partida.
   return replays.filter((r) => r.region === REGION && (count.get(`${r.region}:${r.gameId}`) || 0) < want).map((r) => r.gameId);
 }
@@ -597,6 +634,25 @@ function diag() {
   if (args[0] === 'ui-click') { uiClick(Number(args[1]), Number(args[2])); return; }
   if (args[0] === 'ui-keys') { uiKeys(args.slice(1)); return; }
   if (args[0] === 'ui-focus') { uiFocus(args.slice(1).join(' ')); return; }
+  if (args[0] === 'fetch-file') {
+    // Baja un archivo de la carpeta replay-render del host (bin/yt-dlp.exe, vod-clips.mjs, out/vod/plan.json…)
+    // El agente solo deja pasar letras, números, guion y guion bajo: alias → ruta real.
+    const alias = { 'yt-dlp': 'bin/yt-dlp.exe', 'vod-clips': 'vod-clips.mjs', 'ffmpeg': 'bin/ffmpeg.exe' };
+    const raw = String(args[1] || '');
+    const name = alias[raw] || (/^plan-[A-Za-z0-9_-]{1,40}$/.test(raw) ? `out/vod/${raw}.json` : '');
+    if (!name) { log('nombre no permitido (usa yt-dlp | vod-clips | plan-<nombre>)'); return; }
+    const url = `${(process.env.AGENT_UPDATE_URL || '').replace(/\/$/, '')}/${name}`;
+    const r = await fetch(url); if (!r.ok) { log(`${name} → ${r.status}`); return; }
+    const dest = path.join(here, name); await fsp.mkdir(path.dirname(dest), { recursive: true });
+    await fsp.writeFile(dest, Buffer.from(await r.arrayBuffer()));
+    log(`bajado ${name} (${fs.statSync(dest).size} bytes)`); return;
+  }
+  if (args[0] === 'vod') {
+    // Highlights desde el VOD de Twitch (vod-clips.mjs) con el plan indicado, en la VM.
+    const plan = String(args[1] || ''); if (!/^plan-[A-Za-z0-9_-]{1,40}$/.test(plan)) { log('plan no permitido (plan-<nombre>)'); return; }
+    await new Promise((resolve) => { const c = spawn(process.execPath, [path.join(here, 'vod-clips.mjs'), path.join(here, 'out', 'vod', `${plan}.json`)], { cwd: here, windowsHide: true }); c.stdout.on('data', (d) => log(String(d).trimEnd())); c.stderr.on('data', (d) => log(String(d).trimEnd())); c.on('exit', resolve); });
+    return;
+  }
   if (args[0] === 'update-agent') {
     // Baja agent.mjs del host y cierra el agente actual (su .cmd lo vuelve a lanzar con el archivo nuevo).
     if (!process.env.AGENT_UPDATE_URL) { log('sin AGENT_UPDATE_URL'); return; }
