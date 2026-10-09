@@ -111,3 +111,17 @@ http.createServer(async (req, res) => {
     json(res, 404, { ok: false, error: 'ruta' });
   } catch (e) { json(res, 500, { ok: false, error: e.message }); }
 }).listen(PORT, HOST, () => log(`agente ATAK en ${HOST}:${PORT} como ${os.userInfo().username} (sesión ${process.env.SESSIONNAME || '?'})`));
+
+// Arranque automático del worker (tras un reinicio de la VM): config.json { "autostart": false } lo desactiva.
+setTimeout(async () => {
+  try {
+    let cfg = {}; try { cfg = JSON.parse(await fsp.readFile(path.join(here, 'config.json'), 'utf8')); } catch { /* sin config */ }
+    if (cfg.autostart === false || (worker && worker.exitCode === null)) return;
+    const a = ['--tournament', String(cfg.tournament || 'lqc-2026'), '--watch', '--direct'];
+    await fsp.mkdir(path.dirname(LOG), { recursive: true });
+    const out = fs.openSync(LOG, 'a');
+    worker = spawn(NODE, [path.join(here, 'render.mjs'), ...a], { cwd: here, stdio: ['ignore', out, out], windowsHide: false, env: { ...process.env, ATAK_QUIET: '1', ...(process.env.LOL_DIR ? { LOL_DIR: process.env.LOL_DIR } : {}) } });
+    worker.on('exit', (code) => log('worker terminó', code));
+    log('worker iniciado automáticamente', a.join(' '));
+  } catch (e) { log('autostart falló', e.message); }
+}, 20_000);

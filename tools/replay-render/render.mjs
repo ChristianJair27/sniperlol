@@ -597,6 +597,18 @@ function diag() {
   if (args[0] === 'ui-click') { uiClick(Number(args[1]), Number(args[2])); return; }
   if (args[0] === 'ui-keys') { uiKeys(args.slice(1)); return; }
   if (args[0] === 'ui-focus') { uiFocus(args.slice(1).join(' ')); return; }
+  if (args[0] === 'update-agent') {
+    // Baja agent.mjs del host y cierra el agente actual (su .cmd lo vuelve a lanzar con el archivo nuevo).
+    if (!process.env.AGENT_UPDATE_URL) { log('sin AGENT_UPDATE_URL'); return; }
+    const url = `${process.env.AGENT_UPDATE_URL.replace(/\/$/, '')}/agent.mjs`;
+    const r = await fetch(url); if (!r.ok) { log(`agent.mjs → ${r.status}`); return; }
+    const txt = await r.text(); if (!/listen\(PORT/.test(txt)) { log('agent.mjs descargado no parece válido'); return; }
+    await fsp.writeFile(path.join(here, 'agent.mjs'), txt, 'utf8');
+    log(`agent.mjs actualizado (${txt.length} bytes); reiniciando el agente (pid ${process.ppid})…`);
+    setTimeout(() => { try { execFileSync('taskkill', ['/F', '/PID', String(process.ppid)], { windowsHide: true, stdio: 'ignore' }); } catch { /* */ } }, 500);
+    await sleep(1500);
+    return;
+  }
   if (args.includes('install-client')) { await installClient(); return; }
   if (args.includes('launch-client')) { await launchClient(); return; }
   if (args[0] === 'test-download') {
