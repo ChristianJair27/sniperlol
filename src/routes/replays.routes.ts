@@ -42,6 +42,7 @@ async function initTables() {
     UNIQUE KEY uq_clip (game_region, game_id, clip_key),
     KEY idx_clip_t (tournament_id)
   )`);
+  await pool.query('ALTER TABLE tournament_clips ADD COLUMN IF NOT EXISTS poster MEDIUMBLOB NULL');
   await pool.query(`CREATE TABLE IF NOT EXISTS tournament_replays (
     id INT AUTO_INCREMENT PRIMARY KEY,
     tournament_id VARCHAR(64) NOT NULL,
@@ -414,13 +415,56 @@ router.get('/:region/:gameId/graph', readLimiter, async (req, res) => {
 
 // ── Clips (MP4 renderizados por el worker) ────────────────────────────────────
 const clipUrl = (req: any, region: string, gameId: number, k: string) => `${req.protocol}://${req.get('host')}/api/replays/${region}/${gameId}/clips/${encodeURIComponent(k)}`;
+const SITE_URL = (process.env.SITE_URL || 'https://atakgg.revolution505.com').replace(/\/$/, '');
+const shareUrl = (req: any, region: string, gameId: number, k: string) => `${req.protocol}://${req.get('host')}/api/replays/share/${region}/${gameId}/${encodeURIComponent(k)}`;
+const posterUrl = (req: any, region: string, gameId: number, k: string, has: boolean) => (has ? `${clipUrl(req, region, gameId, k)}/poster.jpg` : null);
+const esc = (v: any) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+const isVerticalKey = (k: string) => k.startsWith('v-') || k.startsWith('vv-');
+
+// GET /api/replays/share/:region/:gameId/:key — página para compartir: Open Graph con el MP4
+// (WhatsApp, Discord, Telegram, Facebook y X lo reproducen en la previsualización) + botón al sitio.
+router.get('/share/:region/:gameId/:key', readLimiter, async (req, res) => {
+  try {
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId); const k = String(req.params.key).slice(0, 64);
+    const [[row]] = await pool.query<any[]>('SELECT tournament_id, match_id, title, kind, t_start, t_end, poster IS NOT NULL AS has_poster FROM tournament_clips WHERE game_region = ? AND game_id = ? AND clip_key = ?', [region, gameId, k]);
+    if (!row) return res.status(404).send('clip no encontrado');
+    const game = await gameInfo(region, gameId);
+    const mp4 = clipUrl(req, region, gameId, k);
+    const poster = posterUrl(req, region, gameId, k, !!row.has_poster) || `${SITE_URL}/og-image.png`;
+    const vertical = isVerticalKey(k);
+    const w = vertical ? 1080 : 1920, h = vertical ? 1920 : 1080;
+    const teams = game ? `${game.team1} vs ${game.team2}` : '';
+    const meta = [teams, game?.round ? `Ronda ${game.round}` : '', game?.gameNumber ? `Juego ${game.gameNumber}` : '', `${Math.floor(row.t_start / 60)}:${String(row.t_start % 60).padStart(2, '0')}`].filter(Boolean).join(' · ');
+    const title = `${row.title} · ${game?.tournamentName || 'ATAK.GG'}`;
+    const site = game ? `${SITE_URL}/tournaments/${encodeURIComponent(game.tournamentId)}?tab=replays&clip=${gameId}-${encodeURIComponent(k)}` : SITE_URL;
+    const self = shareUrl(req, region, gameId, k);
+    const embed = req.query.embed === '1';
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)}</title>
+<meta name="description" content="${esc(meta)}">
+<meta property="og:type" content="video.other"><meta property="og:site_name" content="ATAK.GG">
+<meta property="og:title" content="${esc(title)}"><meta property="og:description" content="${esc(meta)}">
+<meta property="og:url" content="${esc(self)}">
+<meta property="og:image" content="${esc(poster)}"><meta property="og:image:width" content="${w}"><meta property="og:image:height" content="${h}">
+<meta property="og:video" content="${esc(mp4)}"><meta property="og:video:secure_url" content="${esc(mp4)}"><meta property="og:video:type" content="video/mp4"><meta property="og:video:width" content="${w}"><meta property="og:video:height" content="${h}">
+<meta name="twitter:card" content="player"><meta name="twitter:title" content="${esc(title)}"><meta name="twitter:description" content="${esc(meta)}"><meta name="twitter:image" content="${esc(poster)}">
+<meta name="twitter:player" content="${esc(self)}?embed=1"><meta name="twitter:player:width" content="${w}"><meta name="twitter:player:height" content="${h}">
+<meta name="twitter:player:stream" content="${esc(mp4)}"><meta name="twitter:player:stream:content_type" content="video/mp4">
+<style>html,body{margin:0;background:#0a0a0c;color:#f5f5f6;font-family:Barlow,system-ui,sans-serif}.w{max-width:${vertical ? 480 : 1100}px;margin:0 auto;padding:${embed ? 0 : '16px'}}video{width:100%;display:block;background:#000;border-radius:${embed ? 0 : 10}px}.b{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}a.btn{flex:1;min-width:160px;text-align:center;padding:14px 18px;border-radius:8px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;text-decoration:none;color:#fff;background:#e8323c}a.btn.g{background:#1f1f26}h1{font-size:20px;margin:14px 0 4px}p{color:#b6b6c0;margin:0;font-size:14px}</style></head>
+<body><div class="w"><video src="${esc(mp4)}" poster="${esc(poster)}" controls playsinline ${embed ? 'autoplay muted' : ''} preload="metadata"></video>
+${embed ? '' : `<h1>${esc(row.title)}</h1><p>${esc(meta)}</p><div class="b"><a class="btn" href="${esc(site)}">Ver en ATAK.GG</a><a class="btn g" href="${esc(mp4)}" download>Descargar MP4</a></div>`}
+</div></body></html>`);
+  } catch (e: any) { res.status(500).send(e.message); }
+});
 
 // GET /api/replays/:region/:gameId/clips
 router.get('/:region/:gameId/clips', readLimiter, async (req, res) => {
   try {
     const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
-    const [rows] = await pool.query<any[]>('SELECT clip_key, t_start, t_end, kind, title, players, mime, size, created_at FROM tournament_clips WHERE game_region = ? AND game_id = ? ORDER BY t_start', [region, gameId]);
-    res.json({ ok: true, clips: rows.map((r) => ({ key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, region, gameId, r.clip_key) })) });
+    const [rows] = await pool.query<any[]>('SELECT clip_key, t_start, t_end, kind, title, players, mime, size, created_at, poster IS NOT NULL AS has_poster FROM tournament_clips WHERE game_region = ? AND game_id = ? ORDER BY t_start', [region, gameId]);
+    res.json({ ok: true, clips: rows.map((r) => ({ key: r.clip_key, tStart: r.t_start, tEnd: r.t_end, kind: r.kind, title: r.title, players: parseJson(r.players) || [], mime: r.mime, size: r.size, createdAt: r.created_at, url: clipUrl(req, region, gameId, r.clip_key), poster: posterUrl(req, region, gameId, r.clip_key, !!r.has_poster), share: shareUrl(req, region, gameId, r.clip_key) })) });
   } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -458,6 +502,29 @@ router.post('/:region/:gameId/clips/:key', uploadLimiter, raw({ type: () => true
 });
 
 // GET /api/replays/:region/:gameId/clips/:key → el video
+// POST /api/replays/:region/:gameId/clips/:key/poster  (cuerpo = JPEG; token del worker)
+router.post('/:region/:gameId/clips/:key/poster', uploadLimiter, raw({ type: () => true, limit: 3 * 1024 * 1024 }), async (req, res) => {
+  try {
+    const token = (process.env.RENDER_TOKEN || '').trim();
+    if (!token || req.get('x-render-token') !== token) return res.status(401).json({ ok: false, error: 'token de render inválido' });
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId); const k = String(req.params.key).slice(0, 64);
+    const buf: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (buf.length < 1000 || buf[0] !== 0xff || buf[1] !== 0xd8) return res.status(400).json({ ok: false, error: 'no es un JPEG' });
+    const [r] = await pool.query<any>('UPDATE tournament_clips SET poster = ? WHERE game_region = ? AND game_id = ? AND clip_key = ?', [buf, region, gameId, k]);
+    if (!r.affectedRows) return res.status(404).json({ ok: false, error: 'clip no encontrado' });
+    res.json({ ok: true, url: `${clipUrl(req, region, gameId, k)}/poster.jpg` });
+  } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
+});
+// GET /api/replays/:region/:gameId/clips/:key/poster.jpg
+router.get('/:region/:gameId/clips/:key/poster.jpg', readLimiter, async (req, res) => {
+  try {
+    const region = normRegion(req.params.region); const gameId = Number(req.params.gameId); const k = String(req.params.key).slice(0, 64);
+    const [[row]] = await pool.query<any[]>('SELECT poster FROM tournament_clips WHERE game_region = ? AND game_id = ? AND clip_key = ?', [region, gameId, k]);
+    if (!row || !row.poster) return res.status(404).end();
+    res.setHeader('Content-Type', 'image/jpeg'); res.setHeader('Cache-Control', 'public, max-age=86400'); res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.end(row.poster);
+  } catch (e: any) { res.status(500).json({ ok: false, error: e.message }); }
+});
 router.get('/:region/:gameId/clips/:key', readLimiter, async (req, res) => {
   try {
     const region = normRegion(req.params.region); const gameId = Number(req.params.gameId);
