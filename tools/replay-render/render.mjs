@@ -305,9 +305,12 @@ async function renderGame(gameId) {
   log(`== ${REGION}-${gameId} ==`);
   const info = await atak(`/api/replays/${REGION}/${gameId}/moments`);
   const cfgNow = readConfig();
-  const have = cfgNow.force ? new Set() : new Set((await atak(`/api/replays/${REGION}/${gameId}/clips`)).clips.map((c) => c.key).filter((k) => !String(k).startsWith('vod-')));
+  const allKeys = cfgNow.force ? [] : (await atak(`/api/replays/${REGION}/${gameId}/clips`)).clips.map((c) => String(c.key));
+  const have = new Set(allKeys.filter((k) => !k.startsWith('vod-') && !k.startsWith('v-')));
+  const haveV = new Set(allKeys.filter((k) => k.startsWith('v-')).map((k) => k.slice(2)));
+  const wantV = cfgNow.vertical !== false;
   const want = Number(cfgNow.top) || TOP;
-  const todo = (info.top || []).slice(0, want).filter((m) => !have.has(m.key)).sort((a, b) => a.t - b.t);
+  const todo = (info.top || []).slice(0, want).filter((m) => !have.has(m.key) || (wantV && !haveV.has(m.key))).map((m) => ({ ...m, onlyVertical: have.has(m.key) })).sort((a, b) => a.t - b.t);
   if (!todo.length) { log('Sin momentos nuevos que grabar'); return 0; }
   log(`${todo.length} clips por grabar:`, todo.map((m) => `${m.key}`).join(' '));
 
@@ -366,10 +369,12 @@ async function renderGame(gameId) {
       const maxWait = (m.tEnd - m.tStart + 25) * 1000; const t0 = Date.now();
       while (Date.now() - t0 < maxWait) { await sleep(1500); const r = await replay('GET', '/replay/recording'); if (r.data && r.data.recording === false) break; }
       if (!fs.existsSync(webm)) { log('  ✗ no se generó el archivo', webm); continue; }
-      await encodeClip(webm, mp4, m, info.match);
-      const up = await uploadClip(gameId, m, mp4);
-      log(`  ✓ subido ${up.url}`);
-      done++;
+      if (!m.onlyVertical) {
+        await encodeClip(webm, mp4, m, info.match);
+        const up = await uploadClip(gameId, m, mp4);
+        log(`  ✓ subido ${up.url}`);
+        done++;
+      }
       // Vertical para redes (1080×1920): misma grabación, clave v-<key>, kind vertical_<kind>
       const vmp4 = `${base}.vertical.mp4`;
       if (cfgNow.vertical !== false) {
@@ -393,10 +398,15 @@ async function renderGame(gameId) {
 async function pendingGames(tournamentId, want = TOP) {
   const { replays } = await atak(`/api/replays/tournament/${tournamentId}`);
   const { clips } = await atak(`/api/replays/tournament/${tournamentId}/clips`);
-  const count = new Map();
-  for (const c of clips) { if (String(c.key).startsWith('vod-')) continue; const k = `${c.region}:${c.gameId}`; count.set(k, (count.get(k) || 0) + 1); }
-  // Pendiente = partida con replay y menos clips de los que se quieren por partida.
-  return replays.filter((r) => r.region === REGION && (count.get(`${r.region}:${r.gameId}`) || 0) < want).map((r) => r.gameId);
+  const count = new Map(), vcount = new Map();
+  for (const c of clips) {
+    const key = String(c.key); const k = `${c.region}:${c.gameId}`;
+    if (key.startsWith('vod-')) continue;
+    if (key.startsWith('v-')) vcount.set(k, (vcount.get(k) || 0) + 1); else count.set(k, (count.get(k) || 0) + 1);
+  }
+  // Pendiente = partida con replay y menos clips de los que se quieren, o con verticales por hacer.
+  const wantV = readConfig().vertical !== false;
+  return replays.filter((r) => { const k = `${r.region}:${r.gameId}`; const h = count.get(k) || 0; return r.region === REGION && (h < want || (wantV && (vcount.get(k) || 0) < Math.min(h, want))); }).map((r) => r.gameId);
 }
 
 
