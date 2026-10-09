@@ -677,6 +677,25 @@ function diag() {
     await new Promise((resolve) => { const c = spawn(process.execPath, [path.join(here, 'vod-clips.mjs'), path.join(here, 'out', 'vod', `${plan}.json`)], { cwd: here, windowsHide: true }); c.stdout.on('data', (d) => log(String(d).trimEnd())); c.stderr.on('data', (d) => log(String(d).trimEnd())); c.on('exit', resolve); });
     return;
   }
+  if (args[0] === 'posters') {
+    // Pósteres para los clips que no lo tengan: baja cada MP4, saca un fotograma y lo sube.
+    const tid = String(args[1] || readConfig().tournament || 'lqc-2026');
+    const { clips } = await atak(`/api/replays/tournament/${encodeURIComponent(tid)}/clips`);
+    const todo = (clips || []).filter((c) => !c.poster);
+    log(`pósteres: ${todo.length} clips sin póster en ${tid}`);
+    await fsp.mkdir(OUT, { recursive: true });
+    for (const c of todo) {
+      const tmp = path.join(OUT, `poster-${c.gameId}-${c.key}.mp4`);
+      try {
+        const r = await fetch(c.url); if (!r.ok) throw new Error(`descarga ${r.status}`);
+        await fsp.writeFile(tmp, Buffer.from(await r.arrayBuffer()));
+        await uploadPoster(c.gameId, c.key, tmp);
+        log(`  ✓ póster ${c.gameId}/${c.key}`);
+      } catch (e) { log(`  ✗ póster ${c.gameId}/${c.key}: ${e.message}`); }
+      finally { try { await fsp.unlink(tmp); } catch { /* */ } }
+    }
+    return;
+  }
   if (args[0] === 'update-agent') {
     // Baja agent.mjs del host y cierra el agente actual (su .cmd lo vuelve a lanzar con el archivo nuevo).
     if (!process.env.AGENT_UPDATE_URL) { log('sin AGENT_UPDATE_URL'); return; }
