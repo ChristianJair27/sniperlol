@@ -106,6 +106,8 @@ function sanitizeSnapshot(body: any) {
     // 'player' = lo manda un jugador de la partida (eventos completos); 'spectator' = el caster.
     source: body?.source === 'player' ? 'player' : 'spectator',
     activePlayer: String(body?.activePlayer || '').slice(0, 64),
+    // true/false cuando el companion del jugador lo sabe por el LCU (solo las customs son de torneo).
+    isCustom: typeof body?.isCustom === 'boolean' ? body.isCustom : null,
   };
 }
 
@@ -127,8 +129,11 @@ async function rosters(): Promise<RosterIndex[]> {
   rosterCache = { at: Date.now(), list };
   return list;
 }
-/** ¿A qué torneo y equipos pertenece esta partida? (≥ 5 de los 10 jugadores registrados) */
+/** ¿A qué torneo y equipos pertenece esta partida? Cada lado debe ser un equipo registrado
+ *  (≥ 3 jugadores de la misma plantilla por lado, equipos distintos). Un equipo del torneo
+ *  jugando flex/normales contra desconocidos NO cuenta: antes eso se publicaba en el tablero. */
 async function matchTournament(snapshot: any) {
+  if (snapshot?.isCustom === false) return null;
   const players: any[] = snapshot.players || [];
   const teamOf = (idx: RosterIndex, riotId: string) => { const r = String(riotId || '').toLowerCase(); return idx.byId.get(r) || idx.byName.get(r.split('#')[0]) || null; };
   let best: { idx: RosterIndex; n: number; sides: Record<string, Record<string, number>> } | null = null;
@@ -136,7 +141,10 @@ async function matchTournament(snapshot: any) {
     const sides: Record<string, Record<string, number>> = { ORDER: {}, CHAOS: {} };
     let n = 0;
     for (const p of players) { const team = teamOf(idx, p.riotId); if (!team) continue; n++; const side = p.team === 'CHAOS' ? 'CHAOS' : 'ORDER'; sides[side][team] = (sides[side][team] || 0) + 1; }
-    if (n >= 5 && (!best || n > best.n)) best = { idx, n, sides };
+    const topOf = (m: Record<string, number>) => Object.entries(m).sort((a, b) => b[1] - a[1])[0] || ['', 0];
+    const [t1, n1] = topOf(sides.ORDER), [t2, n2] = topOf(sides.CHAOS);
+    const twoTeams = Number(n1) >= 3 && Number(n2) >= 3 && String(t1).trim().toLowerCase() !== String(t2).trim().toLowerCase();
+    if (twoTeams && n >= 6 && (!best || n > best.n)) best = { idx, n, sides };
   }
   if (!best) return null;
   const top = (m: Record<string, number>) => Object.entries(m).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
