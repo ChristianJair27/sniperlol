@@ -70,6 +70,8 @@ interface RosterPlayer {
   puuid?: string;
   userId?: number;
   inviteEmail?: string;
+  /** Invitado por Riot ID: ocupa el slot al aceptar con su cuenta ATAK vinculada. */
+  inviteRiotId?: string;
   inviteStatus?: 'pending' | 'accepted';
 }
 interface TeamRegistration {
@@ -128,6 +130,8 @@ interface TournamentData {
   teamSize?: number;
   gameMap?: 'SR' | 'ARAM' | 'ARENA';
   pickType?: string;
+  // Archivado por el organizador: no sale en la lista pública (sí en "Mis torneos"); se puede restaurar o borrar.
+  archived?: boolean;
   // Fin de la ventana de juego (ladder Arena) — al llegar, el sync cierra.
   endDate?: string;
   // Estado del ladder Arena (partidas procesadas + puntos por dupla).
@@ -238,6 +242,7 @@ async function initTables() {
     `ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS captain_user_id INT`,
     // Soft-hide: torneos de prueba fuera de listas públicas sin borrar datos
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS hidden TINYINT(1) DEFAULT 0`,
+    `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS archived TINYINT(1) DEFAULT 0`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS fearless TINYINT(1) DEFAULT 0`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS bracket_type VARCHAR(20) DEFAULT 'single_elim'`,
     `ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS series_to INT DEFAULT 1`,
@@ -426,6 +431,7 @@ function rowToTournament(row: any): TournamentData {
     ladder:    parseJson(row.ladder) || undefined,
     scheduleId: row.schedule_id ? Number(row.schedule_id) : undefined,
     isPrivate: !!row.is_private,
+    archived: !!row.archived,
     discordWebhookUrl: row.discord_webhook_url || undefined,
     playoffsSize: Number(row.playoffs_size) || 0,
     fixedSchedule: parseJson(row.fixed_schedule) || undefined,
@@ -546,6 +552,7 @@ function serialize(t: TournamentData, access: ViewerAccess = 'public') {
     ladder: t.ladder,
     scheduleId: t.scheduleId,
     isPrivate: !!t.isPrivate,
+    archived: !!t.archived,
     // El webhook es del organizador — no se expone al público.
     discordWebhookUrl: access === 'owner' ? t.discordWebhookUrl : undefined,
     playoffsSize: t.playoffsSize || 0,
@@ -1457,9 +1464,13 @@ router.get('/', optionalAuth, async (req: any, res) => {
     const [rows] = await pool.query<any[]>(
       'SELECT * FROM tournaments WHERE COALESCE(hidden,0)=0 ORDER BY created_at DESC'
     );
+    const wantArchived = String(req.query?.archived || '') === '1';
     const out = await Promise.all(rows.map(async (r) => {
       const t = rowToTournament(r);
+      // Archivados: fuera de la lista; el organizador los pide con ?archived=1.
+      if (!!t.archived !== wantArchived) return null;
       const access = await getViewerAccess(t, req.auth);
+      if (t.archived && access !== 'owner') return null;
       // Privados: solo los ven el organizador y los invitados/participantes.
       if (privateBlocked(t, access)) return null;
       const s = serialize(t, access);
@@ -1896,6 +1907,30 @@ router.post('/tournament-callback', callbackLimiter, async (req, res) => {
   res.status(200).send('OK');
 });
 
+// GET /users/lookup?riotId=Nombre#TAG — ¿ese Riot ID tiene cuenta ATAK.GG vinculada?
+// Para invitar por Riot ID con vista previa del perfil (nombre, avatar, icono).
+// Un Riot ID es público, así que aquí sí se responde "no tiene cuenta".
+router.get('/users/lookup', requireAuth, async (req: any, res) => {
+  const riotId = String(req.query?.riotId || '').trim();
+  const [gameName, tagLine] = riotId.split('#');
+  if (!gameName || !tagLine) return res.status(400).json({ error: 'Riot ID inválido (Nombre#TAG)' });
+  try {
+    const [[row]] = await pool.query<any[]>(
+      `SELECT u.id, u.name, u.avatar_url, a.game_name, a.tag_line, a.profile_icon, a.platform
+         FROM user_riot_accounts a JOIN users u ON u.id = a.user_id
+        WHERE LOWER(a.game_name) = LOWER(?) AND LOWER(a.tag_line) = LOWER(?) LIMIT 1`,
+      [gameName.trim(), tagLine.trim()]
+    );
+    if (!row) return res.json({ found: false, riotId });
+    res.json({
+      found: true, userId: Number(row.id), name: row.name || row.game_name,
+      avatarUrl: row.avatar_url || null, profileIcon: row.profile_icon ? Number(row.profile_icon) : null,
+      riotId: `${row.game_name}#${row.tag_line}`, platform: row.platform || null,
+      self: Number(row.id) === req.auth.userId,
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /invitations/me — pending tournament invitations for the logged-in user
 router.get('/invitations/me', requireAuth, async (req: any, res) => {
   try {
@@ -2058,6 +2093,7 @@ router.get('/me/dashboard', requireAuth, async (req: any, res) => {
           id: t.id, name: t.name, phase: t.phase,
           participants: t.participants, maxParticipants: t.maxParticipants,
           startDate: t.startDate, codesAvailable: t.codePool.length,
+          archived: !!t.archived,
         });
       }
 
@@ -2124,13 +2160,17 @@ router.get('/:id', optionalAuth, async (req: any, res) => {
 // por correo + en su dashboard, y con ella puede ver e inscribirse al torneo.
 router.post('/:id/invite', requireAuth, emailLimiter, async (req: any, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
-  if (!email || !email.includes('@')) return res.status(400).json({ error: 'Correo inválido' });
+  const riotId = String(req.body?.riotId || '').trim();
+  if (!riotId && (!email || !email.includes('@'))) return res.status(400).json({ error: 'Escribe un correo o un Riot ID (Nombre#TAG)' });
   try {
     const t = await getT(req.params.id);
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
     if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador puede invitar' });
 
-    const invitedUserId = await findUserByEmail(email);
+    const invitedUserId = riotId ? await findUserByRiotId(riotId) : await findUserByEmail(email);
+    if (riotId && !invitedUserId) {
+      return res.status(400).json({ error: `${riotId} no tiene cuenta en ATAK.GG con ese Riot ID vinculado. Pídele que vincule su cuenta o invítalo por correo.` });
+    }
     if (!invitedUserId) {
       // A propósito NO decimos si el correo existe o no: con este endpoint
       // abierto, la diferencia entre "no existe" y "invitación enviada" es un
@@ -2140,7 +2180,7 @@ router.post('/:id/invite', requireAuth, emailLimiter, async (req: any, res) => {
       });
     }
     if (invitedUserId === req.auth.userId) {
-      return res.status(400).json({ error: 'Ese es tu propio correo' });
+      return res.status(400).json({ error: riotId ? 'Ese Riot ID es el tuyo: no puedes invitarte a ti mismo' : 'Ese es tu propio correo' });
     }
 
     const [[inviter]] = await pool.query<any[]>('SELECT name, email FROM users WHERE id=? LIMIT 1', [req.auth.userId]);
@@ -2149,7 +2189,7 @@ router.post('/:id/invite', requireAuth, emailLimiter, async (req: any, res) => {
       String(req.body?.name || '').trim() || undefined,
       { tournamentName: t.name, inviterName: inviter?.name || inviter?.email?.split('@')[0] || 'Organizador' }
     );
-    res.json({ success: true, message: `Invitación enviada a ${email}` });
+    res.json({ success: true, message: `Invitación enviada a ${riotId || email}` });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2160,14 +2200,17 @@ router.get('/:id/invites', requireAuth, async (req: any, res) => {
     if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
     if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador' });
     const [rows] = await pool.query<any[]>(
-      `SELECT i.id, i.status, i.player_name, i.created_at, u.email, u.name
-         FROM tournament_invitations i LEFT JOIN users u ON u.id = i.invited_user_id
+      `SELECT i.id, i.status, i.player_name, i.created_at, u.email, u.name, u.avatar_url, a.game_name, a.tag_line
+         FROM tournament_invitations i
+         LEFT JOIN users u ON u.id = i.invited_user_id
+         LEFT JOIN user_riot_accounts a ON a.user_id = i.invited_user_id
         WHERE i.tournament_id = ? AND i.slot_index = -1
         ORDER BY i.created_at DESC`,
       [t.id]
     );
     res.json(rows.map(r => ({
       id: r.id, status: r.status, email: r.email, name: r.player_name || r.name || null,
+      riotId: r.game_name ? `${r.game_name}#${r.tag_line}` : null, avatarUrl: r.avatar_url || null,
       createdAt: r.created_at,
     })));
   } catch (err: any) { res.status(500).json({ error: err.message }); }
@@ -2247,6 +2290,27 @@ router.post('/:id/register', requireAuth, emailLimiter, async (req: any, res) =>
       const name = String(raw.name || '').trim() || `Jugador ${i + 1}`;
       const riotId = String(raw.riotId || '').trim();
       const inviteEmail = String(raw.inviteEmail || '').trim();
+      const inviteRiotId = String(raw.inviteRiotId || '').trim();
+
+      if (inviteRiotId) {
+        if (!/^.+#.{2,}$/.test(inviteRiotId)) return res.status(400).json({ error: `Riot ID inválido en slot ${i + 1}: ${inviteRiotId}`, slot: i });
+        const invitedUserId = await findUserByRiotId(inviteRiotId);
+        if (!invitedUserId) {
+          return res.status(400).json({
+            error: `${inviteRiotId} no tiene cuenta en ATAK.GG con ese Riot ID vinculado. Añádelo como "Riot ID" directo o invítalo por correo.`,
+            slot: i,
+          });
+        }
+        if (invitedUserId === userId) {
+          if (!linked) return res.status(400).json({ error: 'Vincula tu cuenta de LoL para ocupar este slot' });
+          normalizedPlayers.push({ name, riotId: linked.riotId, puuid: linked.puuid, userId, inviteStatus: 'accepted' });
+          continue;
+        }
+        normalizedPlayers.push({ name, riotId: inviteRiotId, inviteRiotId, inviteStatus: 'pending' });
+        inviteOps.push(() => createInvitation(t.id, teamName, invitedUserId, userId, i, name, { tournamentName: t.name, inviterName }));
+        invitationsSent.push(inviteRiotId);
+        continue;
+      }
 
       if (inviteEmail) {
         const invitedUserId = await findUserByEmail(inviteEmail);
@@ -2961,6 +3025,7 @@ router.get('/:id/dashboard', optionalAuth, async (req: any, res) => {
         registrationUrl: t.registrationUrl ?? null, rulesUrl: t.rulesUrl ?? null,
         teamSize: t.teamSize || 5, gameMap: t.gameMap || 'SR',
         isPrivate: !!t.isPrivate,
+        archived: !!t.archived,
         discordWebhookUrl: access === 'owner' ? (t.discordWebhookUrl ?? null) : undefined,
         playoffsSize: t.playoffsSize || 0,
       },
@@ -4101,6 +4166,11 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
       await pool.query('UPDATE tournaments SET fearless=? WHERE id=?', [fearless ? 1 : 0, t.id]);
       t.fearless = !!fearless;
     }
+    // Archivar / restaurar: solo cambia la visibilidad en la lista.
+    if (req.body.archived !== undefined) {
+      await pool.query('UPDATE tournaments SET archived=? WHERE id=?', [req.body.archived ? 1 : 0, t.id]);
+      t.archived = !!req.body.archived;
+    }
     const { bracketType, seriesTo, finalSeriesTo, swissRounds } = req.body;
     const locked = t.phase === 'active' || t.phase === 'complete';
     // Playoffs del suizo: ajustable incluso activo, MIENTRAS no se hayan
@@ -4187,6 +4257,32 @@ router.patch('/:id', requireAuth, async (req: any, res) => {
 // El lobby de Riot no puede forzarlo; la plataforma lo rastrea y lo muestra.
 // Asignación por Riot ID del roster (gamertag → equipo); lo que no se puede
 // atribuir cae en `unassigned` (igual está bloqueado globalmente).
+// DELETE /:id — borra el torneo y todo lo suyo (equipos, invitaciones, stats,
+// replays, clips, publicaciones del feed). Irreversible: la UI pide confirmar
+// escribiendo el nombre. Lo normal es archivar; esto es para limpiar de verdad.
+router.delete('/:id', requireAuth, async (req: any, res) => {
+  try {
+    const t = await getT(req.params.id);
+    if (!t) return res.status(404).json({ error: 'Torneo no encontrado' });
+    if (!isOwner(req, t)) return res.status(403).json({ error: 'Solo el organizador puede eliminar el torneo' });
+    const id = t.id;
+    const safe = async (sql: string, params: any[]) => { try { await pool.query(sql, params); } catch (e: any) { console.warn('[tournament delete]', e.message); } };
+    await safe('DELETE FROM social_likes WHERE post_id IN (SELECT id FROM social_posts WHERE tournament_id = ?)', [id]);
+    await safe('DELETE FROM social_comments WHERE post_id IN (SELECT id FROM social_posts WHERE tournament_id = ?)', [id]);
+    await safe('DELETE FROM social_reposts WHERE post_id IN (SELECT id FROM social_posts WHERE tournament_id = ?)', [id]);
+    await safe('DELETE FROM social_posts WHERE tournament_id = ?', [id]);
+    await safe('DELETE FROM tournament_clips WHERE tournament_id = ?', [id]);
+    await safe('DELETE FROM tournament_replays WHERE tournament_id = ?', [id]);
+    await safe('DELETE FROM tournament_match_stats WHERE tournament_id = ?', [id]);
+    await safe('DELETE FROM tournament_invitations WHERE tournament_id = ?', [id]);
+    await safe('DELETE FROM tournament_registrations WHERE tournament_id = ?', [id]);
+    await safe('DELETE FROM live_feed_channels WHERE channel = ?', [id.toLowerCase()]);
+    await pool.query('DELETE FROM tournaments WHERE id = ?', [id]);
+    console.log(`[tournaments] eliminado ${id} (${t.name}) por usuario ${req.auth.userId}`);
+    res.json({ ok: true, deleted: id });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 router.get('/:id/fearless', async (req, res) => {
   try {
     const t = await getT(req.params.id);
