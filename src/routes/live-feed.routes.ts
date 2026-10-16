@@ -32,6 +32,8 @@ async function initLiveFeedTable() {
       snapshot LONGTEXT NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  // Objetivos marcados a mano por el caster (el espectador no recibe dragón/larvas/heraldo/barón).
+  await pool.query('ALTER TABLE live_feed_channels ADD COLUMN IF NOT EXISTS manual LONGTEXT NULL').catch(() => {});
 }
 initLiveFeedTable().catch((e) => console.error('[live-feed] init error:', e.message));
 
@@ -175,6 +177,7 @@ router.post('/auto/push', async (req, res) => {
          seq = LAST_INSERT_ID(seq + 1), at = VALUES(at), snapshot = VALUES(snapshot)`,
       [hit.channel, Date.now(), JSON.stringify(snap)]
     );
+    void resetManualIfNewGame(hit.channel, Number(snap.gameTime) || 0);
     return res.json({ ok: true, channel: hit.channel, team1: hit.team1, team2: hit.team2, matched: hit.matched, seq: Number(result.insertId) || 1 });
   } catch (e: any) {
     console.error('[live-feed] auto push error:', e.message);
@@ -221,6 +224,7 @@ router.post('/:channel/push', async (req, res) => {
          seq = LAST_INSERT_ID(seq + 1), at = VALUES(at), snapshot = VALUES(snapshot)`,
       [channel, Date.now(), snapshot]
     );
+    void resetManualIfNewGame(channel, Number(snap.gameTime) || 0);
     // GC ocasional de canales muertos (~1 de cada 50 pushes)
     if (Math.random() < 0.02) {
       pool.query('DELETE FROM live_feed_channels WHERE at < ?', [Date.now() - 10 * 60_000]).catch(() => {});
@@ -231,6 +235,72 @@ router.post('/:channel/push', async (req, res) => {
     return res.status(500).json({ error: 'push_failed' });
   }
 });
+
+// ── Objetivos a mano (caster): POST /:channel/mark · DELETE /:channel/mark/last · DELETE /:channel/mark ──
+// El espectador no recibe DragonKill/HordeKill/HeraldKill/BaronKill. Desde la
+// página /broadcast/:canal/control el caster los marca con un clic y el GET los
+// mezcla con el feed como si fueran eventos reales (killer = un jugador del lado).
+const MARK_NAMES = new Set(['DragonKill', 'HordeKill', 'HeraldKill', 'BaronKill', 'TurretKilled']);
+const DRAGON_TYPES = new Set(['Fire', 'Water', 'Earth', 'Air', 'Hextech', 'Chemtech', 'Elder']);
+function parseManual(raw: any): Array<{ id: number; t: number; name: string; killer: string; victim: string; assisters: string[]; extra: string; side: string; manual: true }> {
+  try { const v = typeof raw === 'string' ? JSON.parse(raw) : raw; return Array.isArray(v) ? v : []; } catch { return []; }
+}
+router.post('/:channel/mark', async (req, res) => {
+  if (!TOKEN || String(req.headers['x-feed-token'] || '') !== TOKEN) return res.status(401).json({ error: 'bad_token' });
+  const channel = String(req.params.channel).toLowerCase();
+  if (!CHANNEL_RE.test(channel)) return res.status(400).json({ error: 'bad_channel' });
+  const name = String(req.body?.name || '');
+  const side = req.body?.side === 'red' ? 'red' : 'blue';
+  const extra = String(req.body?.extra || '');
+  if (!MARK_NAMES.has(name)) return res.status(400).json({ error: 'name inválido' });
+  if (name === 'DragonKill' && !DRAGON_TYPES.has(extra)) return res.status(400).json({ error: 'tipo de dragón inválido' });
+  try {
+    const [[row]] = await pool.query<any[]>('SELECT at, snapshot, manual FROM live_feed_channels WHERE channel = ?', [channel]);
+    if (!row) return res.status(409).json({ error: 'No hay partida en vivo en este canal (el companion del caster no está enviando).' });
+    const snap = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
+    const players: any[] = Array.isArray(snap?.players) ? snap.players : [];
+    const killer = players.find((p) => (p.team === 'CHAOS') === (side === 'red'))?.riotId || (side === 'red' ? 'CHAOS' : 'ORDER');
+    const manual = parseManual(row.manual);
+    const t = Number.isFinite(Number(req.body?.t)) ? Math.max(0, Math.round(Number(req.body.t))) : Math.round(Number(snap?.gameTime) || 0);
+    const ev = { id: 900000 + manual.length + 1, t, name, killer, victim: '', assisters: [], extra: name === 'TurretKilled' ? (side === 'red' ? 'Turret_T1_manual' : 'Turret_T2_manual') : extra, side, manual: true as const };
+    manual.push(ev);
+    await pool.query('UPDATE live_feed_channels SET manual = ? WHERE channel = ?', [JSON.stringify(manual), channel]);
+    return res.json({ ok: true, count: manual.length, event: ev });
+  } catch (e: any) { console.error('[live-feed] mark error:', e.message); return res.status(500).json({ error: 'mark_failed' }); }
+});
+router.get('/:channel/mark', async (req, res) => {
+  const channel = String(req.params.channel).toLowerCase();
+  try {
+    const [[row]] = await pool.query<any[]>('SELECT manual FROM live_feed_channels WHERE channel = ?', [channel]);
+    return res.json({ ok: true, events: row ? parseManual(row.manual) : [] });
+  } catch { return res.json({ ok: true, events: [] }); }
+});
+router.delete('/:channel/mark/last', async (req, res) => {
+  if (!TOKEN || String(req.headers['x-feed-token'] || '') !== TOKEN) return res.status(401).json({ error: 'bad_token' });
+  const channel = String(req.params.channel).toLowerCase();
+  try {
+    const [[row]] = await pool.query<any[]>('SELECT manual FROM live_feed_channels WHERE channel = ?', [channel]);
+    const manual = row ? parseManual(row.manual) : [];
+    const removed = manual.pop() || null;
+    if (row) await pool.query('UPDATE live_feed_channels SET manual = ? WHERE channel = ?', [manual.length ? JSON.stringify(manual) : null, channel]);
+    return res.json({ ok: true, removed, count: manual.length });
+  } catch (e: any) { return res.status(500).json({ error: e.message }); }
+});
+router.delete('/:channel/mark', async (req, res) => {
+  if (!TOKEN || String(req.headers['x-feed-token'] || '') !== TOKEN) return res.status(401).json({ error: 'bad_token' });
+  const channel = String(req.params.channel).toLowerCase();
+  try { await pool.query('UPDATE live_feed_channels SET manual = NULL WHERE channel = ?', [channel]); return res.json({ ok: true }); }
+  catch (e: any) { return res.status(500).json({ error: e.message }); }
+});
+// Partida nueva (el reloj vuelve a empezar): los marcados de la anterior se borran solos.
+async function resetManualIfNewGame(channel: string, gameTime: number) {
+  if (!(gameTime < 120)) return;
+  try {
+    const [[row]] = await pool.query<any[]>('SELECT manual FROM live_feed_channels WHERE channel = ?', [channel]);
+    const manual = row ? parseManual(row.manual) : [];
+    if (manual.some((m) => m.t > gameTime + 30)) await pool.query('UPDATE live_feed_channels SET manual = NULL WHERE channel = ?', [channel]);
+  } catch { /* mejor esfuerzo */ }
+}
 
 // ── DELETE /api/live-feed/:channel (companion al terminar; requiere token) ──
 router.delete('/:channel', async (req, res) => {
@@ -255,11 +325,20 @@ router.get('/:channel', async (req, res) => {
   if (!CHANNEL_RE.test(channel)) return res.status(400).json({ error: 'bad_channel' });
   try {
     const [[row]] = await pool.query<any[]>(
-      'SELECT seq, at, snapshot FROM live_feed_channels WHERE channel = ?',
+      'SELECT seq, at, snapshot, manual FROM live_feed_channels WHERE channel = ?',
       [channel]
     );
     if (!row || Date.now() - Number(row.at) > TTL_MS) return res.status(204).end();
     const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
+    const manual = parseManual(row.manual);
+    if (manual.length) {
+      // Un objetivo que el feed ya trae (companion de un jugador) no se duplica.
+      const feedEvents: any[] = Array.isArray(snapshot.events) ? snapshot.events : [];
+      const extra = manual.filter((m) => !feedEvents.some((e) => e.name === m.name && Math.abs(Number(e.t) - m.t) < 120 && (m.name !== 'DragonKill' || e.extra === m.extra)));
+      snapshot.events = [...feedEvents, ...extra].sort((a, b) => Number(a.t) - Number(b.t));
+      snapshot.eventsComplete = true;
+      snapshot.manualEvents = manual.length;
+    }
     return res.json({ ok: true, seq: Number(row.seq), ageMs: Date.now() - Number(row.at), ...snapshot });
   } catch (e: any) {
     console.error('[live-feed] get error:', e.message);
