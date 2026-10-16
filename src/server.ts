@@ -55,7 +55,8 @@ const corsOptions: cors.CorsOptions = {
   },
   credentials: true, // <- necesario si el front manda cookies/credenciales
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  // X-Feed-Token: mesa de control del caster (/broadcast/:canal/control) · X-Media-Kind: subida de medios del feed social.
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "X-Feed-Token", "X-Media-Kind"],
 };
 
 const app = express();
