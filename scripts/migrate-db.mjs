@@ -11,11 +11,13 @@ import 'dotenv/config';
 const phase = (process.argv.find((a) => a.startsWith('--phase')) || '').split('=')[1] || process.argv[process.argv.indexOf('--phase') + 1] || 'small';
 if (fs.existsSync('.env.migrate')) for (const l of fs.readFileSync('.env.migrate', 'utf8').split(/\r?\n/)) { const m = /^([A-Z_]+)=(.*)$/.exec(l); if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^"|"$/g, ''); }
 const src = await mysql.createConnection({ host: process.env.MYSQL_HOST, user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD, database: process.env.MYSQL_DB, supportBigNumbers: true, bigNumberStrings: true });
-const dst = await mysql.createConnection({ host: process.env.DST_HOST, port: Number(process.env.DST_PORT) || 3306, user: process.env.DST_USER, password: process.env.DST_PASSWORD, database: process.env.DST_DB, supportBigNumbers: true, bigNumberStrings: true, maxAllocatedPacket: 256 * 1024 * 1024 });
+const dst = await mysql.createConnection({ host: process.env.DST_HOST, port: Number(process.env.DST_PORT) || 3306, user: process.env.DST_USER, password: process.env.DST_PASSWORD, database: process.env.DST_DB, supportBigNumbers: true, bigNumberStrings: true });
 await dst.query('SET FOREIGN_KEY_CHECKS=0'); await dst.query('SET SESSION sql_mode=""');
 const BLOB_TABLES = ['tournament_clips', 'tournament_replays', 'social_media'];
 const [tabs] = await src.query('SHOW TABLES'); const tables = tabs.map((r) => Object.values(r)[0]);
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+// mysql2 convierte las columnas JSON en objetos: al reinsertar hay que volver a texto (si no, '[object Object]').
+const norm = (v) => (v && typeof v === 'object' && !Buffer.isBuffer(v) && !(v instanceof Date) ? JSON.stringify(v) : v);
 
 async function ensureTable(t) {
   const [[row]] = await src.query(`SHOW CREATE TABLE \`${t}\``);
@@ -31,7 +33,7 @@ async function copySmall(t) {
   const chunk = 500;
   for (let i = 0; i < rows.length; i += chunk) {
     const part = rows.slice(i, i + chunk);
-    await dst.query(`REPLACE INTO \`${t}\` (${cols.map((c) => `\`${c}\``).join(',')}) VALUES ?`, [part.map((r) => cols.map((c) => r[c]))]);
+    await dst.query(`REPLACE INTO \`${t}\` (${cols.map((c) => `\`${c}\``).join(',')}) VALUES ?`, [part.map((r) => cols.map((c) => norm(r[c])))]);
   }
   log(t, rows.length, 'filas');
 }
@@ -50,7 +52,7 @@ async function copyBlobs(t) {
     const [[row]] = await src.query(`SELECT * FROM \`${t}\` WHERE ${where}`, keys.map((k) => id[k]));
     if (!row) continue;
     const cols = Object.keys(row);
-    await dst.query(`REPLACE INTO \`${t}\` (${cols.map((c) => `\`${c}\``).join(',')}) VALUES (${cols.map(() => '?').join(',')})`, cols.map((c) => row[c]));
+    await dst.query(`REPLACE INTO \`${t}\` (${cols.map((c) => `\`${c}\``).join(',')}) VALUES (${cols.map(() => '?').join(',')})`, cols.map((c) => norm(row[c])));
     n++; bytes += Number(row.size) || 0;
     if (n % 10 === 0) log(t, `${n}/${todo.length}`, `${(bytes / 1048576).toFixed(0)} MB`);
   }
