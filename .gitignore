@@ -37,3 +37,4 @@ tools/replay-render/bin/
 tools/replay-render/.agent-token
 tools/replay-render/vm/.env
 tools/replay-render/vm/logs/
+.env.migrate
