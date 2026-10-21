@@ -18,7 +18,7 @@ if (!res.ok) { console.error(`Riot no encuentra ${riotId} (HTTP ${res.status})`)
 const acc = await res.json();
 const canonical = `${acc.gameName}#${acc.tagLine}`;
 
-const conn = await mysql.createConnection({ host: process.env.MYSQL_HOST, user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD, database: process.env.MYSQL_DB });
+const conn = await mysql.createConnection({ host: process.env.MYSQL_HOST, port: Number(process.env.MYSQL_PORT) || 3306, user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD, database: process.env.MYSQL_DB });
 const [regs] = await conn.query('SELECT id, team_name, players FROM tournament_registrations WHERE tournament_id = ? AND team_name = ?', [TID, team]);
 if (regs.length !== 1) { console.error(`equipo "${team}" no encontrado (${regs.length} coincidencias)`); await conn.end(); process.exit(3); }
 const reg = regs[0];

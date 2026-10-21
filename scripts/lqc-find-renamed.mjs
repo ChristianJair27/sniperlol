@@ -8,7 +8,7 @@ const [team, oldName, oldTag, perArg] = process.argv.slice(2);
 const per = Number(perArg) || 30;
 const H = { 'X-Riot-Token': process.env.RIOT_API_KEY };
 const api = async (url) => { const r = await fetch(url, { headers: H }); if (r.status === 429) { await new Promise((s) => setTimeout(s, 1500)); return api(url); } return r.ok ? r.json() : null; };
-const conn = await mysql.createConnection({ host: process.env.MYSQL_HOST, user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD, database: process.env.MYSQL_DB });
+const conn = await mysql.createConnection({ host: process.env.MYSQL_HOST, port: Number(process.env.MYSQL_PORT) || 3306, user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD, database: process.env.MYSQL_DB });
 const [[reg]] = await conn.query("SELECT players FROM tournament_registrations WHERE tournament_id='lqc-2026' AND team_name=?", [team]);
 await conn.end();
 const mates = (typeof reg.players === 'string' ? JSON.parse(reg.players) : reg.players).filter((p) => p.puuid);
