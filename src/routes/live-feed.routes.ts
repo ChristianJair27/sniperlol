@@ -412,6 +412,68 @@ router.get('/:channel/champselect', async (req, res) => {
   }
 });
 
+// ── Serie en curso (cinemática de intro, tablero): equipos, marcador, plantillas, récord ──
+// Los equipos salen del champ select (si está fresco), si no del snapshot in-game,
+// y si no de ?t1=&t2=. Con ellos se busca el partido del bracket del torneo activo.
+const slugify = (s: string) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+router.get('/:channel/series', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const channel = String(req.params.channel).toLowerCase();
+  if (!CHANNEL_RE.test(channel)) return res.status(400).json({ error: 'bad_channel' });
+  try {
+    const [[row]] = await pool.query<any[]>('SELECT at, snapshot, champselect, cs_at FROM live_feed_channels WHERE channel = ?', [channel]);
+    let t1 = String(req.query.t1 || ''), t2 = String(req.query.t2 || ''), from = 'query';
+    const parse = (v: any) => { try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return null; } };
+    if (!t1 || !t2) {
+      const cs = row?.champselect && Date.now() - Number(row.cs_at) < CS_TTL_MS ? parse(row.champselect) : null;
+      const snap = row?.snapshot && Date.now() - Number(row.at) < TTL_MS ? parse(row.snapshot) : null;
+      if (cs && !cs.ended && cs.team1 && cs.team2) { t1 = cs.team1; t2 = cs.team2; from = 'champselect'; }
+      else if (snap?.team1 && snap?.team2) { t1 = snap.team1; t2 = snap.team2; from = 'snapshot'; }
+    }
+    if (!t1 || !t2) return res.status(204).end();
+    const norm = (x: string) => String(x || '').trim().toLowerCase();
+    let hit: { idx: RosterIndex; match: any } | null = null;
+    for (const idx of await rosters()) {
+      const m = idx.bracket.find((bm: any) => (norm(bm.team1) === norm(t1) && norm(bm.team2) === norm(t2)) || (norm(bm.team1) === norm(t2) && norm(bm.team2) === norm(t1)));
+      if (m) { hit = { idx, match: m }; break; }
+    }
+    const teamInfo = async (tournamentId: string | null, name: string) => {
+      let roster: Array<{ name: string; riotId: string; role: string }> = []; let captain = '';
+      if (tournamentId) {
+        const [[reg]] = await pool.query<any[]>('SELECT team_name, captain_riot_id, players FROM tournament_registrations WHERE tournament_id = ? AND LOWER(team_name) = ? LIMIT 1', [tournamentId, norm(name)]);
+        if (reg) {
+          captain = String(reg.captain_riot_id || '');
+          const ps = parse(reg.players) || [];
+          roster = (Array.isArray(ps) ? ps : []).map((p: any) => ({ name: String(p?.name || p?.playerName || p?.riotId || '').split('#')[0].slice(0, 32), riotId: String(p?.riotId || '').slice(0, 48), role: String(p?.role || p?.position || '').slice(0, 16) }));
+        }
+      }
+      return { name, slug: slugify(name), captain, roster };
+    };
+    let standings: any[] = [];
+    if (hit) {
+      const [[tr]] = await pool.query<any[]>('SELECT standings, season, fearless FROM tournaments WHERE id = ?', [hit.idx.tournamentId]);
+      standings = parse(tr?.standings) || [];
+      (hit as any).season = tr?.season || null; (hit as any).fearless = !!tr?.fearless;
+    }
+    const rec = (name: string) => { const st = (Array.isArray(standings) ? standings : []).find((x: any) => norm(x?.team) === norm(name)); return st ? { wins: Number(st.wins) || 0, losses: Number(st.losses) || 0, position: Number(st.position) || null } : null; };
+    const m = hit?.match;
+    // El bracket guarda team1/team2 en su orden; la transmisión usa azul/rojo. Se respeta el orden pedido.
+    const swap = m && norm(m.team1) !== norm(t1);
+    const score = m ? { team1: Number(swap ? m.score2 : m.score1) || 0, team2: Number(swap ? m.score1 : m.score2) || 0 } : { team1: 0, team2: 0 };
+    const tid = hit ? hit.idx.tournamentId : null;
+    return res.json({
+      ok: true, from,
+      tournament: hit ? { id: tid, name: hit.idx.tournamentName, season: (hit as any).season, fearless: (hit as any).fearless } : null,
+      match: m ? { id: m.id, round: m.round, matchNumber: m.matchNumber, status: m.matchStatus, seriesTo: Number(m.seriesTo) || 1, gamesPlayed: Array.isArray(m.games) ? m.games.length : (m.gameId ? 1 : 0), score } : null,
+      team1: { ...(await teamInfo(tid, t1)), record: rec(t1) },
+      team2: { ...(await teamInfo(tid, t2)), record: rec(t2) },
+    });
+  } catch (e: any) {
+    console.error('[live-feed] series error:', e.message);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
 router.get('/:channel', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const channel = String(req.params.channel).toLowerCase();
