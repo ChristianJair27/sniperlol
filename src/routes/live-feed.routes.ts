@@ -34,6 +34,9 @@ async function initLiveFeedTable() {
   `);
   // Objetivos marcados a mano por el caster (el espectador no recibe dragón/larvas/heraldo/barón).
   await pool.query('ALTER TABLE live_feed_channels ADD COLUMN IF NOT EXISTS manual LONGTEXT NULL').catch(() => {});
+  // Champ select en curso (overlay de selección para OBS): aparte del snapshot in-game.
+  await pool.query('ALTER TABLE live_feed_channels ADD COLUMN IF NOT EXISTS champselect LONGTEXT NULL').catch(() => {});
+  await pool.query('ALTER TABLE live_feed_channels ADD COLUMN IF NOT EXISTS cs_at BIGINT NULL').catch(() => {});
 }
 initLiveFeedTable().catch((e) => console.error('[live-feed] init error:', e.message));
 
@@ -324,6 +327,91 @@ router.delete('/:channel', async (req, res) => {
 // OJO: NO fijar Access-Control-Allow-Origin:* aquí — el frontend manda
 // withCredentials y el navegador rechaza respuestas con wildcard; el
 // middleware global de CORS ya refleja el origin permitido.
+// ── Champ select (overlay /broadcast/:canal/champselect) ─────────────────────
+// El companion del caster (en el lobby de la custom como espectador) manda el
+// estado de la selección cada segundo; termina con {ended:true}. TTL corto.
+const CS_TTL_MS = 120_000;
+const ID_LIST = (v: any, max = 10) => (Array.isArray(v) ? v.slice(0, max).map((x) => num(x)).filter((n) => n > 0) : []);
+function sanitizeCell(c: any) {
+  return {
+    cellId: num(c?.cellId),
+    championId: num(c?.championId),
+    championName: str(c?.championName, 40),
+    championKey: str(c?.championKey, 40).replace(/[^A-Za-z0-9]/g, ''),
+    position: str(c?.position, 12).toLowerCase(),
+    summonerName: str(c?.summonerName, 32),
+    tagLine: str(c?.tagLine, 8),
+    acting: !!c?.acting,
+    locked: !!c?.locked,
+  };
+}
+function sanitizeChampSelect(body: any) {
+  if (body?.ended === true) return { ended: true };
+  return {
+    ended: false,
+    phase: str(body?.phase, 24),
+    actionType: str(body?.actionType, 12),
+    timerSecs: Math.max(0, Math.round(num(body?.timerSecs))),
+    timerTotalSecs: Math.max(0, Math.round(num(body?.timerTotalSecs))),
+    blue: Array.isArray(body?.blue) ? body.blue.slice(0, 5).map(sanitizeCell) : [],
+    red: Array.isArray(body?.red) ? body.red.slice(0, 5).map(sanitizeCell) : [],
+    bans: { blue: ID_LIST(body?.bans?.blue, 5), red: ID_LIST(body?.bans?.red, 5) },
+    // Fearless: campeones ya usados en la serie por cada lado.
+    used: { blue: ID_LIST(body?.used?.blue, 30), red: ID_LIST(body?.used?.red, 30) },
+    game: Math.max(1, Math.min(9, Math.round(num(body?.game)) || 1)),
+    matchLabel: str(body?.matchLabel, 120),
+    team1: str(body?.team1, 40), team2: str(body?.team2, 40),
+    logo1: str(body?.logo1, 300), logo2: str(body?.logo2, 300),
+    accent: /^#[0-9a-fA-F]{6}$/.test(String(body?.accent || '')) ? String(body.accent) : '',
+  };
+}
+
+router.post('/:channel/champselect', async (req, res) => {
+  if (!TOKEN) return res.status(503).json({ error: 'live_feed_disabled' });
+  if (String(req.headers['x-feed-token'] || '') !== TOKEN) return res.status(401).json({ error: 'bad_token' });
+  const channel = String(req.params.channel).toLowerCase();
+  if (!CHANNEL_RE.test(channel)) return res.status(400).json({ error: 'bad_channel' });
+  if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'bad_body' });
+  try {
+    const cs = sanitizeChampSelect(req.body);
+    // Si los 10 jugadores coinciden con plantillas del torneo del canal, los nombres de
+    // equipo salen de ahí (igual que en el snapshot in-game).
+    if (!cs.ended) {
+      try {
+        const players = [...cs.blue.map((c: any) => ({ riotId: `${c.summonerName}#${c.tagLine}`, team: 'ORDER' })), ...cs.red.map((c: any) => ({ riotId: `${c.summonerName}#${c.tagLine}`, team: 'CHAOS' }))];
+        const hit = await matchTournament({ players });
+        if (hit && hit.channel === channel) { cs.team1 = hit.team1; cs.team2 = hit.team2; cs.matchLabel = hit.matchLabel; }
+      } catch { /* sin plantillas */ }
+    }
+    await pool.query(
+      `INSERT INTO live_feed_channels (channel, seq, at, snapshot, champselect, cs_at)
+       VALUES (?, 1, 0, '{}', ?, ?)
+       ON DUPLICATE KEY UPDATE champselect = VALUES(champselect), cs_at = VALUES(cs_at)`,
+      [channel, JSON.stringify(cs), Date.now()]
+    );
+    return res.json({ ok: true });
+  } catch (e: any) {
+    console.error('[live-feed] champselect push error:', e.message);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+router.get('/:channel/champselect', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const channel = String(req.params.channel).toLowerCase();
+  if (!CHANNEL_RE.test(channel)) return res.status(400).json({ error: 'bad_channel' });
+  try {
+    const [[row]] = await pool.query<any[]>('SELECT champselect, cs_at FROM live_feed_channels WHERE channel = ?', [channel]);
+    if (!row?.champselect || Date.now() - Number(row.cs_at) > CS_TTL_MS) return res.status(204).end();
+    const cs = typeof row.champselect === 'string' ? JSON.parse(row.champselect) : row.champselect;
+    if (cs?.ended) return res.status(204).end();
+    return res.json({ ok: true, ageMs: Date.now() - Number(row.cs_at), ...cs });
+  } catch (e: any) {
+    console.error('[live-feed] champselect get error:', e.message);
+    return res.status(204).end();
+  }
+});
+
 router.get('/:channel', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const channel = String(req.params.channel).toLowerCase();
