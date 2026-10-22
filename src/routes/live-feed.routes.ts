@@ -78,6 +78,8 @@ function sanitizeEvent(e: any) {
       : [],
     // Para TurretKilled/DragonKill etc.
     extra: str(e?.TurretKilled ?? e?.DragonType ?? e?.extra, 40),
+    // true si lo leyó el companion del HUD del espectador (no viene del Live Client).
+    ...(e?.hud === true ? { hud: true } : {}),
   };
 }
 
@@ -110,6 +112,9 @@ function sanitizeSnapshot(body: any) {
     activePlayer: String(body?.activePlayer || '').slice(0, 64),
     // true/false cuando el companion del jugador lo sabe por el LCU (solo las customs son de torneo).
     isCustom: typeof body?.isCustom === 'boolean' ? body.isCustom : null,
+    // true cuando el companion del caster lee los objetivos del HUD del
+    // espectador (companion >= 0.4.8): el overlay puede fiarse de dragones/barón.
+    hud: body?.hud === true,
   };
 }
 
@@ -339,6 +344,7 @@ router.get('/:channel', async (req, res) => {
       snapshot.eventsComplete = true;
       snapshot.manualEvents = manual.length;
     }
+    if (snapshot.hud === true) snapshot.eventsComplete = true;
     return res.json({ ok: true, seq: Number(row.seq), ageMs: Date.now() - Number(row.at), ...snapshot });
   } catch (e: any) {
     console.error('[live-feed] get error:', e.message);
