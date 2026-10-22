@@ -12,7 +12,7 @@ let cache: { at: number; xml: string } | null = null;
 
 const STATIC: Array<[string, string, string]> = [
   ['/', 'daily', '1.0'], ['/tournaments', 'daily', '0.9'], ['/crear-torneo', 'monthly', '0.8'],
-  ['/stats', 'weekly', '0.8'], ['/meta', 'daily', '0.7'], ['/social', 'daily', '0.6'],
+  ['/stats', 'weekly', '0.8'], ['/meta', 'daily', '0.7'], ['/social', 'daily', '0.6'], ['/companion', 'monthly', '0.8'],
 ];
 
 async function build(): Promise<string> {
