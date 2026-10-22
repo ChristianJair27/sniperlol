@@ -1,4 +1,5 @@
 // src/server.ts
+import sitemapRoutes from './routes/sitemap.routes.js';
 import "./loadEnv.js";
 
 import express, { Request, Response, NextFunction } from "express";
@@ -101,6 +102,7 @@ app.use('/api/static', staticRoutes);
 
 console.log("CORS_ORIGIN allowlist:", allowedOrigins);
 
+app.use(sitemapRoutes); // /sitemap.xml y /api/sitemap.xml
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // Identidad de la instancia: tras cada deploy, 6-8 curls aquí deben devolver
