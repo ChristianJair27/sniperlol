@@ -451,9 +451,9 @@ router.get('/:channel/series', async (req, res) => {
     };
     let standings: any[] = [];
     if (hit) {
-      const [[tr]] = await pool.query<any[]>('SELECT standings, season, fearless FROM tournaments WHERE id = ?', [hit.idx.tournamentId]);
+      const [[tr]] = await pool.query<any[]>('SELECT standings, fearless FROM tournaments WHERE id = ?', [hit.idx.tournamentId]);
       standings = parse(tr?.standings) || [];
-      (hit as any).season = tr?.season || null; (hit as any).fearless = !!tr?.fearless;
+      (hit as any).season = null; (hit as any).fearless = !!tr?.fearless;
     }
     const rec = (name: string) => { const st = (Array.isArray(standings) ? standings : []).find((x: any) => norm(x?.team) === norm(name)); return st ? { wins: Number(st.wins) || 0, losses: Number(st.losses) || 0, position: Number(st.position) || null } : null; };
     const m = hit?.match;
