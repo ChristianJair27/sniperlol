@@ -27,6 +27,21 @@ const run = (cmd, args) => new Promise((res, rej) => execFile(cmd, args, { windo
 const hms = (s) => { s = Math.max(0, Math.round(s)); return `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
 const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const ff = (p) => p.replace(/\\/g, '/').replace(/:/g, '\\:');
+// Acabado: 60 fps (el VOD de lqroc es 1080p60), corrección de color, nitidez, viñeta suave y fundidos.
+const FPS = 60;
+const GRADE = 'eq=contrast=1.06:saturation=1.16:gamma=0.98:brightness=0.01,unsharp=5:5:0.45:3:3:0,vignette=angle=PI/7:mode=forward';
+const X264 = (crf) => ['-c:v', 'libx264', '-preset', 'medium', '-crf', String(crf), '-maxrate', '10M', '-bufsize', '20M', '-profile:v', 'high', '-r', String(FPS), '-g', String(FPS * 2), '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart'];
+function duration(file) {
+  return new Promise((resolve) => execFile(FFMPEG, ['-hide_banner', '-i', file], { windowsHide: true }, (_e, _o, err) => {
+    const m = /Duration:\s*(\d+):(\d+):([\d.]+)/.exec(String(err || '')); resolve(m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0);
+  }));
+}
+async function finish(raw) {
+  const d = await duration(raw);
+  const v = `fps=${FPS},${GRADE}` + (d > 2 ? `,fade=t=in:st=0:d=0.3,fade=t=out:st=${(d - 0.4).toFixed(2)}:d=0.4` : '');
+  const a = d > 2 ? `afade=t=in:st=0:d=0.3,afade=t=out:st=${(d - 0.4).toFixed(2)}:d=0.4` : 'anull';
+  return { v, a };
+}
 
 /** segundo de juego → segundo del VOD, interpolando entre los puntos de calibración. */
 function mapT(calib, t) {
@@ -45,7 +60,7 @@ async function cutClip(vod, start, end, file) {
   // yt-dlp baja solo el tramo (HLS) y lo deja en mp4; luego se re-encoda con la tarjeta.
   const raw = file.replace(/\.mp4$/, '.raw.mp4');
   const ytExe = path.join(here, 'bin', 'yt-dlp.exe');
-  const ytArgs = ['-q', '--no-warnings', '--force-overwrites', '--ffmpeg-location', path.dirname(FFMPEG), '--download-sections', `*${hms(start)}-${hms(end)}`, '-f', 'best[height<=1080]', '-o', raw, vod];
+  const ytArgs = ['-q', '--no-warnings', '--force-overwrites', '--ffmpeg-location', path.dirname(FFMPEG), '--download-sections', `*${hms(start)}-${hms(end)}`, '-f', 'best[height<=1080][fps>=50]/best[height<=1080]', '-o', raw, vod];
   if (fs.existsSync(ytExe)) await run(ytExe, ytArgs); else await run('python', ['-m', 'yt_dlp', ...ytArgs]);
   return raw;
 }
@@ -58,9 +73,11 @@ async function brand(raw, mp4, m, match, brandImg) {
   const meta = (match.round ? `${match.team1} vs ${match.team2} · Ronda ${match.round} · Juego ${match.gameNumber} · ${mmss(m.t)}` : `${match.team1} vs ${match.team2} · ${mmss(m.t)}`).toUpperCase() + ' · STREAM';
   await fsp.writeFile(titleTxt, title, 'utf8'); await fsp.writeFile(metaTxt, meta, 'utf8'); await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
   const fOrb = ff(path.join(ASSETS, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS, 'JetBrainsMono-700.ttf'));
+  const fin = await finish(raw);
   // Tarjeta arriba a la izquierda (abajo va el tablero del overlay del stream).
   const filter = [
-    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c[v0]`,
+    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,${fin.v}[v0]`,
+    `[0:a]${fin.a}[aout]`,
     `[1:v]scale=-1:34[lqc]`, `[2:v]scale=-1:40[atak]`,
     `[v0]drawbox=x=40:y=190:w=980:h=112:color=0x020b1c@0.88:t=fill:enable='lt(t,3.2)',drawbox=x=40:y=190:w=6:h=112:color=0x4ea1ff@1:t=fill:enable='lt(t,3.2)'[v1]`,
     `[v1][lqc]overlay=66:229:enable='lt(t,3.2)'[v2]`,
@@ -72,7 +89,7 @@ async function brand(raw, mp4, m, match, brandImg) {
     `[v7]drawtext=fontfile='${fMono}':textfile='${ff(brandTxt)}':fontcolor=white:fontsize=22:x=1724:y=206:enable='lt(t,3.2)'[vout]`,
   ].join(';');
   await run(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-i', raw, '-i', path.join(ASSETS, brandImg), '-i', path.join(ASSETS, 'atak-logo-mark.png'),
-    '-filter_complex', filter, '-map', '[vout]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', mp4]);
+    '-filter_complex', filter, '-map', '[vout]', '-map', '[aout]', ...X264(20), mp4]);
 }
 
 // Vertical 1080×1920 del clip del stream: la acción al centro, fondo desenfocado, tarjeta solo 3 s.
@@ -84,11 +101,13 @@ async function brandVertical(raw, mp4, m, match, brandImg) {
   await fsp.writeFile(metaTxt, `${match.team1} vs ${match.team2} · ${mmss(m.t)} · STREAM`.toUpperCase(), 'utf8');
   await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
   const fOrb = ff(path.join(ASSETS, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS, 'JetBrainsMono-700.ttf'));
+  const fin = await finish(raw);
   const filter = [
-    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,split=2[a][b]`,
+    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,${fin.v},split=2[a][b]`,
+    `[0:a]${fin.a}[aout]`,
     `[a]crop=1080:1080:420:0[sq]`,
     `[b]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:3,eq=brightness=-0.25[bg]`,
-    `[bg][sq]overlay=0:420[v0]`,
+    `[bg][sq]overlay=0:420,setsar=1[v0]`,
     `[1:v]scale=-1:44[lqc]`, `[2:v]scale=-1:52[atak]`,
     `[v0]drawbox=x=0:y=250:w=1080:h=150:color=0x020b1c@0.85:t=fill:enable='lt(t,3.2)',drawbox=x=0:y=250:w=8:h=150:color=0x4ea1ff@1:t=fill:enable='lt(t,3.2)'[v1]`,
     `[v1][lqc]overlay=40:303:enable='lt(t,3.2)'[v2]`,
@@ -99,7 +118,7 @@ async function brandVertical(raw, mp4, m, match, brandImg) {
     `[v6]drawtext=fontfile='${fMono}':textfile='${ff(brandTxt)}':fontcolor=white:fontsize=30:x=500:y=1530[vout]`,
   ].join(';');
   await run(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-i', raw, '-i', path.join(ASSETS, brandImg), '-i', path.join(ASSETS, 'atak-logo-mark.png'),
-    '-filter_complex', filter, '-map', '[vout]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', mp4]);
+    '-filter_complex', filter, '-map', '[vout]', '-map', '[aout]', ...X264(21), mp4]);
 }
 
 

@@ -46,7 +46,7 @@ const OUT = process.env.OUT_DIR || path.join(os.tmpdir(), 'atak-render');
 const ROFL_DIR = process.env.ROFL_DIR || path.join(OUT, 'rofl');
 let DIRECT = !!opt('direct', false);
 const FFMPEG = process.env.FFMPEG || (fs.existsSync(path.join(here, 'bin', 'ffmpeg.exe')) ? path.join(here, 'bin', 'ffmpeg.exe') : 'ffmpeg');
-const FPS = Number(process.env.FPS || 30);
+const FPS = Number(process.env.FPS || 60);
 const WIDTH = Number(process.env.WIDTH || 1920), HEIGHT = Number(process.env.HEIGHT || 1080);
 const REPLAY_API = 'https://127.0.0.1:2999';
 const ASSETS_URL = process.env.AGENT_UPDATE_URL ? `${process.env.AGENT_UPDATE_URL.replace(/\/$/, '')}/assets` : '';
@@ -154,12 +154,28 @@ async function ensureAssets() {
 const ff = (p) => p.replace(/\\/g, '/').replace(/:/g, '\\:');
 const mmss = (sec) => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
 
+// ── Acabado: corrección de color "broadcast" (contraste, saturación, nitidez, viñeta suave), 60 fps
+// y fundidos de entrada/salida. Mismo filtro en el replay y en los clips del stream (vod-clips.mjs).
+const GRADE = 'eq=contrast=1.07:saturation=1.2:gamma=0.97:brightness=0.012,unsharp=5:5:0.5:3:3:0,vignette=angle=PI/7:mode=forward';
+const X264 = (crf) => ['-c:v', 'libx264', '-preset', 'medium', '-crf', String(crf), '-maxrate', '10M', '-bufsize', '20M', '-profile:v', 'high', '-r', String(FPS), '-g', String(FPS * 2), '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
+function mediaDuration(file) {
+  return new Promise((resolve) => execFile(FFMPEG, ['-hide_banner', '-i', file], { windowsHide: true }, (_e, _o, err) => {
+    const m = /Duration:\s*(\d+):(\d+):([\d.]+)/.exec(String(err || '')); resolve(m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0);
+  }));
+}
+async function finishChain(file) {
+  const d = await mediaDuration(file);
+  const fades = d > 2 ? `,fade=t=in:st=0:d=0.25,fade=t=out:st=${(d - 0.35).toFixed(2)}:d=0.35` : '';
+  return `fps=${FPS},${GRADE}${fades}`;
+}
+
 /** Convierte el webm a MP4 1920×1080 con el overlay de la liga (título del momento, serie, ronda, hora). */
 async function encodeClip(webm, mp4, m, match) {
   const hasAssets = await ensureAssets();
   const base = ['-i', webm];
+  const finish = await finishChain(webm);
   if (!hasAssets) {
-    await ffmpeg([...base, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
+    await ffmpeg([...base, '-vf', finish, ...X264(20), '-an', mp4]);
     return;
   }
   const tdir = path.dirname(mp4);
@@ -174,7 +190,7 @@ async function encodeClip(webm, mp4, m, match) {
   await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
   const fOrb = ff(path.join(ASSETS_DIR, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS_DIR, 'JetBrainsMono-700.ttf'));
   const filter = [
-    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c[v0]`,
+    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,${finish}[v0]`,
     `[1:v]scale=-1:40[lqc]`,
     `[2:v]scale=-1:44[atak]`,
     // La tarjeta solo los primeros segundos: después el video queda limpio.
@@ -188,20 +204,21 @@ async function encodeClip(webm, mp4, m, match) {
     `[v7]drawtext=fontfile='${fMono}':textfile='${ff(brandTxt)}':fontcolor=white:fontsize=22:x=1490:y=980:enable='lt(t,3.2)'[vout]`,
   ].join(';');
   await ffmpeg(['-i', webm, '-i', path.join(ASSETS_DIR, brandImg), '-i', path.join(ASSETS_DIR, 'atak-logo-mark.png'),
-    '-filter_complex', filter, '-map', '[vout]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
+    '-filter_complex', filter, '-map', '[vout]', ...X264(20), '-an', mp4]);
 }
 
 // ── Versión vertical 1080×1920 (redes): la acción al centro, fondo desenfocado y tarjeta arriba ──
 async function encodeVertical(webm, mp4, m, match) {
   const tdir = path.dirname(mp4);
+  const finish = await finishChain(webm);
   const titleTxt = path.join(tdir, 'ov-title.txt'), metaTxt = path.join(tdir, 'ov-meta.txt'), brandTxt = path.join(tdir, 'ov-brand.txt');
   const brandImg = match && match.tournamentId === 'lqc-2026' ? 'lqc-wordmark.png' : 'atak-logo-mark.png';
   const fOrb = ff(path.join(ASSETS_DIR, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS_DIR, 'JetBrainsMono-700.ttf'));
   const filter = [
-    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,split=2[a][b]`,
+    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,${finish},split=2[a][b]`,
     `[a]crop=1080:1080:420:0[sq]`,
     `[b]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:3,eq=brightness=-0.25[bg]`,
-    `[bg][sq]overlay=0:420[v0]`,
+    `[bg][sq]overlay=0:420,setsar=1[v0]`,
     `[1:v]scale=-1:44[lqc]`, `[2:v]scale=-1:52[atak]`,
     `[v0]drawbox=x=0:y=250:w=1080:h=150:color=0x020b1c@0.85:t=fill:enable='lt(t,3.2)',drawbox=x=0:y=250:w=8:h=150:color=0x4ea1ff@1:t=fill:enable='lt(t,3.2)'[v1]`,
     `[v1][lqc]overlay=40:303:enable='lt(t,3.2)'[v2]`,
@@ -216,7 +233,7 @@ async function encodeVertical(webm, mp4, m, match) {
   if (!fs.existsSync(metaTxt)) await fsp.writeFile(metaTxt, (match ? `${match.team1} vs ${match.team2} · ${mmss(m.t)}` : mmss(m.t)).toUpperCase(), 'utf8');
   if (!fs.existsSync(brandTxt)) await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
   await ffmpeg(['-i', webm, '-i', path.join(ASSETS_DIR, brandImg), '-i', path.join(ASSETS_DIR, 'atak-logo-mark.png'),
-    '-filter_complex', filter, '-map', '[vout]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4]);
+    '-filter_complex', filter, '-map', '[vout]', ...X264(21), '-an', mp4]);
 }
 
 // ── ffmpeg ───────────────────────────────────────────────────────────────────
@@ -287,6 +304,23 @@ function launchDirect(rofl) {
   });
 }
 
+// ── Varias versiones del juego (un replay solo abre con el parche con el que se jugó) ──
+// En el disco JUEGO: "Game" = versión activa y "Game-<major.minor>" = las anteriores, cada una
+// con atak-version.txt (lo escribe vm/actualizar-juego.ps1). Antes de abrir un replay se
+// intercambian por nombre (instantáneo, mismo disco) para dejar activa la del parche del replay.
+const gameVersionOf = (dir) => { try { return fs.readFileSync(path.join(dir, 'atak-version.txt'), 'utf8').trim(); } catch { return ''; } };
+function useGameFor(patch) {
+  const want = String(patch || '').split('.').slice(0, 2).join('.');
+  const cur = path.join(LOL_DIR, 'Game');
+  const have = gameVersionOf(cur);
+  if (!want || !have || have === want) return;
+  const alt = path.join(LOL_DIR, `Game-${want}`);
+  if (!fs.existsSync(alt)) throw new Error(`replay del parche ${want} y el juego de la VM es ${have} (no hay Game-${want})`);
+  fs.renameSync(cur, path.join(LOL_DIR, `Game-${have}`));
+  fs.renameSync(alt, cur);
+  log(`Juego cambiado a la versión ${want} (la ${have} queda en Game-${have})`);
+}
+
 // Cola del último r3dlog del juego (diagnóstico cuando no arranca o no responde la Replay API).
 function dumpGameLog(n = 40) {
   try {
@@ -312,6 +346,69 @@ function cameraFor(pos) {
   return { x: Number(pos.x) || 7400, y: 1900, z: (Number(pos.y) || 7400) - 1300 };
 }
 
+// ── Director (estilo League Director, con la Replay API) ────────────────────
+// En vez de una cámara fija sobre el punto del momento, cada clip es una toma dirigida:
+//   · la cámara libre sigue la pelea pasando por la posición de cada baja (timeline de Riot)
+//     con curvas suaves (smoothStep), anticipándose un poco a la acción;
+//   · el zoom (campo de visión) abre al principio y cierra hacia el clímax;
+//   · cámara lenta (0.35×) en el remate de multikills, aces, primera sangre y objetivos;
+//   · interfaz limpia de transmisión: sin controles del replay, sin línea de tiempo ni chat.
+// La geometría base (rotación y FOV de la cámara del juego) se calibra al abrir cada replay.
+const DIRECTOR_UI = { fogOfWar: false, interfaceAll: true, interfaceReplay: false, interfaceTimeline: false, interfaceChat: false, interfaceScore: true, interfaceScoreboard: true, interfaceKillCallouts: true, interfaceAnnounce: true, interfaceMinimap: true, interfaceFrames: true, interfaceTarget: false, outlineSelect: false, outlineHover: false, healthBarChampions: true, floatingText: true };
+const CAM_OFFSET = { x: 0, y: 1900, z: -1300 };   // como cameraFor: al sur del punto y a ~1900 de altura
+let camBase = null;                                // { rotation, fov } leídos del juego
+async function calibrateCamera() {
+  camBase = null;
+  try {
+    await replay('POST', '/replay/render', { ...DIRECTOR_UI, cameraMode: 'top', cameraPosition: { x: 7400 + CAM_OFFSET.x, y: CAM_OFFSET.y, z: 7400 + CAM_OFFSET.z } });
+    await sleep(800);
+    const d = (await replay('GET', '/replay/render')).data || {};
+    const rot = d.cameraRotation;
+    // Sanidad: la cámara del juego mira hacia abajo (~55°); una rotación nula indica que el modo no la expone.
+    if (rot && [rot.x, rot.y, rot.z].every(Number.isFinite) && [rot.x, rot.y, rot.z].some((v) => Math.abs(v) > 1)) camBase = { rotation: rot, fov: Number(d.fieldOfView) || 45 };
+    log(`  director: cámara base ${JSON.stringify(camBase)} (pos ${JSON.stringify(d.cameraPosition || null)})`);
+  } catch (e) { log(`  director: sin calibración (${e.message})`); }
+}
+const camAt = (p) => ({ x: p.x + CAM_OFFSET.x, y: CAM_OFFSET.y, z: p.y + CAM_OFFSET.z });
+const CLIMAX_KINDS = /^(multikill|ace|baron|dragon|elder|riftherald|horde|first_blood|fb)/;
+/** Keyframes de la toma para un momento. kills: [{t, pos:{x,y}}] de la ventana (timeline). */
+function directorShot(m, kills) {
+  const t0 = m.tStart, t1 = m.tEnd;
+  const pts = kills.filter((k) => k.pos && k.t >= t0 - 3 && k.t <= t1 + 1).map((k) => ({ t: k.t, x: k.pos.x, y: k.pos.y })).sort((a, b) => a.t - b.t);
+  const anchor = m.pos ? { x: Number(m.pos.x), y: Number(m.pos.y) } : (pts[0] || { x: 7400, y: 7400 });
+  // Trayectoria: cada baja suavizada con sus vecinas (sin saltos bruscos entre bajas lejanas).
+  const path0 = pts.length ? pts : [{ t: m.t, ...anchor }];
+  const smooth = path0.map((p, i) => { const a = path0[Math.max(0, i - 1)], b = path0[Math.min(path0.length - 1, i + 1)]; return { t: p.t, x: (a.x + 2 * p.x + b.x) / 4, y: (a.y + 2 * p.y + b.y) / 4 }; });
+  const keys = [{ t: t0, x: smooth[0].x, y: smooth[0].y }];
+  // La cámara llega ~0.8 s ANTES de cada baja (se anticipa, como un observador).
+  for (const p of smooth) { const tt = Math.max(t0 + 0.5, p.t - 0.8); if (tt < t1 - 0.3 && tt > keys[keys.length - 1].t + 0.6) keys.push({ ...p, t: tt }); }
+  const last = smooth[smooth.length - 1];
+  keys.push({ t: t1, x: last.x, y: last.y });
+  // Clímax = última baja (o el instante del momento en objetivos sin bajas).
+  const climax = pts.length ? pts[pts.length - 1].t : m.t;
+  const fov = camBase.fov;
+  const seq = {
+    cameraPosition: keys.map((k) => ({ time: k.t, value: camAt(k), blend: 'smoothStep' })),
+    cameraRotation: [{ time: t0, value: camBase.rotation, blend: 'linear' }, { time: t1, value: camBase.rotation, blend: 'linear' }],
+    fieldOfView: [
+      { time: t0, value: fov * 1.12, blend: 'smoothStep' },
+      { time: Math.max(t0 + 1, climax - 0.6), value: fov * 0.86, blend: 'smoothStep' },
+      { time: Math.min(t1 - 0.2, climax + 1.6), value: fov * 0.82, blend: 'smoothStep' },
+      { time: t1, value: fov * 0.92, blend: 'smoothStep' },
+    ].sort((a, b) => a.time - b.time),
+  };
+  if (CLIMAX_KINDS.test(String(m.kind || '')) && climax > t0 + 1.2 && climax < t1 - 1.3) {
+    seq.playbackSpeed = [
+      { time: t0, value: 1, blend: 'snap' },
+      { time: climax - 0.9, value: 1, blend: 'smoothStep' },
+      { time: climax - 0.35, value: 0.35, blend: 'linear' },
+      { time: climax + 0.7, value: 0.35, blend: 'smoothStep' },
+      { time: climax + 1.2, value: 1, blend: 'snap' },
+    ];
+  }
+  return seq;
+}
+
 // ── Render de UNA partida ───────────────────────────────────────────────────
 async function renderGame(gameId) {
   log(`== ${REGION}-${gameId} ==`);
@@ -322,12 +419,20 @@ async function renderGame(gameId) {
   const haveV = new Set(allKeys.filter((k) => k.startsWith('v-')).map((k) => k.slice(2)));
   const wantV = cfgNow.vertical !== false;
   const want = Number(cfgNow.top) || TOP;
-  const todo = (info.top || []).slice(0, want).filter((m) => !have.has(m.key) || (wantV && !haveV.has(m.key))).map((m) => ({ ...m, onlyVertical: have.has(m.key) })).sort((a, b) => a.t - b.t);
+  // Momentos distintos: si dos ventanas se pisan más del 60 % (p. ej. pentakill, cuádruple y ACE del
+  // mismo instante) solo se graba el de mayor puntuación.
+  const pick = [];
+  for (const m of [...(info.moments || info.top || [])].sort((a, b) => b.score - a.score)) {
+    if (pick.some((p) => Math.min(p.tEnd, m.tEnd) - Math.max(p.tStart, m.tStart) > 0.6 * Math.min(p.tEnd - p.tStart, m.tEnd - m.tStart))) continue;
+    pick.push(m); if (pick.length >= want) break;
+  }
+  const todo = pick.filter((m) => !have.has(m.key) || (wantV && !haveV.has(m.key))).map((m) => ({ ...m, onlyVertical: have.has(m.key) })).sort((a, b) => a.t - b.t);
   if (!todo.length) { log('Sin momentos nuevos que grabar'); return 0; }
   log(`${todo.length} clips por grabar:`, todo.map((m) => `${m.key}`).join(' '));
 
   ensureReplayApi();
   if (!(await waitPortFree())) throw new Error('el puerto 2999 siguió ocupado (partida en curso) demasiado tiempo');
+  if (DIRECT && !(await port2999Busy())) useGameFor(info.patch);
 
   const alreadyOpen = await port2999Busy();
   if (alreadyOpen) {
@@ -362,6 +467,8 @@ async function renderGame(gameId) {
   }
   if (!ready) { dumpGameLog(); throw new Error(`la Replay API no respondió (última respuesta: ${lastApi}) — ¿EnableReplayApi=1 en Config\game.cfg?`); }
   await sleep(4000);
+  const director = cfgNow.director !== false;
+  if (director) await calibrateCamera();
 
   await fsp.mkdir(OUT, { recursive: true });
   let done = 0;
@@ -370,16 +477,33 @@ async function renderGame(gameId) {
       const base = path.join(OUT, `${REGION}-${gameId}-${m.key}`);
       const webm = `${base}.webm`, mp4 = `${base}.mp4`;
       log(`▶ ${m.title} (${m.tStart}s–${m.tEnd}s)`);
-      // Interfaz de espectador visible, niebla de guerra desactivada, cámara en el punto.
       const cam = cameraFor(m.pos);
-      await replay('POST', '/replay/render', { fogOfWar: false, interfaceAll: true, interfaceReplay: false, interfaceTimeline: false, cameraMode: 'top', ...(cam ? { cameraPosition: cam } : {}) });
-      await replay('POST', '/replay/playback', { time: Math.max(0, m.tStart - 2), paused: true, speed: 1 });
-      await sleep(2500);
-      if (cam) await replay('POST', '/replay/render', { cameraPosition: cam });
+      let shot = null;
+      if (director && camBase) {
+        let kills = [];
+        try { kills = (await atak(`/api/replays/${REGION}/${gameId}/fight?start=${Math.max(0, m.tStart - 3)}&end=${m.tEnd + 1}`)).kills || []; }
+        catch (e) { log(`  director: sin bajas de la pelea (${e.message}); sigo con el punto del momento`); }
+        shot = directorShot(m, kills);
+        // Toma dirigida: cámara libre ('fps') animada por la secuencia.
+        await replay('POST', '/replay/render', { ...DIRECTOR_UI, cameraMode: 'fps', cameraAttached: false, cameraPosition: shot.cameraPosition[0].value, cameraRotation: camBase.rotation, fieldOfView: shot.fieldOfView[0].value });
+        await replay('POST', '/replay/playback', { time: Math.max(0, m.tStart - 2), paused: true, speed: 1 });
+        const sq = await replay('POST', '/replay/sequence', shot);
+        if (sq.status >= 400) { log(`  director: la secuencia no entró (${sq.status} ${JSON.stringify(sq.data).slice(0, 160)}); toma simple`); shot = null; }
+        else log(`  director: ${shot.cameraPosition.length} puntos de cámara${shot.playbackSpeed ? ' + cámara lenta' : ''}`);
+        await sleep(2500);
+      }
+      if (!shot) {
+        // Toma simple: interfaz de espectador, niebla desactivada, cámara fija en el punto.
+        await replay('POST', '/replay/render', { ...DIRECTOR_UI, cameraMode: 'top', ...(cam ? { cameraPosition: cam } : {}) });
+        await replay('POST', '/replay/playback', { time: Math.max(0, m.tStart - 2), paused: true, speed: 1 });
+        await sleep(2500);
+        if (cam) await replay('POST', '/replay/render', { cameraPosition: cam });
+      }
       await replay('POST', '/replay/recording', { recording: true, path: webm, codec: 'webm', startTime: m.tStart, endTime: m.tEnd, width: WIDTH, height: HEIGHT, framesPerSecond: FPS, enforceFrameRate: true, replaySpeed: 1 });
-      // Espera a que termine (duración del clip + margen).
-      const maxWait = (m.tEnd - m.tStart + 25) * 1000; const t0 = Date.now();
+      // Espera a que termine (a 60 fps fijos el juego puede ir más lento que el tiempo real; la cámara lenta suma).
+      const maxWait = ((m.tEnd - m.tStart) * 4 + 60) * 1000; const t0 = Date.now();
       while (Date.now() - t0 < maxWait) { await sleep(1500); const r = await replay('GET', '/replay/recording'); if (r.data && r.data.recording === false) break; }
+      if (shot) { try { await replay('POST', '/replay/sequence', {}); } catch { /* */ } }
       if (!fs.existsSync(webm)) { log('  ✗ no se generó el archivo', webm); continue; }
       if (!m.onlyVertical) {
         await encodeClip(webm, mp4, m, info.match);
@@ -415,12 +539,12 @@ async function pendingGames(tournamentId, want = TOP) {
   const count = new Map(), vcount = new Map();
   for (const c of clips) {
     const key = String(c.key); const k = `${c.region}:${c.gameId}`;
-    if (key.startsWith('vod-')) continue;
+    if (key.startsWith('vod-') || key.startsWith('vv-')) continue;
     if (key.startsWith('v-')) vcount.set(k, (vcount.get(k) || 0) + 1); else count.set(k, (count.get(k) || 0) + 1);
   }
   // Pendiente = partida con replay y menos clips de los que se quieren, o con verticales por hacer.
   const wantV = readConfig().vertical !== false;
-  return replays.filter((r) => { const k = `${r.region}:${r.gameId}`; const h = count.get(k) || 0; return r.region === REGION && (h < want || (wantV && (vcount.get(k) || 0) < Math.min(h, want))); }).map((r) => r.gameId);
+  return replays.filter((r) => { const k = `${r.region}:${r.gameId}`; const h = count.get(k) || 0; return r.region === REGION && (h < want || (wantV && (vcount.get(k) || 0) < Math.min(h, want))); }).sort((a, b) => Number(b.gameId) - Number(a.gameId)).map((r) => r.gameId); // lo más reciente primero
 }
 
 
