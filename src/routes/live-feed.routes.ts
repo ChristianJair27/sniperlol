@@ -122,19 +122,19 @@ function sanitizeSnapshot(body: any) {
 }
 
 // ── Plantillas de torneos activos (para reconocer una partida por sus jugadores) ──
-type RosterIndex = { tournamentId: string; tournamentName: string; byId: Map<string, string>; byName: Map<string, string>; bracket: any[] };
+type RosterIndex = { tournamentId: string; tournamentName: string; byId: Map<string, string>; byName: Map<string, string>; logos: Map<string, string>; bracket: any[] };
 let rosterCache: { at: number; list: RosterIndex[] } = { at: 0, list: [] };
 async function rosters(): Promise<RosterIndex[]> {
   if (Date.now() - rosterCache.at < 60_000) return rosterCache.list;
   const [ts] = await pool.query<any[]>("SELECT id, name, bracket FROM tournaments WHERE phase IN ('active') AND name NOT REGEXP 'prueba|test|demo'");
   const list: RosterIndex[] = [];
   for (const t of ts) {
-    const [regs] = await pool.query<any[]>('SELECT team_name, captain_riot_id, players FROM tournament_registrations WHERE tournament_id = ?', [t.id]);
-    const byId = new Map<string, string>(), byName = new Map<string, string>();
+    const [regs] = await pool.query<any[]>('SELECT team_name, captain_riot_id, players, logo_url FROM tournament_registrations WHERE tournament_id = ?', [t.id]);
+    const byId = new Map<string, string>(), byName = new Map<string, string>(), logos = new Map<string, string>();
     const add = (riotId: any, team: string) => { const r = String(riotId || '').trim().toLowerCase(); if (!r) return; byId.set(r, team); byName.set(r.split('#')[0], team); };
-    for (const r of regs) { add(r.captain_riot_id, r.team_name); let ps: any[] = []; try { ps = typeof r.players === 'string' ? JSON.parse(r.players) : (r.players || []); } catch { ps = []; } for (const p of ps) add(p?.riotId, r.team_name); }
+    for (const r of regs) { if (r.logo_url) logos.set(r.team_name, String(r.logo_url)); add(r.captain_riot_id, r.team_name); let ps: any[] = []; try { ps = typeof r.players === 'string' ? JSON.parse(r.players) : (r.players || []); } catch { ps = []; } for (const p of ps) add(p?.riotId, r.team_name); }
     let bracket: any[] = []; try { bracket = typeof t.bracket === 'string' ? JSON.parse(t.bracket) : (t.bracket || []); } catch { bracket = []; }
-    list.push({ tournamentId: String(t.id), tournamentName: String(t.name), byId, byName, bracket: Array.isArray(bracket) ? bracket : [] });
+    list.push({ tournamentId: String(t.id), tournamentName: String(t.name), byId, byName, logos, bracket: Array.isArray(bracket) ? bracket : [] });
   }
   rosterCache = { at: Date.now(), list };
   return list;
@@ -142,26 +142,6 @@ async function rosters(): Promise<RosterIndex[]> {
 /** ¿A qué torneo y equipos pertenece esta partida? Cada lado debe ser un equipo registrado
  *  (≥ 3 jugadores de la misma plantilla por lado, equipos distintos). Un equipo del torneo
  *  jugando flex/normales contra desconocidos NO cuenta: antes eso se publicaba en el tablero. */
-// Logo de un equipo reconocido por plantilla: los PNG de /lqc-obs/logos/<slug>.png del sitio
-// (los mismos de las pantallas de OBS). Se comprueba que exista (el sitio devuelve index.html
-// para lo que no existe) y se cachea; así las pantallas ya abiertas en OBS lo toman sin recargar.
-const SITE_URL = (process.env.SITE_URL || 'https://atakgg.revolution505.com').replace(/\/$/, '');
-const logoCache = new Map<string, { url: string; at: number }>();
-async function teamLogoUrl(team: string): Promise<string> {
-  const slug = slugify(team); // definida más abajo (solo se llama en tiempo de petición)
-  if (!slug) return '';
-  const hit = logoCache.get(slug);
-  if (hit && Date.now() - hit.at < (hit.url ? 6 * 3600_000 : 5 * 60_000)) return hit.url;
-  let url = '';
-  try {
-    const u = `${SITE_URL}/lqc-obs/logos/${slug}.png`;
-    const r = await fetch(u, { method: 'HEAD', signal: AbortSignal.timeout(3000) });
-    if (r.ok && String(r.headers.get('content-type') || '').startsWith('image/')) url = u;
-  } catch { /* sin red: sin logo */ }
-  logoCache.set(slug, { url, at: Date.now() });
-  return url;
-}
-
 async function matchTournament(snapshot: any) {
   if (snapshot?.isCustom === false) return null;
   const players: any[] = snapshot.players || [];
@@ -184,7 +164,10 @@ async function matchTournament(snapshot: any) {
   const played = m ? (m.games || []).length : 0;
   const bo = m ? (Number(m.bestOf) || Number(m.bo) || (Number(m.score1) + Number(m.score2) >= 2 ? 3 : 3)) : 3;
   const matchLabel = m ? `${best.idx.tournamentName.toUpperCase()} / RONDA ${m.round} / JUEGO ${played + 1} DE ${bo}` : best.idx.tournamentName.toUpperCase();
-  return { channel: best.idx.tournamentId, team1, team2, matchLabel, matched: best.n };
+  // Logo de la inscripción (tournament_registrations.logo_url): así las pantallas ya abiertas
+  // en OBS (champ select, overlay) lo toman del feed sin recargar.
+  const logo1 = best.idx.logos.get(team1) || '', logo2 = best.idx.logos.get(team2) || '';
+  return { channel: best.idx.tournamentId, team1, team2, matchLabel, matched: best.n, logo1, logo2 };
 }
 
 // ── POST /api/live-feed/auto/push (companion de un JUGADOR de torneo; sin token) ──
@@ -198,7 +181,7 @@ router.post('/auto/push', async (req, res) => {
     const hit = await matchTournament(snap);
     if (!hit) return res.json({ ok: false, reason: 'not_tournament' });
     snap.team1 = hit.team1; snap.team2 = hit.team2; snap.matchLabel = hit.matchLabel;
-    [snap.logo1, snap.logo2] = await Promise.all([teamLogoUrl(hit.team1), teamLogoUrl(hit.team2)]);
+    snap.logo1 = hit.logo1; snap.logo2 = hit.logo2;
     const [result] = await pool.query<any>(
       `INSERT INTO live_feed_channels (channel, seq, at, snapshot)
        VALUES (?, LAST_INSERT_ID(1), ?, ?)
@@ -234,7 +217,7 @@ router.post('/:channel/push', async (req, res) => {
       const hit = await matchTournament(snap);
       if (hit && hit.channel === channel) {
         snap.team1 = hit.team1; snap.team2 = hit.team2; snap.matchLabel = hit.matchLabel;
-        [snap.logo1, snap.logo2] = await Promise.all([teamLogoUrl(hit.team1), teamLogoUrl(hit.team2)]);
+        snap.logo1 = hit.logo1; snap.logo2 = hit.logo2;
       }
     } catch { /* sin plantillas: se respeta lo configurado */ }
     // Si un JUGADOR de la partida está mandando el feed (eventos completos), el del
@@ -407,8 +390,7 @@ router.post('/:channel/champselect', async (req, res) => {
         if (hit && hit.channel === channel) {
           cs.team1 = hit.team1; cs.team2 = hit.team2; cs.matchLabel = hit.matchLabel;
           // Los logos que puso el caster pueden ser de la serie anterior: mandan los del equipo reconocido.
-          const [l1, l2] = await Promise.all([teamLogoUrl(hit.team1), teamLogoUrl(hit.team2)]);
-          cs.logo1 = l1 || ''; cs.logo2 = l2 || '';
+          cs.logo1 = hit.logo1; cs.logo2 = hit.logo2;
         }
       } catch { /* sin plantillas */ }
     }
