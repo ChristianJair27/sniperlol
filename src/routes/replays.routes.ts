@@ -336,7 +336,7 @@ async function computeFight(region: string, gameId: number, start: number, end: 
     for (const aid of ev.assistingParticipantIds || []) { const a = parts.get(Number(aid)); if (a) a.assists++; }
     // Daño exacto que recibió la víctima, por atacante → "daño en bajas"
     for (const d of ev.victimDamageReceived || []) { const a = parts.get(Number(d.participantId)); if (a && v && a.team !== v.team) a.killDamage += (d.physicalDamage || 0) + (d.magicDamage || 0) + (d.trueDamage || 0); }
-    kills.push({ t: Math.round(ev.timestamp / 1000), killer: k ? { name: k.name, champion: k.champion, team: k.team } : null, victim: v ? { name: v.name, champion: v.champion, team: v.team } : null, assists: (ev.assistingParticipantIds || []).map((x: any) => parts.get(Number(x))?.champion).filter(Boolean), bounty: ev.bounty || 0, shutdown: ev.shutdownBounty || 0 });
+    kills.push({ t: Math.round(ev.timestamp / 1000), killer: k ? { name: k.name, champion: k.champion, team: k.team } : null, victim: v ? { name: v.name, champion: v.champion, team: v.team } : null, assists: (ev.assistingParticipantIds || []).map((x: any) => parts.get(Number(x))?.champion).filter(Boolean), bounty: ev.bounty || 0, shutdown: ev.shutdownBounty || 0, ...(ev.position && Number.isFinite(ev.position.x) ? { pos: { x: Number(ev.position.x), y: Number(ev.position.y) } } : {}) });
   }
   const players = [...parts.values()];
   const team = (t: 'blue' | 'red') => { const ps = players.filter((p) => p.team === t); return { kills: ps.reduce((s, p) => s + p.kills, 0), deaths: ps.reduce((s, p) => s + p.deaths, 0), damage: ps.reduce((s, p) => s + p.damage, 0), damageTaken: ps.reduce((s, p) => s + p.damageTaken, 0), gold: ps.reduce((s, p) => s + p.gold, 0) }; };
