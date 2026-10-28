@@ -142,6 +142,26 @@ async function rosters(): Promise<RosterIndex[]> {
 /** ¿A qué torneo y equipos pertenece esta partida? Cada lado debe ser un equipo registrado
  *  (≥ 3 jugadores de la misma plantilla por lado, equipos distintos). Un equipo del torneo
  *  jugando flex/normales contra desconocidos NO cuenta: antes eso se publicaba en el tablero. */
+// Logo de un equipo reconocido por plantilla: los PNG de /lqc-obs/logos/<slug>.png del sitio
+// (los mismos de las pantallas de OBS). Se comprueba que exista (el sitio devuelve index.html
+// para lo que no existe) y se cachea; así las pantallas ya abiertas en OBS lo toman sin recargar.
+const SITE_URL = (process.env.SITE_URL || 'https://atakgg.revolution505.com').replace(/\/$/, '');
+const logoCache = new Map<string, { url: string; at: number }>();
+async function teamLogoUrl(team: string): Promise<string> {
+  const slug = slugify(team); // definida más abajo (solo se llama en tiempo de petición)
+  if (!slug) return '';
+  const hit = logoCache.get(slug);
+  if (hit && Date.now() - hit.at < (hit.url ? 6 * 3600_000 : 5 * 60_000)) return hit.url;
+  let url = '';
+  try {
+    const u = `${SITE_URL}/lqc-obs/logos/${slug}.png`;
+    const r = await fetch(u, { method: 'HEAD', signal: AbortSignal.timeout(3000) });
+    if (r.ok && String(r.headers.get('content-type') || '').startsWith('image/')) url = u;
+  } catch { /* sin red: sin logo */ }
+  logoCache.set(slug, { url, at: Date.now() });
+  return url;
+}
+
 async function matchTournament(snapshot: any) {
   if (snapshot?.isCustom === false) return null;
   const players: any[] = snapshot.players || [];
@@ -178,6 +198,7 @@ router.post('/auto/push', async (req, res) => {
     const hit = await matchTournament(snap);
     if (!hit) return res.json({ ok: false, reason: 'not_tournament' });
     snap.team1 = hit.team1; snap.team2 = hit.team2; snap.matchLabel = hit.matchLabel;
+    [snap.logo1, snap.logo2] = await Promise.all([teamLogoUrl(hit.team1), teamLogoUrl(hit.team2)]);
     const [result] = await pool.query<any>(
       `INSERT INTO live_feed_channels (channel, seq, at, snapshot)
        VALUES (?, LAST_INSERT_ID(1), ?, ?)
@@ -211,7 +232,10 @@ router.post('/:channel/push', async (req, res) => {
     // torneo de este canal, se ignora lo que el caster escribió (suele quedar la serie anterior).
     try {
       const hit = await matchTournament(snap);
-      if (hit && hit.channel === channel) { snap.team1 = hit.team1; snap.team2 = hit.team2; snap.matchLabel = hit.matchLabel; snap.logo1 = ''; snap.logo2 = ''; }
+      if (hit && hit.channel === channel) {
+        snap.team1 = hit.team1; snap.team2 = hit.team2; snap.matchLabel = hit.matchLabel;
+        [snap.logo1, snap.logo2] = await Promise.all([teamLogoUrl(hit.team1), teamLogoUrl(hit.team2)]);
+      }
     } catch { /* sin plantillas: se respeta lo configurado */ }
     // Si un JUGADOR de la partida está mandando el feed (eventos completos), el del
     // espectador no lo pisa mientras esté fresco.
@@ -380,7 +404,12 @@ router.post('/:channel/champselect', async (req, res) => {
       try {
         const players = [...cs.blue.map((c: any) => ({ riotId: `${c.summonerName}#${c.tagLine}`, team: 'ORDER' })), ...cs.red.map((c: any) => ({ riotId: `${c.summonerName}#${c.tagLine}`, team: 'CHAOS' }))];
         const hit = await matchTournament({ players });
-        if (hit && hit.channel === channel) { cs.team1 = hit.team1; cs.team2 = hit.team2; cs.matchLabel = hit.matchLabel; }
+        if (hit && hit.channel === channel) {
+          cs.team1 = hit.team1; cs.team2 = hit.team2; cs.matchLabel = hit.matchLabel;
+          // Los logos que puso el caster pueden ser de la serie anterior: mandan los del equipo reconocido.
+          const [l1, l2] = await Promise.all([teamLogoUrl(hit.team1), teamLogoUrl(hit.team2)]);
+          cs.logo1 = l1 || ''; cs.logo2 = l2 || '';
+        }
       } catch { /* sin plantillas */ }
     }
     await pool.query(
