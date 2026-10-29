@@ -169,7 +169,7 @@ const GRADE = [
   'vignette=angle=PI/6:mode=forward',
   'noise=alls=3:allf=t',
 ].join(',');
-const X264 = (crf) => ['-c:v', 'libx264', '-preset', 'medium', '-crf', String(crf), '-maxrate', '10M', '-bufsize', '20M', '-profile:v', 'high', '-r', String(FPS), '-g', String(FPS * 2), '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
+const X264 = (crf) => ['-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-maxrate', '10M', '-bufsize', '20M', '-profile:v', 'high', '-r', String(FPS), '-g', String(FPS * 2), '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
 function mediaDuration(file) {
   return new Promise((resolve) => execFile(FFMPEG, ['-hide_banner', '-i', file], { windowsHide: true }, (_e, _o, err) => {
     const m = /Duration:\s*(\d+):(\d+):([\d.]+)/.exec(String(err || '')); resolve(m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0);
@@ -202,7 +202,7 @@ async function encodeClip(webm, mp4, m, match) {
   await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
   const fOrb = ff(path.join(ASSETS_DIR, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS_DIR, 'JetBrainsMono-700.ttf'));
   const filter = [
-    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,${finish}[v0]`,
+    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,${finish}[v0]`,
     `[1:v]scale=-1:40[lqc]`,
     `[2:v]scale=-1:44[atak]`,
     // La tarjeta solo los primeros segundos: después el video queda limpio.
@@ -227,7 +227,7 @@ async function encodeVertical(webm, mp4, m, match) {
   const brandImg = match && match.tournamentId === 'lqc-2026' ? 'lqc-wordmark.png' : 'atak-logo-mark.png';
   const fOrb = ff(path.join(ASSETS_DIR, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS_DIR, 'JetBrainsMono-700.ttf'));
   const filter = [
-    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x020b1c,${finish},split=2[a][b]`,
+    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,${finish},split=2[a][b]`,
     `[a]crop=1080:1080:420:0[sq]`,
     `[b]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:3,eq=brightness=-0.25[bg]`,
     `[bg][sq]overlay=0:420,setsar=1[v0]`,
@@ -508,7 +508,8 @@ async function renderGame(gameId) {
   await fsp.mkdir(OUT, { recursive: true });
   let done = 0;
   try {
-    for (const m of todo) {
+    for (const m0 of todo) {
+      let m = m0;
       const base = path.join(OUT, `${REGION}-${gameId}-${m.key}`);
       const webm = `${base}.webm`, mp4 = `${base}.mp4`;
       log(`▶ ${m.title} (${m.tStart}s–${m.tEnd}s)`);
@@ -518,6 +519,13 @@ async function renderGame(gameId) {
         let kills = [];
         try { kills = (await atak(`/api/replays/${REGION}/${gameId}/fight?start=${Math.max(0, m.tStart - 3)}&end=${m.tEnd + 1}`)).kills || []; }
         catch (e) { log(`  director: sin bajas de la pelea (${e.message}); sigo con el punto del momento`); }
+        // Toma ajustada a la acción: entra ~6 s antes de la primera baja y corta ~4 s después de la
+        // última (la ventana del momento puede seguir con el mapa vacío cuando la pelea ya acabó).
+        const kt = kills.filter((k) => k.pos && k.t >= m.tStart - 3 && k.t <= m.tEnd + 1).map((k) => k.t);
+        if (kt.length) {
+          const s0 = Math.max(m.tStart, Math.floor(Math.min(...kt) - 6)), s1 = Math.min(m.tEnd, Math.ceil(Math.max(...kt) + 4));
+          if (s1 - s0 >= 8 && (s0 > m.tStart || s1 < m.tEnd)) { m = { ...m, tStart: s0, tEnd: s1 }; log(`  director: toma ajustada a ${s0}s–${s1}s`); }
+        }
         shot = directorShot(m, kills);
         // Toma dirigida: cámara libre ('fps') animada por la secuencia.
         await replay('POST', '/replay/render', { ...DIRECTOR_UI, ...(DOF_ON ? DOF(CAM_DIST, 6) : { depthOfFieldEnabled: false }), cameraMode: 'fps', cameraAttached: false, cameraPosition: shot.cameraPosition[0].value, cameraRotation: camBase.rotation, fieldOfView: shot.fieldOfView[0].value });
