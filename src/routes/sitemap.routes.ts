@@ -11,7 +11,7 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 let cache: { at: number; xml: string } | null = null;
 
 const STATIC: Array<[string, string, string]> = [
-  ['/', 'daily', '1.0'], ['/tournaments', 'daily', '0.9'], ['/crear-torneo', 'monthly', '0.8'],
+  ['/', 'daily', '1.0'], ['/tournaments', 'daily', '0.9'],
   ['/stats', 'weekly', '0.8'], ['/meta', 'daily', '0.7'], ['/social', 'daily', '0.6'], ['/companion', 'monthly', '0.8'],
 ];
 
