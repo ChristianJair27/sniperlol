@@ -169,6 +169,9 @@ const GRADE = [
   'vignette=angle=PI/6:mode=forward',
   'noise=alls=3:allf=t',
 ].join(',');
+// El juego del espectador dibuja "FPS: n  0 ms" arriba a la derecha y no se apaga por la Replay API:
+// se tapa ese rincón con un parche desenfocado de sí mismo (relativo al tamaño de la grabación).
+const HIDE_FPS = 'split=2[hf0][hf1];[hf1]crop=160:26:iw-160:0,boxblur=6:3[hfb];[hf0][hfb]overlay=W-w:0';
 const X264 = (crf) => ['-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-maxrate', '10M', '-bufsize', '20M', '-profile:v', 'high', '-r', String(FPS), '-g', String(FPS * 2), '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
 function mediaDuration(file) {
   return new Promise((resolve) => execFile(FFMPEG, ['-hide_banner', '-i', file], { windowsHide: true }, (_e, _o, err) => {
@@ -187,7 +190,7 @@ async function encodeClip(webm, mp4, m, match) {
   const base = ['-i', webm];
   const finish = await finishChain(webm);
   if (!hasAssets) {
-    await ffmpeg([...base, '-vf', finish, ...X264(20), '-an', mp4]);
+    await ffmpeg([...base, '-vf', `${HIDE_FPS},${finish}`, ...X264(20), '-an', mp4]);
     return;
   }
   const tdir = path.dirname(mp4);
@@ -202,7 +205,7 @@ async function encodeClip(webm, mp4, m, match) {
   await fsp.writeFile(brandTxt, 'ATAK.GG', 'utf8');
   const fOrb = ff(path.join(ASSETS_DIR, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS_DIR, 'JetBrainsMono-700.ttf'));
   const filter = [
-    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,${finish}[v0]`,
+    `[0:v]${HIDE_FPS},scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,${finish}[v0]`,
     `[1:v]scale=-1:40[lqc]`,
     `[2:v]scale=-1:44[atak]`,
     // La tarjeta solo los primeros segundos: después el video queda limpio.
@@ -227,7 +230,7 @@ async function encodeVertical(webm, mp4, m, match) {
   const brandImg = match && match.tournamentId === 'lqc-2026' ? 'lqc-wordmark.png' : 'atak-logo-mark.png';
   const fOrb = ff(path.join(ASSETS_DIR, 'Orbitron-900.ttf')), fMono = ff(path.join(ASSETS_DIR, 'JetBrainsMono-700.ttf'));
   const filter = [
-    `[0:v]scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,${finish},split=2[a][b]`,
+    `[0:v]${HIDE_FPS},scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,${finish},split=2[a][b]`,
     `[a]crop=1080:1080:420:0[sq]`,
     `[b]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:3,eq=brightness=-0.25[bg]`,
     `[bg][sq]overlay=0:420,setsar=1[v0]`,
