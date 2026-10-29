@@ -154,9 +154,21 @@ async function ensureAssets() {
 const ff = (p) => p.replace(/\\/g, '/').replace(/:/g, '\\:');
 const mmss = (sec) => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
 
-// ── Acabado: corrección de color "broadcast" (contraste, saturación, nitidez, viñeta suave), 60 fps
-// y fundidos de entrada/salida. Mismo filtro en el replay y en los clips del stream (vod-clips.mjs).
-const GRADE = 'eq=contrast=1.07:saturation=1.2:gamma=0.97:brightness=0.012,unsharp=5:5:0.5:3:3:0,vignette=angle=PI/7:mode=forward';
+// ── Acabado cinemático, 60 fps y fundidos de entrada/salida:
+//   · curva en S suave con negros apenas levantados (look de película) y saturación arriba;
+//   · split-toning: sombras hacia azul/teal y luces cálidas (el teal & orange de las cinemáticas);
+//   · bloom: las luces (hechizos, ultis) brillan con un halo suave, mezclado en modo screen;
+//   · nitidez fina, viñeta y un grano muy leve para que no se vea "plano".
+// Es un filtergraph con etiquetas propias (cg*), válido tanto en -vf como dentro de -filter_complex.
+const GRADE = [
+  "eq=contrast=1.05:saturation=1.16:gamma=0.98",
+  "colorbalance=rs=-0.04:gs=-0.01:bs=0.06:rm=0.01:bm=-0.015:rh=0.06:gh=0.02:bh=-0.05",
+  "curves=master='0/0.025 0.25/0.215 0.5/0.5 0.77/0.80 1/0.985'",
+  "split=2[cg0][cg1];[cg1]curves=all='0/0 0.62/0 1/1',gblur=sigma=22[cgb];[cg0][cgb]blend=all_mode=screen:all_opacity=0.22",
+  'unsharp=5:5:0.45:3:3:0',
+  'vignette=angle=PI/6:mode=forward',
+  'noise=alls=3:allf=t',
+].join(',');
 const X264 = (crf) => ['-c:v', 'libx264', '-preset', 'medium', '-crf', String(crf), '-maxrate', '10M', '-bufsize', '20M', '-profile:v', 'high', '-r', String(FPS), '-g', String(FPS * 2), '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
 function mediaDuration(file) {
   return new Promise((resolve) => execFile(FFMPEG, ['-hide_banner', '-i', file], { windowsHide: true }, (_e, _o, err) => {
@@ -356,6 +368,10 @@ function cameraFor(pos) {
 // La geometría base (rotación y FOV de la cámara del juego) se calibra al abrir cada replay.
 const DIRECTOR_UI = { fogOfWar: false, interfaceAll: true, interfaceReplay: false, interfaceTimeline: false, interfaceChat: false, interfaceScore: true, interfaceScoreboard: true, interfaceKillCallouts: true, interfaceAnnounce: true, interfaceMinimap: true, interfaceFrames: true, interfaceTarget: false, outlineSelect: false, outlineHover: false, healthBarChampions: true, floatingText: true };
 const CAM_OFFSET = { x: 0, y: 1900, z: -1300 };   // como cameraFor: al sur del punto y a ~1900 de altura
+// Profundidad de campo de League Director: foco en el suelo bajo la cámara (~2300 de distancia),
+// desenfoque suave hacia arriba/abajo del cuadro (efecto miniatura/cinemático que separa la pelea).
+const CAM_DIST = Math.hypot(CAM_OFFSET.y, CAM_OFFSET.z);
+const DOF = (focus, circle) => ({ depthOfFieldEnabled: true, depthOfFieldCircle: circle, depthOfFieldWidth: 900, depthOfFieldNear: focus - 1400, depthOfFieldMid: focus, depthOfFieldFar: focus + 2200 });
 let camBase = null;                                // { rotation, fov } leídos del juego
 async function calibrateCamera() {
   camBase = null;
@@ -370,6 +386,7 @@ async function calibrateCamera() {
   } catch (e) { log(`  director: sin calibración (${e.message})`); }
 }
 const camAt = (p) => ({ x: p.x + CAM_OFFSET.x, y: CAM_OFFSET.y, z: p.y + CAM_OFFSET.z });
+let DOF_ON = true;
 const CLIMAX_KINDS = /^(multikill|ace|baron|dragon|elder|riftherald|horde|first_blood|fb)/;
 /** Keyframes de la toma para un momento. kills: [{t, pos:{x,y}}] de la ventana (timeline). */
 function directorShot(m, kills) {
@@ -387,22 +404,39 @@ function directorShot(m, kills) {
   // Clímax = última baja (o el instante del momento en objetivos sin bajas).
   const climax = pts.length ? pts[pts.length - 1].t : m.t;
   const fov = camBase.fov;
+  // Catmull-Rom por los puntos clave, muestreada cada 0.2 s con mezcla lineal: la cámara fluye sin
+  // detenerse en cada baja (smoothStep entre keyframes frena a cero en cada uno). Entrada y salida
+  // con ease. Además un "push-in": baja ~12 % de altura a lo largo de la toma.
+  const cr = (a, b, c, d, u) => 0.5 * ((2 * b) + (-a + c) * u + (2 * a - 5 * b + 4 * c - d) * u * u + (-a + 3 * b - 3 * c + d) * u * u * u);
+  const camKeys = [];
+  for (let i = 0; i < keys.length - 1; i++) {
+    const a = keys[Math.max(0, i - 1)], b = keys[i], c = keys[i + 1], d = keys[Math.min(keys.length - 1, i + 2)];
+    const n = Math.max(1, Math.round((c.t - b.t) / 0.2));
+    for (let j = 0; j < n; j++) { const u = j / n; camKeys.push({ t: b.t + (c.t - b.t) * u, x: cr(a.x, b.x, c.x, d.x, u), y: cr(a.y, b.y, c.y, d.y, u) }); }
+  }
+  camKeys.push(keys[keys.length - 1]);
+  const lift = (k) => { const f = 1 - 0.12 * Math.min(1, Math.max(0, (k.t - t0) / Math.max(1, t1 - t0))); const v = camAt(k); return { x: v.x, y: CAM_OFFSET.y * f, z: k.y + CAM_OFFSET.z * f }; };
   const seq = {
-    cameraPosition: keys.map((k) => ({ time: k.t, value: camAt(k), blend: 'smoothStep' })),
+    cameraPosition: camKeys.map((k, i) => ({ time: k.t, value: lift(k), blend: i === 0 ? 'sineEaseOut' : (i >= camKeys.length - 2 ? 'sineEaseIn' : 'linear') })),
     cameraRotation: [{ time: t0, value: camBase.rotation, blend: 'linear' }, { time: t1, value: camBase.rotation, blend: 'linear' }],
     fieldOfView: [
-      { time: t0, value: fov * 1.12, blend: 'smoothStep' },
-      { time: Math.max(t0 + 1, climax - 0.6), value: fov * 0.86, blend: 'smoothStep' },
-      { time: Math.min(t1 - 0.2, climax + 1.6), value: fov * 0.82, blend: 'smoothStep' },
-      { time: t1, value: fov * 0.92, blend: 'smoothStep' },
+      { time: t0, value: fov * 1.12, blend: 'cubicEaseInOut' },
+      { time: Math.max(t0 + 1, climax - 0.6), value: fov * 0.86, blend: 'cubicEaseInOut' },
+      { time: Math.min(t1 - 0.2, climax + 1.6), value: fov * 0.82, blend: 'cubicEaseInOut' },
+      { time: t1, value: fov * 0.92, blend: 'cubicEaseInOut' },
     ].sort((a, b) => a.time - b.time),
   };
+  if (DOF_ON) {
+    // El foco acompaña el push-in; el desenfoque se cierra un poco en el clímax.
+    seq.depthOfFieldMid = [{ time: t0, value: CAM_DIST, blend: 'linear' }, { time: t1, value: CAM_DIST * 0.88, blend: 'linear' }];
+    seq.depthOfFieldCircle = [{ time: t0, value: 6, blend: 'cubicEaseInOut' }, { time: Math.max(t0 + 1, climax - 0.6), value: 9, blend: 'cubicEaseInOut' }, { time: t1, value: 7, blend: 'cubicEaseInOut' }].sort((a, b) => a.time - b.time);
+  }
   if (CLIMAX_KINDS.test(String(m.kind || '')) && climax > t0 + 1.2 && climax < t1 - 1.3) {
     seq.playbackSpeed = [
       { time: t0, value: 1, blend: 'snap' },
-      { time: climax - 0.9, value: 1, blend: 'smoothStep' },
+      { time: climax - 0.9, value: 1, blend: 'sineEaseInOut' },
       { time: climax - 0.35, value: 0.35, blend: 'linear' },
-      { time: climax + 0.7, value: 0.35, blend: 'smoothStep' },
+      { time: climax + 0.7, value: 0.35, blend: 'sineEaseInOut' },
       { time: climax + 1.2, value: 1, blend: 'snap' },
     ];
   }
@@ -469,6 +503,7 @@ async function renderGame(gameId) {
   await sleep(4000);
   const director = cfgNow.director !== false;
   if (director) await calibrateCamera();
+  DOF_ON = cfgNow.dof !== false;
 
   await fsp.mkdir(OUT, { recursive: true });
   let done = 0;
@@ -485,7 +520,7 @@ async function renderGame(gameId) {
         catch (e) { log(`  director: sin bajas de la pelea (${e.message}); sigo con el punto del momento`); }
         shot = directorShot(m, kills);
         // Toma dirigida: cámara libre ('fps') animada por la secuencia.
-        await replay('POST', '/replay/render', { ...DIRECTOR_UI, cameraMode: 'fps', cameraAttached: false, cameraPosition: shot.cameraPosition[0].value, cameraRotation: camBase.rotation, fieldOfView: shot.fieldOfView[0].value });
+        await replay('POST', '/replay/render', { ...DIRECTOR_UI, ...(DOF_ON ? DOF(CAM_DIST, 6) : { depthOfFieldEnabled: false }), cameraMode: 'fps', cameraAttached: false, cameraPosition: shot.cameraPosition[0].value, cameraRotation: camBase.rotation, fieldOfView: shot.fieldOfView[0].value });
         await replay('POST', '/replay/playback', { time: Math.max(0, m.tStart - 2), paused: true, speed: 1 });
         const sq = await replay('POST', '/replay/sequence', shot);
         if (sq.status >= 400) { log(`  director: la secuencia no entró (${sq.status} ${JSON.stringify(sq.data).slice(0, 160)}); toma simple`); shot = null; }
