@@ -388,14 +388,32 @@ async function calibrateCamera() {
 const camAt = (p) => ({ x: p.x + CAM_OFFSET.x, y: CAM_OFFSET.y, z: p.y + CAM_OFFSET.z });
 let DOF_ON = true;
 const CLIMAX_KINDS = /^(multikill|ace|baron|dragon|elder|riftherald|horde|first_blood|fb)/;
+/** Bajas de la pelea principal: en una ventana puede haber escaramuzas lejanas a la vez; promediarlas
+ *  deja la cámara en medio de la jungla. Se toma el grupo más denso (vecinas a < 1800) y se descartan
+ *  las bajas a más de 2400 de su centro. */
+function focusKills(kills, t0, t1) {
+  const pts = kills.filter((k) => k.pos && Number.isFinite(k.pos.x) && k.t >= t0 - 3 && k.t <= t1 + 1).map((k) => ({ t: k.t, x: Number(k.pos.x), y: Number(k.pos.y) })).sort((a, b) => a.t - b.t);
+  if (pts.length < 3) return pts.length === 2 && Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) > 2400 ? [pts[1]] : pts;
+  const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  let best = pts[0], bestN = -1;
+  for (const p of pts) { const n = pts.filter((q) => d(p, q) < 1800).length; if (n >= bestN) { best = p; bestN = n; } }
+  const grp = pts.filter((q) => d(best, q) < 1800);
+  const c = { x: grp.reduce((a, q) => a + q.x, 0) / grp.length, y: grp.reduce((a, q) => a + q.y, 0) / grp.length };
+  return pts.filter((q) => d(c, q) < 2400);
+}
 /** Keyframes de la toma para un momento. kills: [{t, pos:{x,y}}] de la ventana (timeline). */
 function directorShot(m, kills) {
   const t0 = m.tStart, t1 = m.tEnd;
-  const pts = kills.filter((k) => k.pos && k.t >= t0 - 3 && k.t <= t1 + 1).map((k) => ({ t: k.t, x: k.pos.x, y: k.pos.y })).sort((a, b) => a.t - b.t);
+  const pts = focusKills(kills, t0, t1);
   const anchor = m.pos ? { x: Number(m.pos.x), y: Number(m.pos.y) } : (pts[0] || { x: 7400, y: 7400 });
   // Trayectoria: cada baja suavizada con sus vecinas (sin saltos bruscos entre bajas lejanas).
   const path0 = pts.length ? pts : [{ t: m.t, ...anchor }];
-  const smooth = path0.map((p, i) => { const a = path0[Math.max(0, i - 1)], b = path0[Math.min(path0.length - 1, i + 1)]; return { t: p.t, x: (a.x + 2 * p.x + b.x) / 4, y: (a.y + 2 * p.y + b.y) / 4 }; });
+  const near = (a, b) => Math.hypot(a.x - b.x, a.y - b.y) < 1500;
+  const smooth = path0.map((p, i) => {
+    const a = path0[Math.max(0, i - 1)], b = path0[Math.min(path0.length - 1, i + 1)];
+    const ns = [p, p, ...(near(a, p) ? [a] : [p]), ...(near(b, p) ? [b] : [p])];
+    return { t: p.t, x: ns.reduce((s2, q) => s2 + q.x, 0) / 4, y: ns.reduce((s2, q) => s2 + q.y, 0) / 4 };
+  });
   const keys = [{ t: t0, x: smooth[0].x, y: smooth[0].y }];
   // La cámara llega ~0.8 s ANTES de cada baja (se anticipa, como un observador).
   for (const p of smooth) { const tt = Math.max(t0 + 0.5, p.t - 0.8); if (tt < t1 - 0.3 && tt > keys[keys.length - 1].t + 0.6) keys.push({ ...p, t: tt }); }
@@ -521,7 +539,7 @@ async function renderGame(gameId) {
         catch (e) { log(`  director: sin bajas de la pelea (${e.message}); sigo con el punto del momento`); }
         // Toma ajustada a la acción: entra ~6 s antes de la primera baja y corta ~4 s después de la
         // última (la ventana del momento puede seguir con el mapa vacío cuando la pelea ya acabó).
-        const kt = kills.filter((k) => k.pos && k.t >= m.tStart - 3 && k.t <= m.tEnd + 1).map((k) => k.t);
+        const kt = focusKills(kills, m.tStart, m.tEnd).map((k) => k.t);
         if (kt.length) {
           const s0 = Math.max(m.tStart, Math.floor(Math.min(...kt) - 6)), s1 = Math.min(m.tEnd, Math.ceil(Math.max(...kt) + 4));
           if (s1 - s0 >= 8 && (s0 > m.tStart || s1 < m.tEnd)) { m = { ...m, tStart: s0, tEnd: s1 }; log(`  director: toma ajustada a ${s0}s–${s1}s`); }
