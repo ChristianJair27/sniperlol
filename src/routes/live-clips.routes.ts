@@ -112,4 +112,28 @@ router.get('/:channel/clip-state', async (req, res) => {
   } catch { return res.json({ ok: true, state: { show: false, id: 0, last: 0, at: 0 }, url: null }); }
 });
 
+// Sonidos al stream: el Stream Deck de quien produce manda { sound, vol } y el overlay del caster
+// (fuente de navegador en su OBS, con audio) lo reproduce. Se guarda solo el último.
+const SOUND_RE = /^[a-z0-9-]{2,32}$/;
+router.post('/:channel/cue', async (req, res) => {
+  if (!okToken(req)) return res.status(401).json({ error: 'bad_token' });
+  const channel = chan(req); if (!channel) return res.status(400).json({ error: 'bad_channel' });
+  const sound = String(req.body?.sound || '');
+  if (!SOUND_RE.test(sound)) return res.status(400).json({ error: 'bad_sound' });
+  const vol = Math.min(1, Math.max(0, Number(req.body?.vol ?? 0.8)));
+  const cue = { sound, vol, at: Date.now() };
+  try {
+    await pool.query('INSERT INTO live_feed_clip_state (channel, state, at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE state = VALUES(state), at = VALUES(at)', [`${channel}#cue`, JSON.stringify(cue), cue.at]);
+    return res.json({ ok: true, cue });
+  } catch (e: any) { return res.status(500).json({ error: e.message }); }
+});
+router.get('/:channel/cue', async (req, res) => {
+  const channel = chan(req); if (!channel) return res.status(400).json({ error: 'bad_channel' });
+  res.set('Cache-Control', 'no-store');
+  try {
+    const [[row]] = await pool.query<any[]>('SELECT state FROM live_feed_clip_state WHERE channel = ?', [`${channel}#cue`]);
+    return res.json({ ok: true, cue: row ? JSON.parse(row.state) : null });
+  } catch { return res.json({ ok: true, cue: null }); }
+});
+
 export default router;
