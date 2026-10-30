@@ -3446,6 +3446,47 @@ router.post('/:id/matches/:matchId/reset-link', requireAuth, async (req: any, re
 });
 
 // Match stats — full MatchDto parsing with DB cache
+// Lado de team1 en cada juego ('blue' | 'red' | null). El scoreboard pintaba
+// siempre team1 = azul, y cuando los equipos cambian de lado entre juegos el
+// nombre quedaba sobre el roster contrario (LQC 29-oct, Heralds vs REV505
+// juego 3). 1) ganador atribuido del juego (rosters o reporte manual) + lado
+// que ganó; 2) si no lo hay, Riot IDs de los inscritos contra los participantes.
+async function annotateTeamSides(tid: string, match: BracketMatch, games: any[]) {
+  const winnerOf = new Map((match.games || []).map(g => [Number(g.gameId), g.winner || null]));
+  let rosters: { t1: Set<string>; t2: Set<string> } | null = null;
+  const loadRosters = async () => {
+    const t1 = new Set<string>(), t2 = new Set<string>();
+    const [rows] = await pool.query<any[]>(
+      'SELECT team_name, captain_riot_id, players FROM tournament_registrations WHERE tournament_id = ?', [tid]);
+    for (const r of rows) {
+      const set = r.team_name === match.team1 ? t1 : r.team_name === match.team2 ? t2 : null;
+      if (!set) continue;
+      if (r.captain_riot_id) set.add(String(r.captain_riot_id).trim().toLowerCase());
+      for (const pl of parseJson(r.players) || []) if (pl?.riotId) set.add(String(pl.riotId).trim().toLowerCase());
+    }
+    return { t1, t2 };
+  };
+  for (const g of games) {
+    if (!g) continue;
+    const gid = Number(String(g.matchId || '').split('_').pop());
+    const w = winnerOf.get(gid) ?? (!match.games?.length ? match.winner : null);
+    let side: 'blue' | 'red' | null = null;
+    if (w && (g.winner === 'blue' || g.winner === 'red')) {
+      const other = g.winner === 'blue' ? 'red' : 'blue';
+      side = w === match.team1 ? g.winner : w === match.team2 ? other : null;
+    }
+    if (!side) {
+      rosters ??= await loadRosters();
+      const id = (p: any) => `${p.summonerName ?? ''}#${p.tagLine ?? ''}`.trim().toLowerCase();
+      const n = (team: any[], set: Set<string>) => (team || []).filter(p => set.has(id(p))).length;
+      const t1Blue = n(g.blueTeam, rosters.t1) + n(g.redTeam, rosters.t2);
+      const t1Red  = n(g.redTeam, rosters.t1) + n(g.blueTeam, rosters.t2);
+      side = t1Blue > t1Red ? 'blue' : t1Red > t1Blue ? 'red' : null;
+    }
+    g.team1Side = side;
+  }
+}
+
 router.get('/:id/matches/:matchId/stats', async (req, res) => {
   const { id, matchId } = req.params;
   try {
@@ -3492,11 +3533,15 @@ router.get('/:id/matches/:matchId/stats', async (req, res) => {
       const seriesDone = match.matchStatus === 'complete';
       const expected = match.matchStatus === 'complete' || (match.games?.length || 0) <= allGames.length;
       if (seriesDone || expected) {
+        await annotateTeamSides(id, match, allGames).catch(() => {});
         return res.json({ ...allGames[allGames.length - 1], games: allGames });
       }
     }
     const cached = await getStoredMatchStats(id, matchId);
-    if (cached?.isComplete) return res.json({ ...cached, games: allGames.length ? allGames : undefined });
+    if (cached?.isComplete) {
+      await annotateTeamSides(id, match, [cached, ...allGames]).catch(() => {});
+      return res.json({ ...cached, games: allGames.length ? allGames : undefined });
+    }
 
     const primaryPlatform = match.gameRegion || t.region || 'la1';
     const tryPlatforms = primaryPlatform === 'la1' ? ['la1','la2']
@@ -3536,6 +3581,7 @@ router.get('/:id/matches/:matchId/stats', async (req, res) => {
         .catch(err => console.error('[stats] save error:', err.message));
     }
 
+    await annotateTeamSides(id, match, [parsed]).catch(() => {});
     res.json(parsed);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
