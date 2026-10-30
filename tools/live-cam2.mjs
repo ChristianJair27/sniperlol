@@ -87,5 +87,7 @@ function connect() {
   ws.onclose = () => { log('OBS desconectado; reintento en 3 s (¿OBS abierto?)'); setTimeout(connect, 3000); };
   ws.onerror = () => {};
 }
-log(`segunda cámara → canal ${CHANNEL}`);
-connect();
+// Una sola instancia (el botón del Stream Deck puede lanzarla otra vez): si el puerto ya está tomado, salir.
+const { createServer } = await import('node:net');
+const guard = createServer().once('error', () => { log('la segunda cámara ya está corriendo'); process.exit(0); });
+guard.listen(47999, '127.0.0.1', () => { log(`segunda cámara → canal ${CHANNEL}`); connect(); });
