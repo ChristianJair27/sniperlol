@@ -71,7 +71,7 @@ router.get('/:channel/clips/:id', async (req, res) => {
     const [[meta]] = await pool.query<any[]>('SELECT size, mime FROM live_feed_clips WHERE channel = ? AND id = ?', [channel, id]);
     if (!meta) return res.status(404).end();
     const size = Number(meta.size);
-    res.set({ 'Content-Type': meta.mime || 'video/mp4', 'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=3600' });
+    res.set({ 'Content-Type': meta.mime || 'video/mp4', 'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=3600', 'Cross-Origin-Resource-Policy': 'cross-origin', 'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges, Content-Length' });
     const m = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
     if (m) {
       let start = m[1] ? Number(m[1]) : Math.max(0, size - Number(m[2] || 0));
